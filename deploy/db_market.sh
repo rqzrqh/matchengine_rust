@@ -1,0 +1,16 @@
+#!/bin/bash
+
+if [ $# -ne 4 ];then
+	echo "usage:./init_market.sh MYSQL_HOST MYSQL_USER MYSQL_PASSWD MARKET_NAME"
+	exit 1
+fi
+
+MYSQL_HOST=$1
+MYSQL_USER=$2
+MYSQL_PASS=$3
+MARKET_DB=$4
+
+mysql -h$MYSQL_HOST -u$MYSQL_USER -p$MYSQL_PASS -e "DROP DATABASE $MARKET_DB"
+mysql -h$MYSQL_HOST -u$MYSQL_USER -p$MYSQL_PASS -e "CREATE DATABASE $MARKET_DB"
+mysql -h$MYSQL_HOST -u$MYSQL_USER -p$MYSQL_PASS $MARKET_DB < table_template.sql
+
