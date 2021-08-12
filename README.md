@@ -12,7 +12,7 @@ more detail see design.md
 ```
 
 ```
-./deploy/kafka_market.sh
+./deploy/kafka_market.sh eth_btc
 ```
 
 ```

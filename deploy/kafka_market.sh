@@ -1,4 +1,9 @@
-MARKET="eth_btc"
+if [ $# -ne 1 ];then
+	echo "args error"
+	exit 1
+fi
+
+MARKET=$1
 KAFKA_DIR="/Users/rqzrqh/Public/kafka_2.12-2.8.0/bin/"
 
 $KAFKA_DIR/kafka-topics.sh --bootstrap-server localhost:9092 --delete --topic offer.$MARKET
