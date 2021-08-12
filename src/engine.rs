@@ -262,7 +262,7 @@ pub fn market_put_limit_order(publisher: &Publish, m: &mut Market, extern_id: u6
         deal_fee: Cell::new(Decimal::ZERO),
     });
 
-    publisher.publish_order(m, extern_id, &order);
+    publisher.publish_put_order(m, extern_id, &order);
 
     if side == MARKET_ORDER_SIDE_ASK {
         execute_limit_ask_order(publisher, m, extern_id, &order);
@@ -320,7 +320,7 @@ pub fn market_put_market_order(publisher: &Publish, m: &mut Market, extern_id: u
         deal_fee: Cell::new(Decimal::ZERO),
     });
 
-    publisher.publish_order(m, extern_id, &order);
+    publisher.publish_put_order(m, extern_id, &order);
 
     if side == MARKET_ORDER_SIDE_ASK {
         execute_market_ask_order(publisher, m, extern_id, &order);

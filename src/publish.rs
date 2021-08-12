@@ -22,12 +22,12 @@ impl Publish {
         }
     }
 
-    pub fn publish_order(&self, m: &mut Market, extern_id: u64, order: &Rc<Order>) {
+    pub fn publish_put_order(&self, m: &mut Market, extern_id: u64, order: &Rc<Order>) {
 
         m.message_id += 1;
 
         let mut object = JsonValue::new_object();
-        object["type"] = "order".into();
+        object["type"] = "put_order".into();
         object["market"] = m.name.clone().into();
         object["msgid"] = m.message_id.into();
         object["txid"] = extern_id.into();
