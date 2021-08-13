@@ -3,7 +3,9 @@
 It's a memory-matchengine, very simple. Written in rust, **it's used for examing my rust-study .**
 It referes to a c-language matchengine which runs long-term.
 
-more detail see design.md
+more detail see [design.md](https://github.com/rqzrqh/matchengine_rust/blob/master/design.md)
+
+
 
 ### Usage
 
@@ -43,13 +45,13 @@ python3 ./tests/order_generator.py
 
 2.Use a better decimal library for rescale a value. The rust_decimal's function of rescale only support decimal part, not support integer part.
 
-3.Performance test 
+3.Performance test and optimize
 
 4.add process lock
 
-5.add design.md
+5.Automatically deletes old snapshot
 
-
+6.use rocketmq, kafka is not a suitable message queue for more than 64 topics
 
 
 
