@@ -10,6 +10,8 @@ use chrono::prelude::*;
 use tokio::sync::oneshot;
 extern crate pretty_env_logger;
 #[macro_use] extern crate log;
+extern crate process_lock;
+use process_lock::*;
 
 mod error;
 mod engine;
@@ -95,6 +97,17 @@ fn main() {
     let db_passwd = cfg["db"]["passwd"].to_string();
 
     let input_topic = format!("offer.{}", market_name);
+
+    let mut lock = ProcessLock::new(String::from(format!("matchengine.{}", market_name)), None).unwrap();    
+    let guard = lock.trylock().unwrap_or_else(|e| {
+        error!("get process lock failed {}", e.to_string());
+        process::exit(0);
+    });
+
+    if guard.is_none() {
+        error!("get process lock failed");
+        process::exit(0);
+    }
 
     let mut mk = market::Market::new(&market_name, stock_prec, money_prec, fee_prec, &min_amount);
 

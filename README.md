@@ -47,11 +47,9 @@ python3 ./tests/order_generator.py
 
 3.Performance test and optimize
 
-4.add process lock
+4.Automatically deletes old snapshot
 
-5.Automatically deletes old snapshot
-
-6.use rocketmq, kafka is not a suitable message queue for more than 64 topics
+5.use rocketmq, kafka is not a suitable message queue for more than 64 topics
 
 
 
