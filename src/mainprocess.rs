@@ -9,7 +9,7 @@ pub fn handle_mq_message(publisher: &Publish, m: &mut Market, offset: i64, data:
     let parsed = json::parse(data).unwrap();
     info!("{}", parsed);
 
-    m.oper_id = m.oper_id + 1;
+    m.oper_id += 1;
     m.input_offset = offset;
 
     if !parsed.is_object() {

@@ -244,7 +244,7 @@ pub fn market_put_limit_order(publisher: &Publish, m: &mut Market, extern_id: u6
 
     let now = Utc::now();
 
-    m.order_id = m.order_id + 1;
+    m.order_id += 1;
     let order = Rc::new(Order{
         id : m.order_id,
         order_type: MARKET_ORDER_TYPE_LIMIT,
