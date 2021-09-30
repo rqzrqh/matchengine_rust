@@ -9,16 +9,18 @@ more detail see [design.md](https://github.com/rqzrqh/matchengine_rust/blob/mast
 
 ### Usage
 
+cd deploy
+
 ```
-./deploy/db_market.sh localhost $dbuser $dbpasswd eth_btc
+./db_market.sh localhost $dbuser $dbpasswd eth_btc
 ```
 
 ```
-./deploy/kafka_market.sh eth_btc
+./kafka_market.sh eth_btc
 ```
 
 ```
-./deploy/kafka_settle.sh
+./kafka_settle.sh
 ```
 
 ```
