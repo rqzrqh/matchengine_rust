@@ -152,6 +152,7 @@ select a snapshot whose message_id <= message_id, ensure all outputs is handled 
 For settle_service, it would receive message which has been processed before. Because matchengine restart. Use message_id for deduplication, if the message of one market's message id less equal than processed before, it ignore. 
 
 **Replica State Machine avoid a single point of failure**
+
 One trade pair can run multi matchengine processes, just like Replica State Machine. Multi Matchengine try to get the same distributed lock(use etcd). In fact, distributed lock could not ensure only the winner run at any time, but it can make only one process run at most of the time. For settle_service, when handle the message of same trade pair at one settle_topic, it must handle the message which msg_id is bigger than last processes.
 
 
