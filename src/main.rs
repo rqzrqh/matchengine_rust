@@ -1,5 +1,11 @@
 use std::{thread, net::SocketAddr, str, sync::mpsc, fs::File, io::prelude::*, env, process, time::Duration};
-use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
+use rdkafka::consumer::{BaseConsumer, StreamConsumer, CommitMode};
+use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::util::Timeout;
+use rdkafka::consumer::Consumer;
+use rdkafka::config::RDKafkaLogLevel;
+
 use kafka::producer::{Producer, Record, RequiredAcks};
 
 use hyper::{Body, Response, Server, Error};
@@ -143,34 +149,70 @@ fn main() {
 
     let main_routine_sender_mq_clone = main_routine_sender.clone();
     let brokers_clone2 = brokers.clone();
-    let mq_consumer_thread = thread::spawn(move || {
+    let input_offset = mk.input_offset;
 
-        let mut consumer =
-        Consumer::from_hosts(vec!(brokers_clone2.to_owned()))
-            .with_topic_partitions(input_topic.to_owned(), &[0, 0])
-            .with_fallback_offset(FetchOffset::Earliest) // TODO set offset
-            .with_offset_storage(GroupOffsetStorage::Kafka)
+    let consumer_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)// one thread
+        .enable_all()
+        .build()
+        .unwrap();
+
+    consumer_rt.spawn(async move {
+
+        let consumer:StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", brokers_clone2)
+            .set("enable.partition.eof", "false")
+            .set("group.id", "my_consumer_group2")
+            .set("enable.auto.commit", "true")
+            .set("auto.commit.interval.ms", "5000")
+            .set("enable.auto.offset.store", "false")
+            .set_log_level(RDKafkaLogLevel::Debug)
+            // We'll give each session its own (unique) consumer group id,
+            // so that each session will receive all messages
+            //.set("group.id", format!("chat-{}", Uuid::new_v4()))
             .create()
-            .unwrap();
+            .expect("Failed to create client");
+
+        let mut tpl = TopicPartitionList::new();
+        //
+        // tpl.add_partition_offset(&topic_name, 0, Offset::Beginning)
+        //     .unwrap();
+        // tpl.add_partition_offset(&topic_name, 1, Offset::End)
+        //     .unwrap();
+        //
+        tpl.add_partition_offset(&input_topic, 0, Offset::Offset(input_offset+1)).unwrap();
+        //consumer.seek_partitions(tpl, None).expect("failed to seek_partitions"); // not work
+
+        // update session commit offset to replay from specific offset
+        consumer.commit(&tpl, CommitMode::Sync).expect("failed to commit");
+
+        consumer.subscribe(&[&input_topic]).expect("failed to subscribe");
+
         loop {
-            for ms in consumer.poll().unwrap().iter() {
-                for m in ms.messages() {
 
-                    let str = match str::from_utf8(m.value) {
-                        Ok(v) => v,
-                        Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
-                    };
+            match consumer.recv().await {
+                Ok(message) => {
+                    println!(
+                        "Received message at topic: {} partition: {} offset: {} payload: {:?}",
+                        message.topic(),
+                        message.partition(),
+                        message.offset(),
+                        message.payload().map(|p| String::from_utf8_lossy(p).into_owned())
+                    );
 
+                    // should decode data here
+/*
                     let task = task::KafkaMqTask {
-                        offset: m.offset,
-                        data: str.to_string(),
+                            offset: message.offset(),
+                            data: message.payload().map(|p| String::from_utf8_lossy(p).to_string()).unwrap(),
                     };
-
                     main_routine_sender_mq_clone.send(task::Task::MqTask(task)).expect("send mqtask failed");
+*/
                 }
-                consumer.consume_messageset(ms).unwrap_or_else(|e| panic!("{}", e.to_string()));
+                Err(e) => {
+                    eprintln!("consume failed {}", e);
+                }
             }
-            consumer.commit_consumed().unwrap_or_else(|e| panic!("{}", e.to_string()));
         }
     });
 
@@ -209,7 +251,6 @@ fn main() {
     }
 
     let _ = timer_thread.join();
-    let _ = mq_consumer_thread.join();
     let _ = mq_producer_thread.join();
     let _ = http_thread.join();
 }
