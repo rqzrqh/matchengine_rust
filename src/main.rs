@@ -149,7 +149,7 @@ fn main() {
         Consumer::from_hosts(vec!(brokers_clone2.to_owned()))
             .with_topic_partitions(input_topic.to_owned(), &[0, 0])
             .with_fallback_offset(FetchOffset::Earliest) // TODO set offset
-            .with_offset_storage(GroupOffsetStorage::Kafka)
+            .with_offset_storage(Some(GroupOffsetStorage::Kafka))
             .create()
             .unwrap();
         loop {
