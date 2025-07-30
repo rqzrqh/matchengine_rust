@@ -6,8 +6,6 @@ use rdkafka::util::Timeout;
 use rdkafka::consumer::Consumer;
 use rdkafka::config::RDKafkaLogLevel;
 
-use kafka::producer::{Producer, Record, RequiredAcks};
-
 use hyper::{Body, Response, Server, Error};
 use hyper::service::{make_service_fn, service_fn};
 use rust_decimal::prelude::*;
@@ -124,27 +122,10 @@ fn main() {
     load::restore_state(&mut mk, &pool);
 
     let (main_routine_sender, main_routine_receiver) = mpsc::channel();
-    let (publisher_sender, publisher_receiver) = mpsc::channel();
 
     let main_routine_sender_http_clone = main_routine_sender.clone();
     let http_thread = thread::spawn(|| {
         start_httpserver(main_routine_sender_http_clone);
-    });
-
-    let brokers_clone1 = brokers.clone();
-    let mq_producer_thread = thread::spawn(move || {
-        let mut producer = Producer::from_hosts(vec!(brokers_clone1.to_owned()))
-                .with_ack_timeout(Duration::from_secs(1))
-                .with_required_acks(RequiredAcks::One)
-                .create()
-                .unwrap();
-
-        loop {
-            let received:Box<publish::PublishInfo> = publisher_receiver.recv().unwrap();
-            let topic = received.topic;
-            let data = &received.data;
-            producer.send(&Record::from_value(&topic, data.to_string().as_bytes())).unwrap();
-        }
     });
 
     let main_routine_sender_mq_clone = main_routine_sender.clone();
@@ -201,13 +182,13 @@ fn main() {
                     );
 
                     // should decode data here
-/*
+
                     let task = task::KafkaMqTask {
                             offset: message.offset(),
                             data: message.payload().map(|p| String::from_utf8_lossy(p).to_string()).unwrap(),
                     };
                     main_routine_sender_mq_clone.send(task::Task::MqTask(task)).expect("send mqtask failed");
-*/
+
                 }
                 Err(e) => {
                     eprintln!("consume failed {}", e);
@@ -228,7 +209,7 @@ fn main() {
         }
     });
 
-    let publisher = publish::Publish::new(publisher_sender.clone());
+    let publisher = publish::Publish::new(brokers);
 
     loop {
         let task = main_routine_receiver.recv().unwrap();
@@ -251,6 +232,5 @@ fn main() {
     }
 
     let _ = timer_thread.join();
-    let _ = mq_producer_thread.join();
     let _ = http_thread.join();
 }
