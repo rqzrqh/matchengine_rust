@@ -152,6 +152,8 @@ fn on_order_cancel(publisher: &Publish, m: &mut Market, extern_id: u64, params: 
     match m.get_order(&order_id) {
         Some(order_ref) => {
             let order = order_ref.clone();
+
+            m.message_id += 1;
             publisher.publish_cancel_order(m, extern_id, &order);
             if order.side == MARKET_ORDER_SIDE_ASK {
                 m.stock_amount -= order.left.get();
@@ -166,3 +168,9 @@ fn on_order_cancel(publisher: &Publish, m: &mut Market, extern_id: u64, params: 
     }
 }
 
+pub fn update_output_progress(m: &mut Market, quote_deals_id: u64, settle_message_ids: Vec<u64>) {
+    m.quote_deals_id = quote_deals_id;
+    for i in 0..settle_message_ids.len() {
+        m.settle_message_ids[i] = settle_message_ids[i]
+    }
+}

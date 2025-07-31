@@ -161,6 +161,7 @@ fn main() {
         // tpl.add_partition_offset(&topic_name, 1, Offset::End)
         //     .unwrap();
         //
+
         tpl.add_partition_offset(&input_topic, 0, Offset::Offset(input_offset+1)).unwrap();
         //consumer.seek_partitions(tpl, None).expect("failed to seek_partitions"); // not work
 
@@ -209,7 +210,7 @@ fn main() {
         }
     });
 
-    let publisher = publish::Publish::new(brokers);
+    let publisher = publish::Publish::new(brokers, main_routine_sender.clone(), mk.quote_deals_id, mk.settle_message_ids.to_vec());
 
     loop {
         let task = main_routine_receiver.recv().unwrap();
@@ -224,6 +225,9 @@ fn main() {
             task::Task::DumpTask(b) => {
                 dump::handle_dump(&mut mk, b.tm, &pool);
             },
+            task::Task::ProgressUpdateTask(t) => {
+                mainprocess::update_output_progress(&mut mk, t.quote_deals_id, t.settle_message_ids);
+            }
             task::Task::Terminate => {
                 warn!("terminate and exit");
                 break;

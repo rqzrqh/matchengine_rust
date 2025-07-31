@@ -5,6 +5,7 @@ use mysql::prelude::*;
 use std::rc::Rc;
 use skiplist::OrderedSkipList;
 use std::process;
+use json::*;
 
 fn dump_order_list(conn: &mut PooledConn, table: &String, orders: &OrderedSkipList<Rc<Order>>) {
     let limit = 1000;
@@ -59,9 +60,16 @@ fn dump_orders_to_db(conn: &mut PooledConn, m: &Market, table: &String) {
     dump_order_list(conn, table, &m.bids);
 }
 
-fn dump_state_version_to_db(conn: &mut PooledConn, m: &Market, tm: i64) {
-    let sql = format!("INSERT INTO `snap` (`id`, `time`, `oper_id`, `order_id`, `deals_id`, `message_id`, `input_offset`) 
-                                        VALUES (NULL, {}, {}, {}, {}, {}, {}) ", tm, m.oper_id, m.order_id, m.deals_id, m.message_id, m.input_offset);
+// input and corespond state, progress of publish output
+// in fact, quote_deals_id and settle_message_ids only need one piece of data, like one table, but put them into snap table is more simple。
+fn dump_others_to_db(conn: &mut PooledConn, m: &Market, tm: i64) {
+    let mut ay = JsonValue::new_array();
+    for i in 0..m.settle_message_ids.len() {
+        ay[i] = m.settle_message_ids[i].into();
+    }
+
+    let sql = format!("INSERT INTO `snap` (`id`, `time`, `oper_id`, `order_id`, `deals_id`, `message_id`, `input_offset`, `asks`, `bids`, `quote_deals_id`, `settle_message_ids`) 
+                                        VALUES (NULL, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{}') ", tm, m.oper_id, m.order_id, m.deals_id, m.message_id, m.input_offset, m.asks.len(), m.bids.len(), m.quote_deals_id, ay.to_string());
     info!("{}", sql);
     conn.query_drop(&sql).unwrap_or_else(|e| {
         panic!("{}", e.to_string());
@@ -91,8 +99,9 @@ pub fn handle_dump(m: &mut Market, tm: i64, pool: &Pool) {
 
     let table = format!("snap_order_{}", tm);
 
+    // dump orders first to keep consistence with snap table record
     dump_orders_to_db(&mut conn, m, &table);
-    dump_state_version_to_db(&mut conn, m, tm);
+    dump_others_to_db(&mut conn, m, tm);
 
     process::exit(0);
 }

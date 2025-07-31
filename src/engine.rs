@@ -51,7 +51,9 @@ fn execute_limit_ask_order(publisher: &Publish, m: &mut Market, extern_id: u64, 
         let now = update_time(taker, &maker);
 
 		publisher.publish_quote_deal(m, now, &price, &amount, MARKET_ORDER_SIDE_ASK);
+        m.message_id += 1;
         publisher.publish_deal(m, extern_id, now, taker.user_id, maker.user_id, taker.id, MARKET_ROLE_TAKER, &price, &amount, &deal, &ask_fee, &bid_fee);
+        m.message_id += 1;
         publisher.publish_deal(m, extern_id, now,  maker.user_id, taker.user_id, maker.id, MARKET_ROLE_MAKER, &price, &amount, &deal, &bid_fee, &ask_fee);
 
         taker.left.set(taker.left.get() - amount);
@@ -99,7 +101,9 @@ fn execute_limit_bid_order(publisher: &Publish, m: &mut Market, extern_id: u64, 
         let now = update_time(taker, &maker);
 
         publisher.publish_quote_deal(m, now, &price, &amount, MARKET_ORDER_SIDE_BID);
+        m.message_id += 1;
         publisher.publish_deal(m, extern_id, now, taker.user_id, maker.user_id, taker.id, MARKET_ROLE_TAKER, &price, &amount, &deal, &bid_fee, &ask_fee);
+        m.message_id += 1;
         publisher.publish_deal(m, extern_id, now, maker.user_id, taker.user_id, maker.id, MARKET_ROLE_MAKER, &price, &amount, &deal, &ask_fee, &bid_fee);
 
         taker.left.set(taker.left.get() - amount);
@@ -142,7 +146,9 @@ fn execute_market_ask_order(publisher: &Publish, m: &mut Market, extern_id: u64,
         let now = update_time(taker, &maker);
 
         publisher.publish_quote_deal(m, now, &price, &amount, MARKET_ORDER_SIDE_ASK);
+        m.message_id += 1;
         publisher.publish_deal(m, extern_id, now, taker.user_id, maker.user_id, taker.id, MARKET_ROLE_TAKER, &price, &amount, &deal, &ask_fee, &bid_fee);
+        m.message_id += 1;
         publisher.publish_deal(m, extern_id, now, maker.user_id, taker.user_id, maker.id, MARKET_ROLE_MAKER, &price, &amount, &deal, &bid_fee, &ask_fee);
 
         taker.left.set(taker.left.get() - amount);
@@ -210,7 +216,9 @@ fn execute_market_bid_order(publisher: &Publish, m: &mut Market, extern_id: u64,
         let now = update_time(taker, &maker);
 
         publisher.publish_quote_deal(m, now, &price, &amount, MARKET_ORDER_SIDE_BID);
+        m.message_id += 1;
         publisher.publish_deal(m, extern_id, now, taker.user_id, maker.user_id, taker.id, MARKET_ROLE_TAKER, &price, &amount, &deal, &bid_fee, &ask_fee);
+        m.message_id += 1;
         publisher.publish_deal(m, extern_id, now, maker.user_id, taker.user_id, maker.id, MARKET_ROLE_MAKER, &price, &amount, &deal, &ask_fee, &bid_fee);
 
         taker.left.set(taker.left.get() - deal);
@@ -262,6 +270,7 @@ pub fn market_put_limit_order(publisher: &Publish, m: &mut Market, extern_id: u6
         deal_fee: Cell::new(Decimal::ZERO),
     });
 
+    m.message_id += 1;
     publisher.publish_put_order(m, extern_id, &order);
 
     if side == MARKET_ORDER_SIDE_ASK {
@@ -320,6 +329,7 @@ pub fn market_put_market_order(publisher: &Publish, m: &mut Market, extern_id: u
         deal_fee: Cell::new(Decimal::ZERO),
     });
 
+    m.message_id += 1;
     publisher.publish_put_order(m, extern_id, &order);
 
     if side == MARKET_ORDER_SIDE_ASK {
