@@ -15,6 +15,8 @@ pub static MARKET_ORDER_SIDE_BID:u32 = 2;
 pub static MARKET_ROLE_MAKER:u32 = 1;
 pub static MARKET_ROLE_TAKER:u32 = 2;
 
+pub static USER_SETTLE_GROUP_SIZE:usize = 64;
+
 pub struct Order {
     pub id: u64,
     pub order_type: u32,
@@ -85,6 +87,7 @@ impl PartialEq for Order {
 }
 
 pub struct Market {
+    // state
     pub oper_id: u64,
     pub order_id: u64,
     pub deals_id: u64,
@@ -104,6 +107,10 @@ pub struct Market {
 
     pub stock_amount: Decimal,
     pub money_amount: Decimal,
+
+    // output state
+    pub quote_deals_id: u64,
+    pub settle_message_ids: [u64;USER_SETTLE_GROUP_SIZE],
 }
 
 impl Market {
@@ -127,6 +134,9 @@ impl Market {
             bids: OrderedSkipList::new(),
             stock_amount: Decimal::ZERO,
             money_amount: Decimal::ZERO,
+
+            quote_deals_id: 0,
+            settle_message_ids: [0; USER_SETTLE_GROUP_SIZE],
         }
     }
 

@@ -17,12 +17,13 @@ CREATE TABLE `snap_order_example` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
 CREATE TABLE `snap` (
-	`id`                INT UNSIGNED NOT NULL PRIMARY KEY AUTO_INCREMENT,
+	`id`                BIGINT UNSIGNED NOT NULL PRIMARY KEY AUTO_INCREMENT,
 	`time`              BIGINT NOT NULL,
 	`oper_id`       	BIGINT UNSIGNED NOT NULL,
 	`order_id`      	BIGINT UNSIGNED NOT NULL,
 	`deals_id`      	BIGINT UNSIGNED NOT NULL,
 	`message_id`    	BIGINT UNSIGNED NOT NULL DEFAULT '0',
-	`input_offset`      BIGINT NOT NULL DEFAULT '-1'
+	`input_offset`      BIGINT NOT NULL DEFAULT '-1',
+	`quote_deals_id`    BIGINT UNSIGNED NOT NULL,
+	`settle_message_ids` TEXT NOT NULL,
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
-
