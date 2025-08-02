@@ -106,45 +106,45 @@ pub fn restore_output_state(m: &mut Market, pool: &Pool) -> Option<(u64, u64, u6
     match res {
         Some(v) => {
 
-                let id = v.0;
-                let quote_deals_id = v.1;
-                let str_settle_message_ids = v.2;
+            let id = v.0;
+            let quote_deals_id = v.1;
+            let str_settle_message_ids = v.2;
 
-                let parsed = json::parse(&str_settle_message_ids).expect("json decode failed");
-                info!("{}", parsed);
+            let parsed = json::parse(&str_settle_message_ids).expect("json decode failed");
+            info!("{}", parsed);
 
-                if !parsed.is_array() {
-                    error!("settle_message_ids is not array {}", parsed);
-                    process::exit(0);
+            if !parsed.is_array() {
+                error!("settle_message_ids is not array {}", parsed);
+                process::exit(0);
+            }
+
+            if m.settle_message_ids.len() != parsed.len() {
+                error!("settle message ids length not equal {} {}", m.settle_message_ids.len(), parsed.len());
+                process::exit(0);
+            }
+
+            for i in 0..parsed.len() {
+                let group_message_id = parsed[i].as_u64().unwrap();
+                m.settle_message_ids[i] = group_message_id;
+            }
+
+            // find the first non-zero value
+            let mut min_settle_group_message_id:u64 = 0;
+            let mut settle_message_ids = m.settle_message_ids.clone();
+            settle_message_ids.sort();
+            for i in 0..settle_message_ids.len() {
+                if settle_message_ids[i] != 0 {
+                    min_settle_group_message_id = settle_message_ids[i];
+                    break;
                 }
+            }
 
-                if m.settle_message_ids.len() != parsed.len() {
-                    error!("settle message ids length not equal {} {}", m.settle_message_ids.len(), parsed.len());
-                    process::exit(0);
-                }
+            let fake_snap_id = id + 1;
 
-                for i in 0..parsed.len() {
-                    let group_message_id = parsed[i].as_u64().unwrap();
-                    m.settle_message_ids[i] = group_message_id;
-                }
+            info!("output state id:{} quote_deals_id:{} min_settle_message_id:{}", 
+                id, quote_deals_id, min_settle_group_message_id);
 
-                // find the first non-zero value
-                let mut min_settle_group_message_id:u64 = 0;
-                let mut settle_message_ids = m.settle_message_ids.clone();
-                settle_message_ids.sort();
-                for i in 0..settle_message_ids.len() {
-                    if settle_message_ids[i] != 0 {
-                        min_settle_group_message_id = settle_message_ids[i];
-                        break;
-                    }
-                }
-
-                let fake_snap_id = id + 1;
-
-                info!("output state id:{} quote_deals_id:{} min_settle_message_id:{}", 
-                    id, quote_deals_id, min_settle_group_message_id);
-
-                return Some((fake_snap_id, quote_deals_id, min_settle_group_message_id));
+            return Some((fake_snap_id, quote_deals_id, min_settle_group_message_id));
         },
         None => {
             info!("no output state");
