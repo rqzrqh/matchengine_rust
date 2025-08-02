@@ -173,4 +173,7 @@ pub fn update_output_progress(m: &mut Market, quote_deals_id: u64, settle_messag
     for i in 0..settle_message_ids.len() {
         m.settle_message_ids[i] = settle_message_ids[i]
     }
+
+    println!("quote_deals_id={}", quote_deals_id);
+    println!("settle_message_ids={:?}", m.settle_message_ids);
 }
