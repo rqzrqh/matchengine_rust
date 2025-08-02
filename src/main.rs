@@ -5,6 +5,7 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 use rdkafka::consumer::Consumer;
 use rdkafka::config::RDKafkaLogLevel;
+use uuid::{uuid, Uuid};
 
 use hyper::{Body, Response, Server, Error};
 use hyper::service::{make_service_fn, service_fn};
@@ -27,7 +28,7 @@ mod mainprocess;
 mod httpserver;
 mod task;
 
-#[tokio::main]
+//#[tokio::main]
 async fn start_httpserver(main_routine_sender: mpsc::Sender<task::Task>) {
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
 
@@ -138,19 +139,19 @@ fn main() {
         .build()
         .unwrap();
 
-    consumer_rt.spawn(async move {
+    let consumer_handler = consumer_rt.spawn(async move {
 
         let consumer:StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", brokers_clone2)
             .set("enable.partition.eof", "false")
-            .set("group.id", "my_consumer_group2")
+            //.set("group.id", "my_consumer_group")
+            // We'll give each session its own (unique) consumer group id,
+            // so that each session will receive all messages
+            .set("group.id", format!("match-{}", Uuid::new_v4()))
             .set("enable.auto.commit", "true")
             .set("auto.commit.interval.ms", "5000")
             .set("enable.auto.offset.store", "false")
             .set_log_level(RDKafkaLogLevel::Debug)
-            // We'll give each session its own (unique) consumer group id,
-            // so that each session will receive all messages
-            //.set("group.id", format!("chat-{}", Uuid::new_v4()))
             .create()
             .expect("Failed to create client");
 
@@ -235,6 +236,7 @@ fn main() {
         }
     }
 
+    //consumer_handler.await.unwrap();
     let _ = timer_thread.join();
     let _ = http_thread.join();
 }

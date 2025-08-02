@@ -3,8 +3,10 @@ use std::{thread, str, sync::mpsc, time::Duration};
 use std::rc::Rc;
 use rust_decimal::prelude::*;
 use json::*;
-use kafka::producer::{Producer, Record, RequiredAcks};
 use crate::task::*;
+
+use rdkafka::producer::{ FutureProducer, FutureRecord };
+use rdkafka::{ config::ClientConfig };
 
 pub struct Publish {
     sender: mpsc::Sender<Box<OutputPublishTask>>,
@@ -35,51 +37,88 @@ impl Publish {
         let settle_group_count = settle_message_ids.len() as u32;
 
         thread::spawn(move || {
-            let mut producer = Producer::from_hosts(vec!(brokers.to_owned()))
-                    .with_ack_timeout(Duration::from_secs(1))
-                    .with_required_acks(RequiredAcks::One)
+
+            let producer_rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)// one thread
+                .enable_all()
+                .build()
+                .unwrap();
+
+            producer_rt.block_on(async {
+
+                let producer: &FutureProducer = &ClientConfig::new()
+                    .set("bootstrap.servers", brokers)
+                    .set("message.timeout.ms", "5000")
                     .create()
-                    .unwrap();
-            let mut quote_deals_id = quote_deals_id;
-            let mut settle_message_ids:Vec<u64> = settle_message_ids.clone();
+                    .expect("Producer creation error");
 
-            loop {
-                let task:Box<OutputPublishTask> = receiver.recv().unwrap();
-                let x = task.as_ref();
-                match x {
-                    OutputPublishTask::QuotePublishTask(tsk) => {
-                        if tsk.deals_id > quote_deals_id {
-                            let topic = &tsk.topic;
-                            let data = &tsk.data;
-                            producer.send(&Record::from_value(&topic, data.to_string().as_bytes())).unwrap();
-                            quote_deals_id = tsk.deals_id;
+                let mut quote_deals_id = quote_deals_id;
+                let mut settle_message_ids:Vec<u64> = settle_message_ids.clone();
 
-                            let task = PublishProgressTask{
-                                quote_deals_id: quote_deals_id,
-                                settle_message_ids: settle_message_ids.clone(),
-                            };
-                            main_routine_sender.send(Task::ProgressUpdateTask(task)).expect("send progress update task failed");
-                        }
-                    },
-                    OutputPublishTask::SettlePublishTask(tsk) => {
+                loop {
+                    let task:Box<OutputPublishTask> = receiver.recv().unwrap();
+                    let x = task.as_ref();
+                    match x {
+                        OutputPublishTask::QuotePublishTask(tsk) => {
+                            if tsk.deals_id > quote_deals_id {
+                                // check continuous
 
-                        let group_id = tsk.group_id as usize;
+                                let topic = &tsk.topic;
+                                let data = &tsk.data;
 
-                        if tsk.message_id > settle_message_ids[group_id] {
-                            let topic = &tsk.topic;
-                            let data = &tsk.data;
-                            producer.send(&Record::from_value(&topic, data.to_string().as_bytes())).unwrap();
-                            settle_message_ids[group_id] = tsk.message_id;
+                                let x = data.to_string();
+                                let y = x.as_bytes();
+                                let record = FutureRecord::to(&topic).payload(y);
+                                let delivery_status = producer.send::<Vec<u8>, _, _>(
+                                    record,
+                                    Duration::from_secs(5000)
+                                );
+                                match delivery_status.await {
+                                    Ok(_) => {},
+                                    Err(_) => {panic!("publish settle failed");},
+                                }
 
-                            let task = PublishProgressTask{
-                                quote_deals_id: quote_deals_id,
-                                settle_message_ids: settle_message_ids.clone(),
-                            };
-                            main_routine_sender.send(Task::ProgressUpdateTask(task)).expect("send progress update task failed");
+                                quote_deals_id = tsk.deals_id;
+
+                                let task = PublishProgressTask{
+                                    quote_deals_id: quote_deals_id,
+                                    settle_message_ids: settle_message_ids.clone(),
+                                };
+                                main_routine_sender.send(Task::ProgressUpdateTask(task)).expect("send progress update task failed");
+                            }
+                        },
+                        OutputPublishTask::SettlePublishTask(tsk) => {
+
+                            let group_id = tsk.group_id as usize;
+
+                            if tsk.message_id > settle_message_ids[group_id] {
+                                let topic = &tsk.topic;
+                                let data = &tsk.data;
+
+                                let x = data.to_string();
+                                let y = x.as_bytes();
+                                let record = FutureRecord::to(&topic).payload(y);
+                                let delivery_status = producer.send::<Vec<u8>, _, _>(
+                                    record,
+                                    Duration::from_secs(5000)
+                                );
+                                match delivery_status.await {
+                                    Ok(_) => {},
+                                    Err(_) => {panic!("publish quote failed");},
+                                }
+
+                                settle_message_ids[group_id] = tsk.message_id;
+
+                                let task = PublishProgressTask{
+                                    quote_deals_id: quote_deals_id,
+                                    settle_message_ids: settle_message_ids.clone(),
+                                };
+                                main_routine_sender.send(Task::ProgressUpdateTask(task)).expect("send progress update task failed");
+                            }
                         }
                     }
                 }
-            }
+            })
         });
 
         Publish {
@@ -109,7 +148,14 @@ impl Publish {
             data: object,
         };
 
-        self.sender.send(Box::new(OutputPublishTask::SettlePublishTask(message))).expect("send failed");
+        let res = self.sender.send(Box::new(OutputPublishTask::SettlePublishTask(message)));
+        match res {
+            Ok(_) => {
+            },
+            Err(e) => {
+                panic!("publish_put_order failed.{}", e);
+            }
+        }
     }
 
     pub fn publish_cancel_order(&self, m: &Market, extern_id: u64, order: &Rc<Order>) {
@@ -133,7 +179,14 @@ impl Publish {
             data: object,
         };
 
-        self.sender.send(Box::new(OutputPublishTask::SettlePublishTask(message))).expect("send failed");
+        let res = self.sender.send(Box::new(OutputPublishTask::SettlePublishTask(message)));
+        match res {
+            Ok(_) => {
+            },
+            Err(e) => {
+                panic!("publish_cancel_order failed.{}", e);
+            }
+        }
     }
 
     pub fn publish_deal(&self, m: &Market, extern_id: u64, tm: i64, user_id: u32, rival_user_id: u32, order_id: u64, role: u32,
@@ -173,7 +226,14 @@ impl Publish {
             data: object,
         };
 
-        self.sender.send(Box::new(OutputPublishTask::SettlePublishTask(message))).expect("send failed");
+        let res = self.sender.send(Box::new(OutputPublishTask::SettlePublishTask(message)));
+        match res {
+            Ok(_) => {
+            },
+            Err(e) => {
+                panic!("publish_deal failed.{}", e);
+            }
+        }
     }
 
     pub fn publish_error(&self, m: &mut Market, extern_id: u64, user_id: u32, params: &JsonValue, code: u32) {
@@ -200,7 +260,14 @@ impl Publish {
             data: object,
         };
 
-        self.sender.send(Box::new(OutputPublishTask::SettlePublishTask(message))).expect("send failed");
+        let res = self.sender.send(Box::new(OutputPublishTask::SettlePublishTask(message)));
+        match res {
+            Ok(_) => {
+            },
+            Err(e) => {
+                panic!("publish_error failed.{}", e);
+            }
+        }
     }
 
     pub fn publish_quote_deal(&self, m: &Market, tm: i64, price: &Decimal, amount: &Decimal, side: u32) {
@@ -228,6 +295,13 @@ impl Publish {
             data: object,
         };
 
-        self.sender.send(Box::new(OutputPublishTask::QuotePublishTask(message))).expect("send failed");
+        let res = self.sender.send(Box::new(OutputPublishTask::QuotePublishTask(message)));
+        match res {
+            Ok(_) => {
+            },
+            Err(e) => {
+                panic!("publish_quote_deal failed.{}", e);
+            }
+        }
     }
 }
