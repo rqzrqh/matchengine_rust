@@ -14,9 +14,15 @@ pub struct SqlDumpTask {
     pub tm: i64,
 }
 
+pub struct PublishProgressTask {
+    pub quote_deals_id: u64,
+    pub settle_message_ids: Vec<u64>,
+}
+
 pub enum Task {
     MqTask(KafkaMqTask),
     QueryTask(HttpQueryTask),
     DumpTask(SqlDumpTask),
+    ProgressUpdateTask(PublishProgressTask),
     Terminate,
 }

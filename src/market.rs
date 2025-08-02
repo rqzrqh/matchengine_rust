@@ -121,7 +121,7 @@ impl Market {
             order_id: 0,
             deals_id: 0,
             message_id: 0,
-            input_offset: 0,
+            input_offset: -1,
             name : name.clone(),
             stock_prec: stock_prec,
             money_prec: money_prec,

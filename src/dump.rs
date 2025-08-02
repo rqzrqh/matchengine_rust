@@ -68,8 +68,8 @@ fn dump_others_to_db(conn: &mut PooledConn, m: &Market, tm: i64) {
         ay[i] = m.settle_message_ids[i].into();
     }
 
-    let sql = format!("INSERT INTO `snap` (`id`, `time`, `oper_id`, `order_id`, `deals_id`, `message_id`, `input_offset`, `quote_deals_id`, `settle_message_ids`) 
-                                        VALUES (NULL, {}, {}, {}, {}, {}, {}, {}, {}) ", tm, m.oper_id, m.order_id, m.deals_id, m.message_id, m.input_offset, m.quote_deals_id, ay.to_string());
+    let sql = format!("INSERT INTO `snap` (`id`, `time`, `oper_id`, `order_id`, `deals_id`, `message_id`, `input_offset`, `asks`, `bids`, `quote_deals_id`, `settle_message_ids`) 
+                                        VALUES (NULL, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{}') ", tm, m.oper_id, m.order_id, m.deals_id, m.message_id, m.input_offset, m.asks.len(), m.bids.len(), m.quote_deals_id, ay.to_string());
     info!("{}", sql);
     conn.query_drop(&sql).unwrap_or_else(|e| {
         panic!("{}", e.to_string());
@@ -99,6 +99,7 @@ pub fn handle_dump(m: &mut Market, tm: i64, pool: &Pool) {
 
     let table = format!("snap_order_{}", tm);
 
+    // dump orders first to keep consistence with snap table record
     dump_orders_to_db(&mut conn, m, &table);
     dump_others_to_db(&mut conn, m, tm);
 

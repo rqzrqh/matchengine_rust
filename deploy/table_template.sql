@@ -24,6 +24,8 @@ CREATE TABLE `snap` (
 	`deals_id`      	BIGINT UNSIGNED NOT NULL,
 	`message_id`    	BIGINT UNSIGNED NOT NULL DEFAULT '0',
 	`input_offset`      BIGINT NOT NULL DEFAULT '-1',
+	`asks`   			INT UNSIGNED NOT NULL,
+	`bids`   			INT UNSIGNED NOT NULL,
 	`quote_deals_id`    BIGINT UNSIGNED NOT NULL,
-	`settle_message_ids` TEXT NOT NULL,
+	`settle_message_ids` TEXT NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
