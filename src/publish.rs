@@ -1,8 +1,9 @@
 use crate::market::*;
-use std::sync::mpsc;
+use std::{thread, str, sync::mpsc, time::Duration};
 use std::rc::Rc;
 use rust_decimal::prelude::*;
 use json::*;
+use kafka::producer::{Producer, Record, RequiredAcks};
 
 pub static USER_GROUP_SIZE:u32 = 64;
 
@@ -16,7 +17,24 @@ pub struct Publish {
 }
 
 impl Publish {
-    pub fn new(sender: mpsc::Sender<Box<PublishInfo>>) -> Publish {
+    pub fn new(brokers: String) -> Publish {
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let mut producer = Producer::from_hosts(vec!(brokers.to_owned()))
+                    .with_ack_timeout(Duration::from_secs(1))
+                    .with_required_acks(RequiredAcks::One)
+                    .create()
+                    .unwrap();
+
+            loop {
+                let received:Box<PublishInfo> = receiver.recv().unwrap();
+                let topic = received.topic;
+                let data = &received.data;
+                producer.send(&Record::from_value(&topic, data.to_string().as_bytes())).unwrap();
+            }
+        });
+
         Publish {
             sender: sender,
         }
