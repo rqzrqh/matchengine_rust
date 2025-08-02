@@ -108,13 +108,13 @@ pub fn restore_output_state(m: &mut Market, pool: &Pool) -> Option<(u64, u64, u6
 
                 let id = v.0;
                 let quote_deals_id = v.1;
-                let settle_message_ids = v.2;
+                let str_settle_message_ids = v.2;
 
-                let parsed = json::parse(&settle_message_ids).expect("json decode failed");
+                let parsed = json::parse(&str_settle_message_ids).expect("json decode failed");
                 info!("{}", parsed);
 
                 if !parsed.is_array() {
-                    error!("settle_message_ids not array {}", parsed);
+                    error!("settle_message_ids is not array {}", parsed);
                     process::exit(0);
                 }
 
@@ -123,15 +123,19 @@ pub fn restore_output_state(m: &mut Market, pool: &Pool) -> Option<(u64, u64, u6
                     process::exit(0);
                 }
 
-                let mut min_settle_group_message_id:u64 = u64::MAX;
-
                 for i in 0..parsed.len() {
                     let group_message_id = parsed[i].as_u64().unwrap();
                     m.settle_message_ids[i] = group_message_id;
+                }
 
-                    // optimize messageid=0
-                    if group_message_id < min_settle_group_message_id {
-                        min_settle_group_message_id = group_message_id;
+                // find the first non-zero value
+                let mut min_settle_group_message_id:u64 = 0;
+                let mut settle_message_ids = m.settle_message_ids.clone();
+                settle_message_ids.sort();
+                for i in 0..settle_message_ids.len() {
+                    if settle_message_ids[i] != 0 {
+                        min_settle_group_message_id = settle_message_ids[i];
+                        break;
                     }
                 }
 
