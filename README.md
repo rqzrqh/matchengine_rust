@@ -43,7 +43,7 @@ python3 ./tests/order_generator.py
 
 ### TODO
 
-1.Replay from a specificed offset. But the rust-library of kafka and rdkafka aren't yet support this feature, the rocketmq also is incomplete.
+1.Replay from a specificed offset. But the rust-rdkafka seems not support it.
 
 2.Use a better decimal library for rescale a value. The rust_decimal's function of rescale only support decimal part, not support integer part.
 
@@ -51,7 +51,7 @@ python3 ./tests/order_generator.py
 
 4.Automatically deletes old snapshot
 
-5.use rocketmq, kafka is not a suitable message queue for more than 64 topics
+5.optimize publish performance
 
 
 
