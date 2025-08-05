@@ -14,146 +14,49 @@ Matchengine is a state matchine, put_order/cancel_order message were treated as 
 
 
 
-mysql> show tables;
-
-+-----------------------+
-
-| Tables_in_eth_btc   |
-
-+-----------------------+
-
-| snap         |
-
-| snap_order_1628750228 |
-
-| snap_order_1628750828 |
-
-| snap_order_1628751428 |
-
-| snap_order_example  |
-
-+-----------------------+
-
-14 rows in set (0.00 sec)
-
-
-
-mysql> select * from snap;
-
-+----+------------+---------+----------+----------+------------+--------------+
-
-| id | time    | oper_id | order_id | deals_id | message_id | input_offset |
-
-+----+------------+---------+----------+----------+------------+--------------+
-
-| 1 | 1628750228 |    4 |    4 |    1 |     6 |      3 |
-
-| 2 | 1628750828 |    4 |    4 |    1 |     6 |      3 |
-
-| 3 | 1628751428 |    4 |    4 |    1 |     6 |      3 |
-
-+----+------------+---------+----------+----------+------------+--------------+
-
-12 rows in set (0.00 sec)
-
-
-
-mysql> select * from snap_order_1628751428;
-
-+----+---+------+-------------+-------------+---------+-------+--------+----------------+----------------+-------+------------+------------+----------+
-
-| id | t | side | create_time | update_time | user_id | price | amount | taker_fee_rate | maker_fee_rate | left | deal_stock | deal_money | deal_fee |
-
-+----+---+------+-------------+-------------+---------+-------+--------+----------------+----------------+-------+------------+------------+----------+
-
-| 1 | 1 |  2 | 1628749643 | 1628749687 |    0 | 100.0 | 100.0 | 0.1      | 0.1      | 90.0 | 10.0    | 1000.00  | 1.00   |
-
-| 2 | 1 |  2 | 1628749645 | 1628749645 |    0 | 100.0 | 100.0 | 0.1      | 0.1      | 100.0 | 0     | 0     | 0    |
-
-| 4 | 1 |  1 | 1628749756 | 1628749756 |   11 | 102.0 | 20.0  | 0.1      | 0.1      | 20.0 | 0     | 0     | 0    |
-
-+----+---+------+-------------+-------------+---------+-------+--------+----------------+----------------+-------+------------+------------+----------+
-
-3 rows in set (0.00 sec)
-
-
-
-All ids are continuous increasing.
-
-
-
 ![image-20210813104749921](https://github.com/rqzrqh/matchengine_rust/blob/master/image/recover_process.png?raw=true)
+
+1.read the latest snap, get the quote_deals_id and min_settle_message_id
+
+2.walk all snaps by id from large to small , find a snap which deal id is less than quote_deals_id and message_id is less than min_settle_message_id
+
+3.apply the snap
 
 
 
 # Correctness
 
-Once offer_service receives a put_order request, it would check and generate a pre-order in db.
+upper stream(market sort module)
 
-The message sequence of any users in a market the settle_service see are put_order->as taker deals->as taker deals->as maker deals->as maker deals->...->cancel_order.
-
-Once received a put_order message, it uses extern_id in message to associate with a pre-order in db, and creates a order.
-
-Once received a deals message, (either as taker or as maker) it changes the corresponding user asset and order asset.
-
-Once received a cancel_order messaege, it cancels the corresponding order in db.
+1.number each request of current market, push to mq in batch, if failed or on the fly, resend it.
 
 
 
-# Exception Handling
+the engine
 
-Settle_service is data strong consistency by write order, asset and consume offset to db in sql transaction. Matchengine dumps consume-offset and engine's state to db periodically,  input and state are consistent. When matchengine restarted, selected the latest state in db may caused output loss and raise an exception! Because the corresponding output may not had been sent to message queue! 
+1.input must be sorted by continuous oper_id, the engine discard incontinuous input request.
 
-**How to find a corrent snapshot?**
+2.serial processing, push-data orderly
 
-The key is the corresponding output of the state must had been sent to message queue or processed by settle_service. Through the metadata of the message queue topic we can‘t obtain any valuable information about recovering . So we should read from the consume state in settle_service's db.
-
-
-
-*step1: read all message_id from db*
-
-```
-select 'topic','message_id' from 'market_settle_message_id' where'market'='eth_btc'
-```
-
-| topic     | market   | message_id |
-| --------- | -------- | ---------- |
-| settle.0  | eth_btc  | 500        |
-| ...       | eth_btc  | 503        |
-| settle.63 | eth_btc  | ...        |
-| settle.0  | eth_usdt | 600        |
-| ...       | eth_usdt | ...        |
-| settle.63 | eth_usdt | 590        |
+3.recover to the  input position and state correctly, corresponding output must has been pushed to the mq.
 
 
 
-*step2: select a correct message_id*
+down stream(user settle module)
 
-There are two cases for message queue with different features. 
+1.record latest group message id, and ignore incontinuous message.
 
-(1)process as producer, there aren't any relationship between topics.(kafka)
+2.commit settle result and settle group offset in database transaction
 
-select min one as message_id
-
-(2)process as producer, messages sent to topics are ordered.  message order between topics are sequenced.
-
-select max one as message_id
+3.recover from database
 
 
 
-*step3: matchengine get correct snapshot*
+down stream(quote deals module)
 
-select a snapshot whose message_id <= message_id, ensure all outputs is handled by settle_service 
+1.record latest deals id, and ignore incontinuous deals.
 
-
-
-**How to process the retransmit or old message?**
-
-For settle_service, it would receive message which has been processed before. Because matchengine restart. Use message_id for deduplication, if the message of one market's message id less equal than processed before, it ignore. 
-
-**Replica State Machine avoid a single point of failure**
-
-One trade pair can run multi matchengine processes, just like Replica State Machine. Multi Matchengine try to get the same distributed lock(use etcd). In fact, distributed lock could not ensure only the winner run at any time, but it can make only one process run at most of the time. For settle_service, when handle the message of same trade pair at one settle_topic, it must handle the message which msg_id is bigger than last processes.
+2.recover from deals id.
 
 
 
@@ -166,6 +69,10 @@ Memory-matchengine is high performance. One matchengine corresponds one market, 
 The match results are splited into multiple topics, this made user-level load balance and topic-level message orderly. Different Topics can be  processed concurrency.
 
 
+
+# Fault-Tolerant
+
+All service can set up multiple services for fault-tolerant
 
 
 
