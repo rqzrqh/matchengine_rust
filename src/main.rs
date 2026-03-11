@@ -1,5 +1,5 @@
 use std::{thread, net::SocketAddr, str, sync::mpsc, fs::File, io::prelude::*, env, process, time::Duration};
-use rdkafka::consumer::{BaseConsumer, StreamConsumer, CommitMode};
+use rdkafka::consumer::{BaseConsumer, StreamConsumer};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
@@ -156,20 +156,9 @@ fn main() {
             .expect("Failed to create client");
 
         let mut tpl = TopicPartitionList::new();
-        //
-        // tpl.add_partition_offset(&topic_name, 0, Offset::Beginning)
-        //     .unwrap();
-        // tpl.add_partition_offset(&topic_name, 1, Offset::End)
-        //     .unwrap();
-        //
-
-        tpl.add_partition_offset(&input_topic, 0, Offset::Offset(input_offset+1)).unwrap();
-        //consumer.seek_partitions(tpl, None).expect("failed to seek_partitions"); // not work
-
-        // update session commit offset to replay from specific offset
-        consumer.commit(&tpl, CommitMode::Sync).expect("failed to commit");
-
-        consumer.subscribe(&[&input_topic]).expect("failed to subscribe");
+        tpl.add_partition_offset(&input_topic, 0, Offset::Offset(input_offset + 1))
+            .unwrap();
+        consumer.assign(&tpl).expect("failed to assign");
 
         loop {
 

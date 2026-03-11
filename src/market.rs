@@ -87,26 +87,29 @@ impl PartialEq for Order {
 }
 
 pub struct Market {
-    // state
-    pub oper_id: u64,
-    pub order_id: u64,
-    pub deals_id: u64,
-    pub message_id: u64,
-    pub input_offset: i64,
 
     pub name: String,
-
     pub stock_prec: u32,
     pub money_prec: u32,
     pub fee_rate_prec: u32,
     pub min_amount: Decimal,
     orders: HashMap<u64, Rc<Order>>,
     users: HashMap<u32, OrderedSkipList<Rc<Order>>>,
-    pub asks: OrderedSkipList<Rc<Order>>,
-    pub bids: OrderedSkipList<Rc<Order>>,
-
     pub stock_amount: Decimal,
     pub money_amount: Decimal,
+
+    // input
+    pub input_offset: i64,
+
+    // state
+    pub oper_id: u64,
+    pub order_id: u64,
+    pub deals_id: u64,
+    pub message_id: u64,
+
+    // state
+    pub asks: OrderedSkipList<Rc<Order>>,
+    pub bids: OrderedSkipList<Rc<Order>>,
 
     // output state
     pub quote_deals_id: u64,

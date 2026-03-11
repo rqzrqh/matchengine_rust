@@ -45,15 +45,13 @@ python3 ./tests/order_generator.py
 
 ### TODO
 
-1.Replay from a specificed offset. But the rust-rdkafka seems not work well now.
+1.The input data contain oper_id and the engine record it and do continuity check.
 
-2.The input data contain oper_id and the engine record it and do continuity check.
+2.Use orderly batch send for higher data-push performance
 
-3.Use orderly batch send for higher data-push performance
+3.Use a better decimal library for rescale a value. The rust_decimal's function of rescale only support decimal part, not support integer part.
 
-4.Use a better decimal library for rescale a value. The rust_decimal's function of rescale only support decimal part, not support integer part.
-
-5.Automatically deletes old snapshot
+4.Automatically deletes old snapshot
 
 
 
