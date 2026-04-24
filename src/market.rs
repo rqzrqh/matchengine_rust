@@ -100,6 +100,7 @@ pub struct Market {
 
     // input
     pub input_offset: i64,
+    pub input_sequence_id: u64,
 
     // state
     pub oper_id: u64,
@@ -125,6 +126,7 @@ impl Market {
             deals_id: 0,
             message_id: 0,
             input_offset: -1,
+            input_sequence_id: 0,
             name : name.clone(),
             stock_prec: stock_prec,
             money_prec: money_prec,

@@ -1,13 +1,12 @@
 use std::{thread, net::SocketAddr, str, sync::mpsc, fs::File, io::prelude::*, env, process, time::Duration};
 use rdkafka::consumer::{BaseConsumer, StreamConsumer};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
-use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::util::Timeout;
 use rdkafka::consumer::Consumer;
 use rdkafka::config::RDKafkaLogLevel;
 use uuid::{uuid, Uuid};
 
-use hyper::{Body, Response, Server, Error};
+use hyper::{Body, Response, Server, Error, Method, StatusCode};
+use hyper::header::{self, HeaderValue};
 use hyper::service::{make_service_fn, service_fn};
 use rust_decimal::prelude::*;
 use mysql::*;
@@ -43,10 +42,30 @@ async fn start_httpserver(main_routine_sender: mpsc::Sender<task::Task>) {
                 let main_routine_sender2 = main_routine_sender1.clone();
 
                 async move {
+                    if req.method() == Method::OPTIONS {
+                        return Ok::<_, Error>(
+                            Response::builder()
+                                .status(StatusCode::NO_CONTENT)
+                                .header(
+                                    header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                                    HeaderValue::from_static("*"),
+                                )
+                                .header(
+                                    header::ACCESS_CONTROL_ALLOW_METHODS,
+                                    HeaderValue::from_static("POST, OPTIONS"),
+                                )
+                                .header(
+                                    header::ACCESS_CONTROL_ALLOW_HEADERS,
+                                    HeaderValue::from_static("Content-Type"),
+                                )
+                                .body(Body::empty())
+                                .unwrap(),
+                        );
+                    }
 
                     let (tx, rx) = oneshot::channel();
 
-                    let msg = hyper::body::to_bytes(req).await.unwrap();
+                    let msg = hyper::body::to_bytes(req.into_body()).await.unwrap();
                     let str = String::from_utf8(msg.to_vec()).unwrap();
 
                     let task = task::HttpQueryTask {
@@ -56,9 +75,14 @@ async fn start_httpserver(main_routine_sender: mpsc::Sender<task::Task>) {
 
                     main_routine_sender2.send(task::Task::QueryTask(task)).expect("send httptask failed");
 
-                    let res = rx.await;
+                    let res = rx.await.unwrap();
 
-                    Ok::<_, Error>(Response::new(Body::from(res.unwrap())))
+                    let mut response = Response::new(Body::from(res));
+                    response.headers_mut().insert(
+                        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                        HeaderValue::from_static("*"),
+                    );
+                    Ok::<_, Error>(response)
                 }
             }))
         }
@@ -210,7 +234,8 @@ fn main() {
                 mainprocess::handle_mq_message(&publisher, &mut mk, t.offset, &t.data);
             },
             task::Task::QueryTask(a) => {
-                httpserver::handle_http_request(&mk, &a.content, a.rsp);
+                let res = httpserver::handle_http_request(&mk, &a.content);
+                let _ = a.rsp.send(res);
             },
             task::Task::DumpTask(b) => {
                 dump::handle_dump(&mut mk, b.tm, &pool);

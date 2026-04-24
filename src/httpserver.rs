@@ -1,52 +1,50 @@
 use crate::market::*;
-use tokio::sync::oneshot;
-use json::*;
+use json::JsonValue;
 use rust_decimal::prelude::*;
-use std::rc::Rc;
 use skiplist::OrderedSkipList;
+use std::rc::Rc;
 
-pub fn handle_http_request(m: &Market, content: &String, rsp: oneshot::Sender<String>) {
+fn json_err(msg: &str) -> String {
+    let mut o = JsonValue::new_object();
+    o["error"] = msg.into();
+    o.dump()
+}
 
-    let parsed = json::parse(content).unwrap();
+pub fn handle_http_request(m: &Market, content: &String) -> String {
+    let parsed = match json::parse(content) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("json parse failed {}", e);
+            return json_err("invalid json");
+        }
+    };
 
     if !parsed.is_object() {
         warn!("request msg not object {}", parsed);
-        return;
+        return json_err("not an object");
     }
 
-    let method = parsed["method"].as_str().unwrap();
+    let method = match parsed["method"].as_str() {
+        Some(s) => s,
+        None => return json_err("method missing or not string"),
+    };
     let params = &parsed["params"];
-    let res: String;
 
     match method {
-        "market.summary" => {
-            res = handle_market_summary(m, params);
-        },
-        "market.status" => {
-            res = handle_market_status(m, params);
-        },
-        "market.order_detail" => {
-            res = handle_order_detail(m, params);
-        },
-        "market.order_book" => {
-            res = handle_order_book(m, params);
-        },
-        "market.user_order_pending" => {
-            res = handle_user_order_pending(m, params);
-        },
-        _ => {
-            res = String::from("unsupported method");
-        },
+        "market.summary" => handle_market_summary(m, params),
+        "market.status" => handle_market_status(m, params),
+        "market.order_detail" => handle_order_detail(m, params),
+        "market.order_book" => handle_order_book(m, params),
+        "market.user_order_pending" => handle_user_order_pending(m, params),
+        _ => json_err("unsupported method"),
     }
-
-    let _ = rsp.send(res);
 }
 
 fn handle_market_summary(m: &Market, params: &JsonValue) -> String {
     let market_name = params["market"].as_str().unwrap();
 
     if !m.name.eq(market_name) {
-        return String::from("market not equal")
+        return String::from("market not equal");
     }
 
     let mut object = JsonValue::new_object();
@@ -55,11 +53,11 @@ fn handle_market_summary(m: &Market, params: &JsonValue) -> String {
     let mut bid_amount = Decimal::ZERO;
 
     for order in &m.asks {
-        ask_amount += order.left.get(); 
+        ask_amount += order.left.get();
     }
 
     for order in &m.bids {
-        bid_amount += order.left.get(); 
+        bid_amount += order.left.get();
     }
 
     object["name"] = m.name.clone().into();
@@ -74,7 +72,7 @@ fn handle_market_summary(m: &Market, params: &JsonValue) -> String {
 fn handle_market_status(m: &Market, params: &JsonValue) -> String {
     let market_name = params["market"].as_str().unwrap();
     if !m.name.eq(market_name) {
-        return String::from("market not equal")
+        return String::from("market not equal");
     }
 
     let mut object = JsonValue::new_object();
@@ -83,6 +81,7 @@ fn handle_market_status(m: &Market, params: &JsonValue) -> String {
     object["deals_id"] = m.deals_id.into();
     object["message_id"] = m.message_id.into();
     object["input_offset"] = m.input_offset.into();
+    object["input_sequence_id"] = m.input_sequence_id.into();
 
     object.dump()
 }
@@ -91,17 +90,13 @@ fn handle_order_detail(m: &Market, params: &JsonValue) -> String {
     let market_name = params["market"].as_str().unwrap();
     let order_id = params["order_id"].as_u64().unwrap();
     if !m.name.eq(market_name) {
-        return String::from("market not equal")
+        return String::from("market not equal");
     }
 
     let order = m.get_order(&order_id);
     match order {
-        Some(o) => {
-            o.to_json().dump()
-        },
-        None => {
-            String::from("not exist")
-        },
+        Some(o) => o.to_json().dump(),
+        None => String::from("not exist"),
     }
 }
 
@@ -132,7 +127,7 @@ fn handle_order_book(m: &Market, params: &JsonValue) -> String {
     let limit = params["limit"].as_u32().unwrap();
 
     if !m.name.eq(market_name) {
-        return String::from("market not equal")
+        return String::from("market not equal");
     }
 
     let mut object = JsonValue::new_object();
@@ -159,7 +154,7 @@ fn handle_user_order_pending(m: &Market, params: &JsonValue) -> String {
     let limit = params["limit"].as_u32().unwrap();
 
     if !m.name.eq(market_name) {
-        return String::from("market not equal")
+        return String::from("market not equal");
     }
 
     let mut object = JsonValue::new_object();
@@ -170,7 +165,7 @@ fn handle_user_order_pending(m: &Market, params: &JsonValue) -> String {
         object["total"] = orders.len().into();
 
         let mut array = JsonValue::new_array();
-        let mut count:u32 = 0;
+        let mut count: u32 = 0;
 
         while count < limit {
             let index = offset + count;

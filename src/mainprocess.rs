@@ -9,9 +9,6 @@ pub fn handle_mq_message(publisher: &Publish, m: &mut Market, offset: i64, data:
     let parsed = json::parse(data).unwrap();
     info!("{}", parsed);
 
-    m.oper_id += 1;
-    m.input_offset = offset;
-
     if !parsed.is_object() {
         error!("mq msg not object {}", parsed);
         return;
@@ -32,9 +29,31 @@ pub fn handle_mq_message(publisher: &Publish, m: &mut Market, offset: i64, data:
         return;
     }
 
+    if !parsed.has_key("input_sequence_id") || !parsed["input_sequence_id"].is_number() {
+        error!("input_sequence_id parse failed {}", parsed);
+        return;
+    }
+
+    let msg_seq = parsed["input_sequence_id"].as_u64().unwrap();
+    let Some(expected_seq) = m.input_sequence_id.checked_add(1) else {
+        error!("market input_sequence_id overflow {}", m.input_sequence_id);
+        return;
+    };
+    if msg_seq != expected_seq {
+        error!(
+            "input_sequence_id mismatch: message {} expected next {}",
+            msg_seq, expected_seq
+        );
+        return;
+    }
+
     let method = parsed["method"].as_str().unwrap();
     let extern_id = parsed["id"].as_u64().unwrap();
     let params = &parsed["params"];
+
+    m.oper_id += 1;
+    m.input_offset = offset;
+    m.input_sequence_id = msg_seq;
 
     match method {
         "order.put_limit" => on_order_put_limit(&publisher, m, extern_id, &params),

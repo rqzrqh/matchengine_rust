@@ -24,6 +24,7 @@ CREATE TABLE `snap` (
 	`deals_id`      	BIGINT UNSIGNED NOT NULL,
 	`message_id`    	BIGINT UNSIGNED NOT NULL DEFAULT '0',
 	`input_offset`      BIGINT NOT NULL DEFAULT '-1',
+	`input_sequence_id` BIGINT UNSIGNED NOT NULL DEFAULT '0',
 	`asks`   			INT UNSIGNED NOT NULL,
 	`bids`   			INT UNSIGNED NOT NULL,
 	`quote_deals_id`    BIGINT UNSIGNED NOT NULL,

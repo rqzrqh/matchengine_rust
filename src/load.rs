@@ -168,9 +168,9 @@ pub fn restore_state(m: &mut Market, pool: &Pool) {
             let min_settle_group_message_id = output.2;
 
             loop {
-                let sql = format!("SELECT `id`, `time`, `oper_id`, `order_id`, `deals_id`, `message_id`, `input_offset`, `asks`, `bids` from `snap` WHERE `id` < {} ORDER BY `id` DESC LIMIT 1", last_snap_id);
+                let sql = format!("SELECT `id`, `time`, `oper_id`, `order_id`, `deals_id`, `message_id`, `input_offset`, `input_sequence_id`, `asks`, `bids` from `snap` WHERE `id` < {} ORDER BY `id` DESC LIMIT 1", last_snap_id);
                 info!("{}", sql);
-                let res: Option<(u64, i64, u64, u64, u64, u64, i64, u32, u32)> = conn.query_first(&sql).unwrap();
+                let res: Option<(u64, i64, u64, u64, u64, u64, i64, u64, u32, u32)> = conn.query_first(&sql).unwrap();
                 match res {
                     Some(v) => {
 
@@ -181,11 +181,12 @@ pub fn restore_state(m: &mut Market, pool: &Pool) {
                         let deals_id = v.4;
                         let message_id = v.5;
                         let input_offset = v.6;
-                        asks = v.7;
-                        bids = v.8;
+                        let input_sequence_id = v.7;
+                        asks = v.8;
+                        bids = v.9;
 
-                        info!("found snap id:{} time:{} oper_id:{} order_id:{} deals_id:{} message_id:{} input_offset:{} asks:{} bids:{}", 
-                            id, tm, oper_id, order_id, deals_id, message_id, input_offset, asks, bids);
+                        info!("found snap id:{} time:{} oper_id:{} order_id:{} deals_id:{} message_id:{} input_offset:{} input_sequence_id:{} asks:{} bids:{}", 
+                            id, tm, oper_id, order_id, deals_id, message_id, input_offset, input_sequence_id, asks, bids);
 
                         if deals_id > quote_deals_id || message_id > min_settle_group_message_id {
 
@@ -209,6 +210,7 @@ pub fn restore_state(m: &mut Market, pool: &Pool) {
                         m.deals_id = deals_id;
                         m.message_id = message_id;
                         m.input_offset = input_offset;
+                        m.input_sequence_id = input_sequence_id;
 
                         load_order(m, &mut conn, tm);
                     },
@@ -227,6 +229,6 @@ pub fn restore_state(m: &mut Market, pool: &Pool) {
         panic!("order count error {} {} {} {}", asks, m.asks.len(), bids, m.bids.len());
     }
 
-    info!("restore state oper_id:{} order_id:{} deals_id:{} message_id:{} input_offset:{}", 
-        m.oper_id, m.order_id, m.deals_id, m.message_id, m.input_offset);
+    info!("restore state oper_id:{} order_id:{} deals_id:{} message_id:{} input_offset:{} input_sequence_id:{}", 
+        m.oper_id, m.order_id, m.deals_id, m.message_id, m.input_offset, m.input_sequence_id);
 }

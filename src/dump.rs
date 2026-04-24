@@ -68,8 +68,8 @@ fn dump_others_to_db(conn: &mut PooledConn, m: &Market, tm: i64) {
         ay[i] = m.settle_message_ids[i].into();
     }
 
-    let sql = format!("INSERT INTO `snap` (`id`, `time`, `oper_id`, `order_id`, `deals_id`, `message_id`, `input_offset`, `asks`, `bids`, `quote_deals_id`, `settle_message_ids`) 
-                                        VALUES (NULL, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{}') ", tm, m.oper_id, m.order_id, m.deals_id, m.message_id, m.input_offset, m.asks.len(), m.bids.len(), m.quote_deals_id, ay.to_string());
+    let sql = format!("INSERT INTO `snap` (`id`, `time`, `oper_id`, `order_id`, `deals_id`, `message_id`, `input_offset`, `input_sequence_id`, `asks`, `bids`, `quote_deals_id`, `settle_message_ids`) 
+                                        VALUES (NULL, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{}') ", tm, m.oper_id, m.order_id, m.deals_id, m.message_id, m.input_offset, m.input_sequence_id, m.asks.len(), m.bids.len(), m.quote_deals_id, ay.to_string());
     info!("{}", sql);
     conn.query_drop(&sql).unwrap_or_else(|e| {
         panic!("{}", e.to_string());
