@@ -14,4 +14,5 @@ user_id = 0
 amount = 100
 
 producer = KafkaProducer(bootstrap_servers='127.0.0.1:9092')
-order_ops.place_market_order(producer, extern_id, True, user_id, amount)
+seq = order_ops.get_input_sequence_id() + 1
+order_ops.place_market_order(producer, extern_id, True, user_id, amount, seq)

@@ -15,4 +15,5 @@ price = 100
 amount = 100
 
 producer = KafkaProducer(bootstrap_servers='127.0.0.1:9092')
-order_ops.place_limit_order(producer, extern_id, False, user_id, price, amount)
+seq = order_ops.get_input_sequence_id() + 1
+order_ops.place_limit_order(producer, extern_id, False, user_id, price, amount, seq)
