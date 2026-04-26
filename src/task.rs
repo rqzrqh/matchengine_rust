@@ -5,9 +5,34 @@ pub struct KafkaMqTask {
     pub data: String,
 }
 
-pub struct HttpQueryTask {
-    pub content: String,
-    pub rsp: oneshot::Sender<String>,
+#[derive(Debug)]
+pub enum RestOp {
+    MarketSummary { market: String },
+    MarketStatus { market: String },
+    OrderDetail { market: String, order_id: u64 },
+    OrderBook {
+        market: String,
+        side: u32,
+        offset: u32,
+        limit: u32,
+    },
+    UserOrdersPending {
+        market: String,
+        user_id: u32,
+        offset: u32,
+        limit: u32,
+    },
+}
+
+#[derive(Debug)]
+pub struct RestResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+pub struct RestQueryTask {
+    pub op: RestOp,
+    pub rsp: oneshot::Sender<RestResponse>,
 }
 
 pub struct SqlDumpTask {
@@ -21,7 +46,7 @@ pub struct PublishProgressTask {
 
 pub enum Task {
     MqTask(KafkaMqTask),
-    QueryTask(HttpQueryTask),
+    RestQuery(RestQueryTask),
     DumpTask(SqlDumpTask),
     ProgressUpdateTask(PublishProgressTask),
     Terminate,

@@ -24,7 +24,8 @@ cd deploy
 ```
 
 ```
-RUST_LOG=info cargo run --release ./deploy/eth_btc.conf
+# From repo root; path optional, defaults to ./config.yaml
+RUST_LOG=info cargo run --release
 ```
 
 ```
@@ -37,7 +38,9 @@ python3 ./tests/order_generator.py
 
 **src** all code
 
-**deploy**  scripts of init database and messagequeue, config file
+**deploy**  scripts of init database and messagequeue
+
+Root **config.yaml** is shared by the matching engine and the web app (YAML: `market` / `brokers` / `db`)
 
 **tests** very useful test scripts, generate various orders
 

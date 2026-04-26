@@ -1,0 +1,34 @@
+# Shared by matching engine and web-test (DB, Kafka, market, etc.)
+
+market:
+  name: eth_btc
+  stock_prec: 1
+  money_prec: 2
+  fee_prec: 1
+  min_amount: "0.1"
+
+brokers: "127.0.0.1:9092"
+
+db:
+  addr: "127.0.0.1:3306"
+  user: root
+  passwd: "123456"
+
+# --- Snapshot dump ---
+# Periodically writes one row to table `snap` and order data to `snap_order_<timestamp>` (forked process).
+snap_dump:
+  # Seconds between each dump.
+  dump_interval_secs: 600
+
+# --- Snapshot cleanup ---
+# Deletes old `snap` rows and matching `snap_order_*` tables. Two rules apply together (union): a row is
+# removable if it is too old OR if the table has more than max_snapshots rows (oldest removed first).
+# The one “correct” snapshot used for recovery is never deleted. The cleanup task always runs on
+# cleanup_interval_secs; if max_age_secs and max_snapshots are both 0, each pass does nothing.
+snap_cleanup:
+  # Delete snapshots whose `time` is older than now minus this many seconds. 0 = do not use this rule.
+  max_age_secs: 3600
+  # Keep at most this many newest snapshots (by `time`). 0 = do not use this rule.
+  max_snapshots: 10
+  # How often to evaluate the two rules above.
+  cleanup_interval_secs: 60

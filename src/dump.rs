@@ -76,17 +76,15 @@ fn dump_others_to_db(conn: &mut PooledConn, m: &Market, tm: i64) {
     });
 }
 
-pub fn handle_dump(m: &mut Market, tm: i64, pool: &Pool) {
-
-    unsafe{
+/// After `fork`, the child must not use the parent's [`Pool`]: duplicated TCP sockets cause
+/// `CodecError { Packets out of sync }`. Open a new pool from `db_url` in the child only.
+pub fn handle_dump(m: &mut Market, tm: i64, db_url: &str) {
+    unsafe {
         match fork() {
-            Ok(ForkResult::Parent { child, .. }) => {
-                //info!("Continuing execution in parent process, new child has pid: {}", child);
+            Ok(ForkResult::Parent { .. }) => {
                 return;
-            },
-            Ok(ForkResult::Child) => {
-                //info!("I'm a new child process");
-            },
+            }
+            Ok(ForkResult::Child) => {}
             Err(_) => {
                 panic!("Fork failed");
             }
@@ -95,7 +93,9 @@ pub fn handle_dump(m: &mut Market, tm: i64, pool: &Pool) {
 
     info!("dump to {}", tm);
 
-    let mut conn = pool.get_conn().unwrap();
+    let opts = Opts::from_url(db_url).expect("dump: invalid db url");
+    let pool = Pool::new(opts).expect("dump: Pool::new in child");
+    let mut conn = pool.get_conn().expect("dump: get_conn in child");
 
     let table = format!("snap_order_{}", tm);
 

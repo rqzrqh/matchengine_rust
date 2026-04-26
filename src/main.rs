@@ -1,129 +1,75 @@
-use std::{thread, net::SocketAddr, str, sync::mpsc, fs::File, io::prelude::*, env, process, time::Duration};
+use std::{thread, net::SocketAddr, str, sync::mpsc, env, process, time::Duration};
 use rdkafka::consumer::{BaseConsumer, StreamConsumer};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use rdkafka::consumer::Consumer;
 use rdkafka::config::RDKafkaLogLevel;
 use uuid::{uuid, Uuid};
 
-use hyper::{Body, Response, Server, Error, Method, StatusCode};
-use hyper::header::{self, HeaderValue};
-use hyper::service::{make_service_fn, service_fn};
 use rust_decimal::prelude::*;
 use mysql::*;
 use chrono::prelude::*;
-use tokio::sync::oneshot;
 extern crate pretty_env_logger;
 #[macro_use] extern crate log;
 extern crate process_lock;
 use process_lock::*;
 
+mod config;
 mod error;
 mod engine;
 mod market;
 mod publish;
 mod dump;
+mod correct_snap;
+mod snap_cleanup;
 mod load;
 mod mainprocess;
-mod httpserver;
+mod http;
 mod task;
 
-//#[tokio::main]
-async fn start_httpserver(main_routine_sender: mpsc::Sender<task::Task>) {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
-
-    let make_svc = make_service_fn(move |_| {
-
-        let main_routine_sender1 = main_routine_sender.clone();
-
-        async move {
-
-            Ok::<_, Error>(service_fn(move |req| {
-
-                let main_routine_sender2 = main_routine_sender1.clone();
-
-                async move {
-                    if req.method() == Method::OPTIONS {
-                        return Ok::<_, Error>(
-                            Response::builder()
-                                .status(StatusCode::NO_CONTENT)
-                                .header(
-                                    header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                                    HeaderValue::from_static("*"),
-                                )
-                                .header(
-                                    header::ACCESS_CONTROL_ALLOW_METHODS,
-                                    HeaderValue::from_static("POST, OPTIONS"),
-                                )
-                                .header(
-                                    header::ACCESS_CONTROL_ALLOW_HEADERS,
-                                    HeaderValue::from_static("Content-Type"),
-                                )
-                                .body(Body::empty())
-                                .unwrap(),
-                        );
-                    }
-
-                    let (tx, rx) = oneshot::channel();
-
-                    let msg = hyper::body::to_bytes(req.into_body()).await.unwrap();
-                    let str = String::from_utf8(msg.to_vec()).unwrap();
-
-                    let task = task::HttpQueryTask {
-                        content: str,
-                        rsp: tx,
-                    };
-
-                    main_routine_sender2.send(task::Task::QueryTask(task)).expect("send httptask failed");
-
-                    let res = rx.await.unwrap();
-
-                    let mut response = Response::new(Body::from(res));
-                    response.headers_mut().insert(
-                        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                        HeaderValue::from_static("*"),
-                    );
-                    Ok::<_, Error>(response)
-                }
-            }))
-        }
-    });
-
-    let server = Server::bind(&addr).serve(make_svc);
-
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
-    }
+async fn start_httpserver(main_routine_sender: mpsc::Sender<task::Task>, addr: SocketAddr) {
+    http::serve_engine_http(
+        addr,
+        http::EngineHttpState {
+            main_routine_sender,
+        },
+    )
+    .await;
 }
 
 fn main() {
 
-    println!("#####matchengine start####");
-
     pretty_env_logger::init();
 
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        println!("args error");
-        process::exit(0);
-    }
+    let cfg_path = args.get(1).map(|s| s.as_str()).unwrap_or("config.yaml");
 
-    let mut file = File::open(&args[1]).unwrap();
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
+    let cfg = config::load_config(cfg_path).unwrap_or_else(|e| {
+        eprintln!("config load failed: {}", e);
+        process::exit(1);
+    });
 
-    let cfg = json::parse(&contents).unwrap();
-
-    let market_name = cfg["market"]["name"].to_string();
-    let stock_prec = cfg["market"]["stock_prec"].as_u32().unwrap();
-    let money_prec = cfg["market"]["money_prec"].as_u32().unwrap();
-    let fee_prec = cfg["market"]["fee_prec"].as_u32().unwrap();
+    let market_name = cfg.market.name.clone();
+    let stock_prec = cfg.market.stock_prec;
+    let money_prec = cfg.market.money_prec;
+    let fee_prec = cfg.market.fee_prec;
     // TODO consider prec relationship
-    let min_amount = Decimal::from_str(cfg["market"]["min_amount"].as_str().unwrap()).unwrap();
+    let min_amount = Decimal::from_str(&cfg.market.min_amount).unwrap();
 
-    let brokers = cfg["brokers"].to_string();
-    let db_addr = cfg["db"]["addr"].to_string();
-    let db_user = cfg["db"]["user"].to_string();
-    let db_passwd = cfg["db"]["passwd"].to_string();
+    let brokers = cfg.brokers.clone();
+    let db_addr = cfg.db.addr.clone();
+    let db_user = cfg.db.user.clone();
+    let db_passwd = cfg.db.passwd.clone();
+
+    const ENGINE_HTTP_IP: &str = "127.0.0.1";
+    const ENGINE_HTTP_PORT: u16 = 8080;
+    let http_addr: SocketAddr = format!("{}:{}", ENGINE_HTTP_IP, ENGINE_HTTP_PORT)
+        .parse()
+        .expect("engine http bind addr");
+
+    println!(
+        "Matching engine REST base: http://{}:{}/markets/<market>/…",
+        ENGINE_HTTP_IP, ENGINE_HTTP_PORT
+    );
 
     let input_topic = format!("offer.{}", market_name);
 
@@ -146,11 +92,23 @@ fn main() {
 
     load::restore_state(&mut mk, &pool);
 
+    let pool_snap_cleanup = pool.clone();
+    let snap_cleanup_cfg = cfg.snap_cleanup.clone();
+    let _snap_cleanup_thread = thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(snap_cleanup_cfg.cleanup_interval_secs.max(1)));
+        snap_cleanup::prune_snapshots(
+            &pool_snap_cleanup,
+            snap_cleanup_cfg.max_age_secs,
+            snap_cleanup_cfg.max_snapshots,
+        );
+    });
+
     let (main_routine_sender, main_routine_receiver) = mpsc::channel();
 
     let main_routine_sender_http_clone = main_routine_sender.clone();
-    let http_thread = thread::spawn(|| {
-        start_httpserver(main_routine_sender_http_clone);
+    let http_thread = thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(start_httpserver(main_routine_sender_http_clone, http_addr));
     });
 
     let main_routine_sender_mq_clone = main_routine_sender.clone();
@@ -212,10 +170,11 @@ fn main() {
         }
     });
 
+    let dump_every_secs = cfg.snap_dump.dump_interval_secs.max(1);
     let main_routine_sender_timer_clone = main_routine_sender.clone();
     let timer_thread = thread::spawn(move || {
         loop {
-            thread::sleep(Duration::from_secs(600));
+            thread::sleep(Duration::from_secs(dump_every_secs));
             let now = Utc::now();
             let task = task::SqlDumpTask{
                 tm: now.timestamp(),
@@ -233,12 +192,12 @@ fn main() {
             task::Task::MqTask(t) => {
                 mainprocess::handle_mq_message(&publisher, &mut mk, t.offset, &t.data);
             },
-            task::Task::QueryTask(a) => {
-                let res = httpserver::handle_http_request(&mk, &a.content);
+            task::Task::RestQuery(a) => {
+                let res = http::handle_rest_request(&mk, a.op);
                 let _ = a.rsp.send(res);
             },
             task::Task::DumpTask(b) => {
-                dump::handle_dump(&mut mk, b.tm, &pool);
+                dump::handle_dump(&mut mk, b.tm, url.as_str());
             },
             task::Task::ProgressUpdateTask(t) => {
                 mainprocess::update_output_progress(&mut mk, t.quote_deals_id, t.settle_message_ids);

@@ -8,9 +8,12 @@ edition = "2024"
 [dependencies]
 kafka = "0.10.0"
 mysql = "26.0.0"
-hyper = { version = "0.14", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
 tokio = { version = "1", features = ["full"] }
 json = "*"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
 chrono = "*"
 skiplist = "0.6.0"
 rust_decimal = {version = "1.14.3", features = ["maths"]}
