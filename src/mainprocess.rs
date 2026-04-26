@@ -102,7 +102,7 @@ fn on_order_put_limit(publisher: &Publish, m: &mut Market, extern_id: u64, param
     let mut amount = Decimal::from_str(params["amount"].as_str().unwrap()).unwrap();
     amount.rescale(m.stock_prec);
     let mut price = Decimal::from_str(params["price"].as_str().unwrap()).unwrap();
-    price.rescale(m.money_prec-m.stock_prec);
+    price.rescale(m.money_prec.saturating_sub(m.stock_prec));
     let mut taker_fee_rate = Decimal::from_str(params["taker_fee_rate"].as_str().unwrap()).unwrap();
     taker_fee_rate.rescale(m.fee_rate_prec);
     let mut maker_fee_rate = Decimal::from_str(params["maker_fee_rate"].as_str().unwrap()).unwrap();

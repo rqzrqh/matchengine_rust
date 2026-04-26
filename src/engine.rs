@@ -1,4 +1,3 @@
-
 use std::rc::Rc;
 use crate::market::*;
 use crate::publish::*;
@@ -182,15 +181,7 @@ fn execute_market_bid_order(publisher: &Publish, m: &mut Market, extern_id: u64,
         let price = maker.price;
 
         let mut amount = taker.left.get() / price;
-        amount.rescale(m.stock_prec as u32);
-
-/*
-        /// let mut round = Decimal::from_str("1.45").unwrap();
-        /// round.rescale(1);
-        /// assert_eq!(round.to_string(), "1.5");
-        /// a = 10^(-1)
-        /// 1.5 - a = 1.4
-*/
+        amount.rescale(m.stock_prec);
 
         loop {
             if amount * price > taker.left.get() {

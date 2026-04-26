@@ -1,3 +1,6 @@
+/**
+ * web-test entry: Express + Vite (dev), MySQL via Drizzle, Kafka producers/consumers, WebSocket fan-out.
+ */
 import { randomUUID } from "crypto";
 import path from "node:path";
 import fs from "node:fs";

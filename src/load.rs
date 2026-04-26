@@ -45,7 +45,7 @@ fn load_order(m: &mut Market, conn: &mut PooledConn, timestamp: i64) {
                 user_id: res_part1[i].5,
                 price: {
                     let mut d = Decimal::from_str(&res_part1[i].6).unwrap();
-                    d.rescale(m.money_prec-m.stock_prec);
+                    d.rescale(m.money_prec.saturating_sub(m.stock_prec));
                     d
                 },
                 amount: {
@@ -78,7 +78,11 @@ fn load_order(m: &mut Market, conn: &mut PooledConn, timestamp: i64) {
                     d.rescale(m.money_prec);
                     Cell::new(d)
                 },
-                deal_fee: Cell::new(Decimal::from_str(&res_part2[i].2).unwrap()),
+                deal_fee: {
+                    let mut d = Decimal::from_str(&res_part2[i].2).unwrap();
+                    d.rescale(m.money_prec);
+                    Cell::new(d)
+                },
             });
 
             info!("id:{} type:{} side:{} create_time:{} update_time:{} user_id:{} price:{} amount:{} taker_fee_rate:{} maker_fee_rate:{} left:{} deal_stock:{} deal_money:{} deal_fee:{}",

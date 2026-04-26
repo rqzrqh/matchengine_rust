@@ -134,7 +134,7 @@ impl Publish {
         object["market"] = m.name.clone().into();
         object["msgid"] = m.message_id.into();
         object["txid"] = extern_id.into();
-        object["order"] = order.to_json();
+        object["order"] = order.to_json(m);
 
         let group_id = order.user_id%self.settle_group_count;
         let topic = format!("settle.{}", group_id);
@@ -165,7 +165,7 @@ impl Publish {
         object["market"] = m.name.clone().into();
         object["msgid"] = m.message_id.into();
         object["txid"] = extern_id.into();
-        object["order"] = order.to_json();
+        object["order"] = order.to_json(m);
 
         let group_id = order.user_id%self.settle_group_count;
         let topic = format!("settle.{}", group_id);
@@ -205,11 +205,23 @@ impl Publish {
         deals["order_id"] = order_id.into();
         deals["deal_id"] = m.deals_id.into();
         deals["role"] = role.into();
-        deals["price"] = price.to_string().into();
-        deals["amount"] = amount.to_string().into();
-        deals["deal"] = deal.to_string().into();
-        deals["fee"] = fee.to_string().into();
-        deals["rival_fee"] = rival_fee.to_string().into();
+
+        let mut p = *price;
+        p.rescale(m.money_prec.saturating_sub(m.stock_prec));
+        let mut a = *amount;
+        a.rescale(m.stock_prec);
+        let mut d = *deal;
+        d.rescale(m.money_prec);
+        let mut f = *fee;
+        f.rescale(m.money_prec);
+        let mut rf = *rival_fee;
+        rf.rescale(m.money_prec);
+
+        deals["price"] = p.to_string().into();
+        deals["amount"] = a.to_string().into();
+        deals["deal"] = d.to_string().into();
+        deals["fee"] = f.to_string().into();
+        deals["rival_fee"] = rf.to_string().into();
 
         object["deals"] = deals;
 
@@ -280,8 +292,14 @@ impl Publish {
         info["time"] = tm.into();
         info["side"] = side.into();
         info["deal_id"] = m.deals_id.into();
-        info["price"] = price.to_string().into();
-        info["amount"] = amount.to_string().into();
+
+        let mut p = *price;
+        p.rescale(m.money_prec.saturating_sub(m.stock_prec));
+        let mut a = *amount;
+        a.rescale(m.stock_prec);
+
+        info["price"] = p.to_string().into();
+        info["amount"] = a.to_string().into();
 
         object["info"] = info;
 

@@ -1,5 +1,7 @@
+//! 撮合主线程侧的 HTTP 语义：`HttpOp` → 状态码 + JSON 字符串（不含 Axum 路由，路由见 `server.rs`）。
+
 use crate::market::*;
-use crate::task::{RestOp, RestResponse};
+use crate::task::{HttpOp, HttpResponse};
 use json::JsonValue;
 use rust_decimal::prelude::*;
 use skiplist::OrderedSkipList;
@@ -11,35 +13,35 @@ fn json_err(msg: &str) -> String {
     o.dump()
 }
 
-fn unknown_market() -> RestResponse {
-    RestResponse {
+fn unknown_market() -> HttpResponse {
+    HttpResponse {
         status: 404,
         body: json_err("unknown market"),
     }
 }
 
 /// Matcher thread only.
-pub fn handle_rest_request(m: &Market, op: RestOp) -> RestResponse {
+pub fn handle_http_request(m: &Market, op: HttpOp) -> HttpResponse {
     match op {
-        RestOp::MarketSummary { market } => {
+        HttpOp::MarketSummary { market } => {
             if !m.name.eq(&market) {
                 return unknown_market();
             }
-            RestResponse {
+            HttpResponse {
                 status: 200,
                 body: json_market_summary(m),
             }
         }
-        RestOp::MarketStatus { market } => {
+        HttpOp::MarketStatus { market } => {
             if !m.name.eq(&market) {
                 return unknown_market();
             }
-            RestResponse {
+            HttpResponse {
                 status: 200,
                 body: json_market_status(m),
             }
         }
-        RestOp::OrderDetail {
+        HttpOp::OrderDetail {
             market,
             order_id,
         } => {
@@ -47,17 +49,17 @@ pub fn handle_rest_request(m: &Market, op: RestOp) -> RestResponse {
                 return unknown_market();
             }
             match m.get_order(&order_id) {
-                Some(o) => RestResponse {
+                Some(o) => HttpResponse {
                     status: 200,
-                    body: o.to_json().dump(),
+                    body: o.to_json(m).dump(),
                 },
-                None => RestResponse {
+                None => HttpResponse {
                     status: 404,
                     body: json_err("order not found"),
                 },
             }
         }
-        RestOp::OrderBook {
+        HttpOp::OrderBook {
             market,
             side,
             offset,
@@ -67,17 +69,17 @@ pub fn handle_rest_request(m: &Market, op: RestOp) -> RestResponse {
                 return unknown_market();
             }
             if side != MARKET_ORDER_SIDE_ASK && side != MARKET_ORDER_SIDE_BID {
-                return RestResponse {
+                return HttpResponse {
                     status: 400,
                     body: json_err("invalid side (use 1=ask, 2=bid)"),
                 };
             }
-            RestResponse {
+            HttpResponse {
                 status: 200,
                 body: json_order_book(m, side, offset, limit),
             }
         }
-        RestOp::UserOrdersPending {
+        HttpOp::UserOrdersPending {
             market,
             user_id,
             offset,
@@ -86,7 +88,7 @@ pub fn handle_rest_request(m: &Market, op: RestOp) -> RestResponse {
             if !m.name.eq(&market) {
                 return unknown_market();
             }
-            RestResponse {
+            HttpResponse {
                 status: 200,
                 body: json_user_orders_pending(m, &user_id, offset, limit),
             }
@@ -104,6 +106,8 @@ fn json_market_summary(m: &Market) -> String {
     for order in &m.bids {
         bid_amount += order.left.get();
     }
+    ask_amount.rescale(m.stock_prec);
+    bid_amount.rescale(m.stock_prec);
     object["name"] = m.name.clone().into();
     object["ask_count"] = (m.asks.len() as u32).into();
     object["ask_amount"] = ask_amount.to_string().into();
@@ -123,7 +127,12 @@ fn json_market_status(m: &Market) -> String {
     object.dump()
 }
 
-fn get_order_by_limit(offset: u32, limit: u32, orders: &OrderedSkipList<Rc<Order>>) -> JsonValue {
+fn get_order_by_limit(
+    m: &Market,
+    offset: u32,
+    limit: u32,
+    orders: &OrderedSkipList<Rc<Order>>,
+) -> JsonValue {
     let mut array = JsonValue::new_array();
     if offset < (orders.len() as u32) {
         let mut count = 0;
@@ -134,7 +143,7 @@ fn get_order_by_limit(offset: u32, limit: u32, orders: &OrderedSkipList<Rc<Order
                 break;
             }
             count += 1;
-            let _ = array.push(order.unwrap().to_json());
+            let _ = array.push(order.unwrap().to_json(m));
         }
     }
     array
@@ -146,12 +155,16 @@ fn json_order_book(m: &Market, side: u32, offset: u32, limit: u32) -> String {
     object["offset"] = offset.into();
     if side == MARKET_ORDER_SIDE_ASK {
         object["total"] = m.asks.len().into();
-        object["stock_amount"] = m.stock_amount.to_string().into();
-        object["orders"] = get_order_by_limit(offset, limit, &m.asks);
+        let mut stock_amt = m.stock_amount;
+        stock_amt.rescale(m.stock_prec);
+        object["stock_amount"] = stock_amt.to_string().into();
+        object["orders"] = get_order_by_limit(m, offset, limit, &m.asks);
     } else {
         object["total"] = m.bids.len().into();
-        object["money_amount"] = m.money_amount.to_string().into();
-        object["orders"] = get_order_by_limit(offset, limit, &m.bids);
+        let mut money_amt = m.money_amount;
+        money_amt.rescale(m.money_prec);
+        object["money_amount"] = money_amt.to_string().into();
+        object["orders"] = get_order_by_limit(m, offset, limit, &m.bids);
     }
     object.dump()
 }
@@ -176,7 +189,7 @@ fn json_user_orders_pending(
                 break;
             }
             count += 1;
-            let _ = array.push(order.unwrap().to_json());
+            let _ = array.push(order.unwrap().to_json(m));
         }
         object["orders"] = array;
     } else {

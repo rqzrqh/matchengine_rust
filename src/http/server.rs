@@ -1,4 +1,4 @@
-use crate::task::{self, RestOp, RestQueryTask, RestResponse};
+use crate::task::{self, HttpOp, HttpRequestTask, HttpResponse};
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, Method, StatusCode};
@@ -85,31 +85,31 @@ async fn get_market_summary(
     State(st): State<EngineHttpState>,
     Path(MarketPath { market }): Path<MarketPath>,
 ) -> Response {
-    let res = forward_rest(st, RestOp::MarketSummary { market }).await;
-    rest_to_axum(res)
+    let res = forward_http_request(st, HttpOp::MarketSummary { market }).await;
+    http_response_to_axum(res)
 }
 
 async fn get_market_status(
     State(st): State<EngineHttpState>,
     Path(MarketPath { market }): Path<MarketPath>,
 ) -> Response {
-    let res = forward_rest(st, RestOp::MarketStatus { market }).await;
-    rest_to_axum(res)
+    let res = forward_http_request(st, HttpOp::MarketStatus { market }).await;
+    http_response_to_axum(res)
 }
 
 async fn get_order_detail_http(
     State(st): State<EngineHttpState>,
     Path(MarketOrderPath { market, order_id }): Path<MarketOrderPath>,
 ) -> Response {
-    let res = forward_rest(
+    let res = forward_http_request(
         st,
-        RestOp::OrderDetail {
+        HttpOp::OrderDetail {
             market,
             order_id,
         },
     )
     .await;
-    rest_to_axum(res)
+    http_response_to_axum(res)
 }
 
 async fn get_order_book_http(
@@ -117,9 +117,9 @@ async fn get_order_book_http(
     Path(MarketPath { market }): Path<MarketPath>,
     Query(q): Query<OrderBookQuery>,
 ) -> Response {
-    let res = forward_rest(
+    let res = forward_http_request(
         st,
-        RestOp::OrderBook {
+        HttpOp::OrderBook {
             market,
             side: q.side,
             offset: q.offset,
@@ -127,7 +127,7 @@ async fn get_order_book_http(
         },
     )
     .await;
-    rest_to_axum(res)
+    http_response_to_axum(res)
 }
 
 async fn get_user_orders_http(
@@ -135,9 +135,9 @@ async fn get_user_orders_http(
     Path(MarketUserPath { market, user_id }): Path<MarketUserPath>,
     Query(q): Query<UserOrdersQuery>,
 ) -> Response {
-    let res = forward_rest(
+    let res = forward_http_request(
         st,
-        RestOp::UserOrdersPending {
+        HttpOp::UserOrdersPending {
             market,
             user_id,
             offset: q.offset,
@@ -145,18 +145,18 @@ async fn get_user_orders_http(
         },
     )
     .await;
-    rest_to_axum(res)
+    http_response_to_axum(res)
 }
 
-async fn forward_rest(st: EngineHttpState, op: RestOp) -> RestResponse {
+async fn forward_http_request(st: EngineHttpState, op: HttpOp) -> HttpResponse {
     let (tx, rx) = tokio::sync::oneshot::channel();
     st.main_routine_sender
-        .send(task::Task::RestQuery(RestQueryTask { op, rsp: tx }))
-        .expect("send rest task failed");
+        .send(task::Task::HttpRequest(HttpRequestTask { op, rsp: tx }))
+        .expect("send http task failed");
     rx.await.unwrap()
 }
 
-fn rest_to_axum(r: RestResponse) -> Response {
+fn http_response_to_axum(r: HttpResponse) -> Response {
     let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     Response::builder()
         .status(status)

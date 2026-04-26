@@ -5,9 +5,11 @@ It is inspired by a longer-running C implementation of the same idea.
 
 More detail: [design.md](https://github.com/rqzrqh/matchengine_rust/blob/master/doc/design.md).
 
-### Architecture
+### Test Architecture
 
-![System architecture diagram](test_architecture.png)
+![Test architecture diagram](https://raw.githubusercontent.com/rqzrqh/matchengine_rust/refs/heads/master/image/test_architecture.png)
+
+For OS threads and Tokio runtimes inside the engine binary, see the comment block at the top of **`src/main.rs`**; for messaging protocol notes see **`doc/design.md`**.
 
 ### Deployment
 

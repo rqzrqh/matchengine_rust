@@ -35,7 +35,8 @@ pub struct Order {
 }
 
 impl Order {
-    pub fn to_json(&self) -> JsonValue {
+    /// JSON for APIs and Kafka, with numeric fields rescaled to the market’s configured precisions.
+    pub fn to_json(&self, m: &Market) -> JsonValue {
         let mut object = JsonValue::new_object();
 
         object["id"] = self.id.into();
@@ -44,14 +45,44 @@ impl Order {
         object["create_time"] = self.create_time.into();
         object["update_time"] = self.update_time.get().into();
         object["user_id"] = self.user_id.into();
-        object["price"] = self.price.to_string().into();
-        object["amount"] = self.amount.get().to_string().into();
-        object["taker_fee_rate"] = self.taker_fee_rate.to_string().into();
-        object["maker_fee_rate"] = self.maker_fee_rate.to_string().into();
-        object["left"] = self.left.get().to_string().into();
-        object["deal_stock"] = self.deal_stock.get().to_string().into();
-        object["deal_money"] = self.deal_money.get().to_string().into();
-        object["deal_fee"] = self.deal_fee.get().to_string().into();
+
+        let mut price = self.price;
+        price.rescale(m.money_prec.saturating_sub(m.stock_prec));
+        object["price"] = price.to_string().into();
+
+        let mut amount = self.amount.get();
+        amount.rescale(m.stock_prec);
+        object["amount"] = amount.to_string().into();
+
+        let mut taker_fee_rate = self.taker_fee_rate;
+        taker_fee_rate.rescale(m.fee_rate_prec);
+        object["taker_fee_rate"] = taker_fee_rate.to_string().into();
+
+        let mut maker_fee_rate = self.maker_fee_rate;
+        maker_fee_rate.rescale(m.fee_rate_prec);
+        object["maker_fee_rate"] = maker_fee_rate.to_string().into();
+
+        let mut left = self.left.get();
+        let left_dp = if self.order_type == MARKET_ORDER_TYPE_MARKET && self.side == MARKET_ORDER_SIDE_BID
+        {
+            m.money_prec
+        } else {
+            m.stock_prec
+        };
+        left.rescale(left_dp);
+        object["left"] = left.to_string().into();
+
+        let mut deal_stock = self.deal_stock.get();
+        deal_stock.rescale(m.stock_prec);
+        object["deal_stock"] = deal_stock.to_string().into();
+
+        let mut deal_money = self.deal_money.get();
+        deal_money.rescale(m.money_prec);
+        object["deal_money"] = deal_money.to_string().into();
+
+        let mut deal_fee = self.deal_fee.get();
+        deal_fee.rescale(m.money_prec);
+        object["deal_fee"] = deal_fee.to_string().into();
 
         object
     }

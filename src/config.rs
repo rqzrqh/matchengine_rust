@@ -1,4 +1,8 @@
+//! YAML configuration: market, Kafka brokers, MySQL credentials, snapshot dump and retention.
+
+use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SnapCleanupCfg {
@@ -76,4 +80,61 @@ pub struct DbCfg {
 pub fn load_config(path: &str) -> Result<Config, String> {
     let contents = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     serde_yaml::from_str(&contents).map_err(|e| e.to_string())
+}
+
+/// Fail fast before the matcher runs: precision fields must fit `rust_decimal` and relate consistently.
+pub fn validate_config(cfg: &Config) -> Result<(), String> {
+    const MAX_SCALE: u32 = Decimal::MAX_SCALE;
+
+    if cfg.brokers.trim().is_empty() {
+        return Err("brokers must be non-empty".into());
+    }
+    if cfg.db.addr.trim().is_empty() || cfg.db.user.trim().is_empty() {
+        return Err("db.addr and db.user must be non-empty".into());
+    }
+
+    let m = &cfg.market;
+    if m.name.trim().is_empty() {
+        return Err("market.name must be non-empty".into());
+    }
+    if m.stock_prec > MAX_SCALE {
+        return Err(format!(
+            "market.stock_prec ({}) exceeds rust_decimal::Decimal::MAX_SCALE ({})",
+            m.stock_prec, MAX_SCALE
+        ));
+    }
+    if m.money_prec > MAX_SCALE {
+        return Err(format!(
+            "market.money_prec ({}) exceeds Decimal::MAX_SCALE ({})",
+            m.money_prec, MAX_SCALE
+        ));
+    }
+    if m.fee_prec > MAX_SCALE {
+        return Err(format!(
+            "market.fee_prec ({}) exceeds Decimal::MAX_SCALE ({})",
+            m.fee_prec, MAX_SCALE
+        ));
+    }
+    if m.stock_prec > m.money_prec {
+        log::warn!(
+            "market.stock_prec ({}) > money_prec ({}): price rescale uses money_prec.saturating_sub(stock_prec) (=0); ensure this matches your market rules",
+            m.stock_prec,
+            m.money_prec
+        );
+    }
+
+    let mut min_amount = Decimal::from_str(&m.min_amount)
+        .map_err(|e| format!("market.min_amount is not a valid decimal: {}", e))?;
+    if min_amount <= Decimal::ZERO {
+        return Err("market.min_amount must be > 0".into());
+    }
+    min_amount.rescale(m.stock_prec);
+    if min_amount <= Decimal::ZERO {
+        return Err(
+            "market.min_amount rescale to stock_prec rounds to zero; raise min_amount or lower stock_prec"
+                .into(),
+        );
+    }
+
+    Ok(())
 }

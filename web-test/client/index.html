@@ -99,9 +99,10 @@
         <div class="layout-cell layout-orderbook" aria-label="Order book">
           <section class="panel cell cell--orderbook">
             <h2>Order book</h2>
-            <p class="muted">Auto-refresh every 0.5s. Change depth limit to apply on the next tick.</p>
-            <div class="row">
+            <p class="muted">Auto-refresh every 0.5s. Change limit or offset to apply on the next tick.</p>
+            <div class="row ob-controls">
               <label>Depth limit <input type="number" id="ob-limit" value="12" min="1" max="50" /></label>
+              <label>Offset <input type="number" id="ob-offset" value="0" min="0" step="1" /></label>
             </div>
             <p class="ob-overview-label">Summary</p>
             <pre id="out-ob-overview" class="mono mono--ob-meta" aria-label="Market summary from engine"></pre>

@@ -132,12 +132,20 @@ async function refreshEngineStatus(): Promise<void> {
 
 async function refreshOrderbook(): Promise<void> {
   const limit = Number((document.getElementById("ob-limit") as HTMLInputElement).value || 12);
+  const offset = Math.max(
+    0,
+    Math.floor(Number((document.getElementById("ob-offset") as HTMLInputElement).value || 0)),
+  );
   const m = encodeURIComponent(marketName);
   try {
     const [summary, asks, bids] = await Promise.all([
       engineApi<unknown>(`/markets/${m}/summary`),
-      engineApi<unknown>(`/markets/${m}/order-book?side=1&offset=0&limit=${limit}`),
-      engineApi<unknown>(`/markets/${m}/order-book?side=2&offset=0&limit=${limit}`),
+      engineApi<unknown>(
+        `/markets/${m}/order-book?side=1&offset=${offset}&limit=${limit}`,
+      ),
+      engineApi<unknown>(
+        `/markets/${m}/order-book?side=2&offset=${offset}&limit=${limit}`,
+      ),
     ]);
 
     show($("out-ob-overview"), summary);

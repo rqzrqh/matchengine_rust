@@ -26,6 +26,14 @@ mod mainprocess;
 mod http;
 mod task;
 
+// Runtime layout (one OS process, one market):
+// - Main thread: blocking loop on `main_routine_receiver`; owns `Market`, handles Kafka input, REST replies,
+//   snapshot dumps, and publish progress updates.
+// - HTTP thread: nested Tokio runtime running Axum; forwards `HttpRequest` tasks to the main channel.
+// - Kafka consumer: Tokio runtime (single worker) on `offer.<market>`; sends `MqTask` to the main channel.
+// - Timer thread: periodic `DumpTask` to fork snapshot writers.
+// - Snapshot cleanup thread: periodic `prune_snapshots` against MySQL.
+
 async fn start_httpserver(main_routine_sender: mpsc::Sender<task::Task>, addr: SocketAddr) {
     http::serve_engine_http(
         addr,
@@ -48,11 +56,15 @@ fn main() {
         process::exit(1);
     });
 
+    if let Err(e) = config::validate_config(&cfg) {
+        eprintln!("config invalid: {}", e);
+        process::exit(1);
+    }
+
     let market_name = cfg.market.name.clone();
     let stock_prec = cfg.market.stock_prec;
     let money_prec = cfg.market.money_prec;
     let fee_prec = cfg.market.fee_prec;
-    // TODO consider prec relationship
     let min_amount = Decimal::from_str(&cfg.market.min_amount).unwrap();
 
     let brokers = cfg.brokers.clone();
@@ -116,7 +128,7 @@ fn main() {
     let input_offset = mk.input_offset;
 
     let consumer_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)// one thread
+        .worker_threads(1) // consumer loop only
         .enable_all()
         .build()
         .unwrap();
@@ -126,9 +138,7 @@ fn main() {
         let consumer:StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", brokers_clone2)
             .set("enable.partition.eof", "false")
-            //.set("group.id", "my_consumer_group")
-            // We'll give each session its own (unique) consumer group id,
-            // so that each session will receive all messages
+            // Unique group id per run so this process reads the full topic from the assigned offset.
             .set("group.id", format!("match-{}", Uuid::new_v4()))
             .set("enable.auto.commit", "true")
             .set("auto.commit.interval.ms", "5000")
@@ -153,8 +163,6 @@ fn main() {
                         message.offset(),
                         message.payload().map(|p| String::from_utf8_lossy(p).into_owned())
                     );
-
-                    // should decode data here
 
                     let task = task::KafkaMqTask {
                             offset: message.offset(),
@@ -192,8 +200,8 @@ fn main() {
             task::Task::MqTask(t) => {
                 mainprocess::handle_mq_message(&publisher, &mut mk, t.offset, &t.data);
             },
-            task::Task::RestQuery(a) => {
-                let res = http::handle_rest_request(&mk, a.op);
+            task::Task::HttpRequest(a) => {
+                let res = http::handle_http_request(&mk, a.op);
                 let _ = a.rsp.send(res);
             },
             task::Task::DumpTask(b) => {

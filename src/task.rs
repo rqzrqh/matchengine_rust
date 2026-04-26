@@ -6,7 +6,7 @@ pub struct KafkaMqTask {
 }
 
 #[derive(Debug)]
-pub enum RestOp {
+pub enum HttpOp {
     MarketSummary { market: String },
     MarketStatus { market: String },
     OrderDetail { market: String, order_id: u64 },
@@ -25,14 +25,14 @@ pub enum RestOp {
 }
 
 #[derive(Debug)]
-pub struct RestResponse {
+pub struct HttpResponse {
     pub status: u16,
     pub body: String,
 }
 
-pub struct RestQueryTask {
-    pub op: RestOp,
-    pub rsp: oneshot::Sender<RestResponse>,
+pub struct HttpRequestTask {
+    pub op: HttpOp,
+    pub rsp: oneshot::Sender<HttpResponse>,
 }
 
 pub struct SqlDumpTask {
@@ -46,7 +46,7 @@ pub struct PublishProgressTask {
 
 pub enum Task {
     MqTask(KafkaMqTask),
-    RestQuery(RestQueryTask),
+    HttpRequest(HttpRequestTask),
     DumpTask(SqlDumpTask),
     ProgressUpdateTask(PublishProgressTask),
     Terminate,

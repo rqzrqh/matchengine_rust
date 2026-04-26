@@ -1,7 +1,7 @@
-//! Engine HTTP: Axum serves REST JSON under `/markets/...` (`server`) with json builders (`rest`).
+//! Engine HTTP: Axum 在 `server` 里挂路由；撮合线程在 `handlers` 里根据 `HttpOp` 拼状态码与 JSON 响应体。
 
-mod rest;
+mod handlers;
 mod server;
 
-pub use rest::handle_rest_request;
+pub use handlers::handle_http_request;
 pub use server::{serve_engine_http, EngineHttpState};
