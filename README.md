@@ -131,5 +131,5 @@ There is no bundled load-test binary in this repo. For integration testing, run 
 
 1. Use ordered batch sends for higher data-push throughput.
 
-2. Consider a richer decimal library for rescaling: `rust_decimal`’s rescale helper only adjusts the fractional part, not the integer part.
+2. Deeper decimal parity: golden tests vs a reference engine on representative order flows; **`rescale_down`** is only applied on snapshot load, Kafka command parse, and market-buy sizing—matching where the C engine calls `decimal(..., prec)` / `mpd_rescale` (see **`doc/decimal-precision.md`**).
 

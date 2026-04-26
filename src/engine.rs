@@ -1,4 +1,6 @@
 use std::rc::Rc;
+
+use crate::align_decimal::market_buy_base_amount;
 use crate::market::*;
 use crate::publish::*;
 use chrono::prelude::*;
@@ -170,9 +172,6 @@ fn execute_market_ask_order(publisher: &Publish, m: &mut Market, extern_id: u64,
 
 fn execute_market_bid_order(publisher: &Publish, m: &mut Market, extern_id: u64, taker: &Rc<Order>) {
 
-    let ten = Decimal::new(10, 0);
-    let min = ten.powi(-(m.stock_prec as i64));
-
     while !m.asks.is_empty() && taker.left.get() > Decimal::ZERO {
 
         let maker_ref = m.asks.front().unwrap();
@@ -180,16 +179,7 @@ fn execute_market_bid_order(publisher: &Publish, m: &mut Market, extern_id: u64,
 
         let price = maker.price;
 
-        let mut amount = taker.left.get() / price;
-        amount.rescale(m.stock_prec);
-
-        loop {
-            if amount * price > taker.left.get() {
-                amount -= min;
-            } else {
-                break;
-            }
-        }
+        let mut amount = market_buy_base_amount(taker.left.get(), price, m.stock_prec);
 
         if amount > maker.left.get() {
             amount = maker.left.get();

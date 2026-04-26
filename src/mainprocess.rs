@@ -1,3 +1,4 @@
+use crate::align_decimal::rescale_down;
 use crate::market::*;
 use crate::publish::*;
 use crate::engine::*;
@@ -100,13 +101,13 @@ fn on_order_put_limit(publisher: &Publish, m: &mut Market, extern_id: u64, param
     let user_id = params["user_id"].as_u32().unwrap();
     let side = params["side"].as_u32().unwrap();
     let mut amount = Decimal::from_str(params["amount"].as_str().unwrap()).unwrap();
-    amount.rescale(m.stock_prec);
+    rescale_down(&mut amount, m.stock_prec);
     let mut price = Decimal::from_str(params["price"].as_str().unwrap()).unwrap();
-    price.rescale(m.money_prec.saturating_sub(m.stock_prec));
+    rescale_down(&mut price, m.money_prec.saturating_sub(m.stock_prec));
     let mut taker_fee_rate = Decimal::from_str(params["taker_fee_rate"].as_str().unwrap()).unwrap();
-    taker_fee_rate.rescale(m.fee_rate_prec);
+    rescale_down(&mut taker_fee_rate, m.fee_rate_prec);
     let mut maker_fee_rate = Decimal::from_str(params["maker_fee_rate"].as_str().unwrap()).unwrap();
-    maker_fee_rate.rescale(m.fee_rate_prec);
+    rescale_down(&mut maker_fee_rate, m.fee_rate_prec);
 
     market_put_limit_order(publisher, m, extern_id, user_id, side, amount, price, taker_fee_rate, maker_fee_rate).unwrap_or_else(|e| {
         publisher.publish_error(m, extern_id, user_id, params, e);
@@ -140,13 +141,13 @@ fn on_order_put_market(publisher: &Publish, m: &mut Market, extern_id: u64, para
     let mut amount = Decimal::from_str(params["amount"].as_str().unwrap()).unwrap();
 
     if side == MARKET_ORDER_SIDE_ASK {
-        amount.rescale(m.stock_prec);
+        rescale_down(&mut amount, m.stock_prec);
     } else {
-        amount.rescale(m.money_prec);
+        rescale_down(&mut amount, m.money_prec);
     }
 
     let mut taker_fee_rate = Decimal::from_str(params["taker_fee_rate"].as_str().unwrap()).unwrap();
-    taker_fee_rate.rescale(m.fee_rate_prec);
+    rescale_down(&mut taker_fee_rate, m.fee_rate_prec);
 
     market_put_market_order(publisher, m, extern_id, user_id, side, amount, taker_fee_rate).unwrap_or_else(|e| {
         publisher.publish_error(m, extern_id, user_id, params, e);

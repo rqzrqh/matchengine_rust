@@ -13,6 +13,7 @@ extern crate pretty_env_logger;
 extern crate process_lock;
 use process_lock::*;
 
+mod align_decimal;
 mod config;
 mod error;
 mod engine;

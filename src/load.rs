@@ -1,3 +1,4 @@
+use crate::align_decimal::rescale_down;
 use crate::correct_snap::{find_correct_restore_snap, SnapStateForRestore};
 use crate::market::*;
 use mysql::*;
@@ -45,42 +46,41 @@ fn load_order(m: &mut Market, conn: &mut PooledConn, timestamp: i64) {
                 user_id: res_part1[i].5,
                 price: {
                     let mut d = Decimal::from_str(&res_part1[i].6).unwrap();
-                    d.rescale(m.money_prec.saturating_sub(m.stock_prec));
+                    rescale_down(&mut d, m.money_prec.saturating_sub(m.stock_prec));
                     d
                 },
                 amount: {
                     let mut d = Decimal::from_str(&res_part1[i].7).unwrap();
-                    d.rescale(m.stock_prec);
+                    rescale_down(&mut d, m.stock_prec);
                     Cell::new(d)
                 },
                 taker_fee_rate: {
                     let mut d = Decimal::from_str(&res_part1[i].8).unwrap();
-                    d.rescale(m.fee_rate_prec);
+                    rescale_down(&mut d, m.fee_rate_prec);
                     d
                 },
                 maker_fee_rate: {
                     let mut d = Decimal::from_str(&res_part1[i].9).unwrap();
-                    d.rescale(m.fee_rate_prec);
+                    rescale_down(&mut d, m.fee_rate_prec);
                     d
                 },
                 left: {
                     let mut d = Decimal::from_str(&res_part1[i].10).unwrap();
-                    d.rescale(m.stock_prec);
+                    rescale_down(&mut d, m.stock_prec);
                     Cell::new(d)
                 },
                 deal_stock: {
                     let mut d = Decimal::from_str(&res_part1[i].11).unwrap();
-                    d.rescale(m.stock_prec);
+                    rescale_down(&mut d, m.stock_prec);
                     Cell::new(d)
                 },
                 deal_money: {
                     let mut d = Decimal::from_str(&res_part2[i].1).unwrap();
-                    d.rescale(m.money_prec);
+                    rescale_down(&mut d, m.money_prec);
                     Cell::new(d)
                 },
                 deal_fee: {
-                    let mut d = Decimal::from_str(&res_part2[i].2).unwrap();
-                    d.rescale(m.money_prec);
+                    let d = Decimal::from_str(&res_part2[i].2).unwrap();
                     Cell::new(d)
                 },
             });
