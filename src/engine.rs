@@ -213,14 +213,14 @@ fn execute_market_bid_order(publisher: &Publish, m: &mut Market, extern_id: u64,
         publisher.publish_deal(m, extern_id, now, maker.user_id, taker.user_id, maker.id, MARKET_ROLE_MAKER, &price, &amount, &deal, &ask_fee, &bid_fee);
 
         taker.left.set(taker.left.get() - deal);
-        taker.deal_stock.set(taker.deal_stock.get() - amount);
-        taker.deal_money.set(taker.deal_money.get() - deal);
+        taker.deal_stock.set(taker.deal_stock.get() + amount);
+        taker.deal_money.set(taker.deal_money.get() + deal);
         taker.deal_fee.set(taker.deal_fee.get() + bid_fee);
 
         maker.left.set(maker.left.get() - amount);
         maker.deal_stock.set(maker.deal_stock.get() + amount);
         maker.deal_money.set(maker.deal_money.get() + deal);
-        maker.deal_money.set(maker.deal_money.get() + ask_fee);
+        maker.deal_fee.set(maker.deal_fee.get() + ask_fee);
 
         m.stock_amount -= amount;
 
