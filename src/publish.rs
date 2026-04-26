@@ -206,22 +206,11 @@ impl Publish {
         deals["deal_id"] = m.deals_id.into();
         deals["role"] = role.into();
 
-        let mut p = *price;
-        p.rescale(m.money_prec.saturating_sub(m.stock_prec));
-        let mut a = *amount;
-        a.rescale(m.stock_prec);
-        let mut d = *deal;
-        d.rescale(m.money_prec);
-        let mut f = *fee;
-        f.rescale(m.money_prec);
-        let mut rf = *rival_fee;
-        rf.rescale(m.money_prec);
-
-        deals["price"] = p.to_string().into();
-        deals["amount"] = a.to_string().into();
-        deals["deal"] = d.to_string().into();
-        deals["fee"] = f.to_string().into();
-        deals["rival_fee"] = rf.to_string().into();
+        deals["price"] = price.to_string().into();
+        deals["amount"] = amount.to_string().into();
+        deals["deal"] = deal.to_string().into();
+        deals["fee"] = fee.to_string().into();
+        deals["rival_fee"] = rival_fee.to_string().into();
 
         object["deals"] = deals;
 
@@ -293,13 +282,8 @@ impl Publish {
         info["side"] = side.into();
         info["deal_id"] = m.deals_id.into();
 
-        let mut p = *price;
-        p.rescale(m.money_prec.saturating_sub(m.stock_prec));
-        let mut a = *amount;
-        a.rescale(m.stock_prec);
-
-        info["price"] = p.to_string().into();
-        info["amount"] = a.to_string().into();
+        info["price"] = price.to_string().into();
+        info["amount"] = amount.to_string().into();
 
         object["info"] = info;
 

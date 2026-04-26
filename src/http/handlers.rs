@@ -106,8 +106,6 @@ fn json_market_summary(m: &Market) -> String {
     for order in &m.bids {
         bid_amount += order.left.get();
     }
-    ask_amount.rescale(m.stock_prec);
-    bid_amount.rescale(m.stock_prec);
     object["name"] = m.name.clone().into();
     object["ask_count"] = (m.asks.len() as u32).into();
     object["ask_amount"] = ask_amount.to_string().into();
@@ -155,15 +153,11 @@ fn json_order_book(m: &Market, side: u32, offset: u32, limit: u32) -> String {
     object["offset"] = offset.into();
     if side == MARKET_ORDER_SIDE_ASK {
         object["total"] = m.asks.len().into();
-        let mut stock_amt = m.stock_amount;
-        stock_amt.rescale(m.stock_prec);
-        object["stock_amount"] = stock_amt.to_string().into();
+        object["stock_amount"] = m.stock_amount.to_string().into();
         object["orders"] = get_order_by_limit(m, offset, limit, &m.asks);
     } else {
         object["total"] = m.bids.len().into();
-        let mut money_amt = m.money_amount;
-        money_amt.rescale(m.money_prec);
-        object["money_amount"] = money_amt.to_string().into();
+        object["money_amount"] = m.money_amount.to_string().into();
         object["orders"] = get_order_by_limit(m, offset, limit, &m.bids);
     }
     object.dump()
