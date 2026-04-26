@@ -1,4 +1,7 @@
--- follow is state of the state machine, so called snapshot.
+-- Market database template (applied by deploy/db_market.sh).
+-- `snap` holds snapshot metadata; each dump also creates `snap_order_<unix_ts>` with the same
+-- column layout as `snap_order_example` (this table is a schema template only).
+
 CREATE TABLE `snap_order_example` (
 	`id`                BIGINT UNSIGNED NOT NULL PRIMARY KEY,
 	`t`                 TINYINT UNSIGNED NOT NULL,

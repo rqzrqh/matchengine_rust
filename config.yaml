@@ -15,20 +15,19 @@ db:
   passwd: "123456"
 
 # --- Snapshot dump ---
-# Periodically writes one row to table `snap` and order data to `snap_order_<timestamp>` (forked process).
+# Forks a child process on an interval; writes one row to `snap` and order rows to `snap_order_<timestamp>`.
 snap_dump:
-  # Seconds between each dump.
+  # Interval between dumps, in seconds.
   dump_interval_secs: 600
 
 # --- Snapshot cleanup ---
-# Deletes old `snap` rows and matching `snap_order_*` tables. Two rules apply together (union): a row is
-# removable if it is too old OR if the table has more than max_snapshots rows (oldest removed first).
-# The one “correct” snapshot used for recovery is never deleted. The cleanup task always runs on
-# cleanup_interval_secs; if max_age_secs and max_snapshots are both 0, each pass does nothing.
+# Drops old `snap` rows and their `snap_order_*` tables. A snapshot is eligible for removal if EITHER:
+# its `time` is older than max_age_secs OR the table holds more than max_snapshots rows (oldest removed first).
+# The snapshot chosen for recovery is never deleted. Runs every cleanup_interval_secs; if both limits are 0, each pass is a no-op.
 snap_cleanup:
-  # Delete snapshots whose `time` is older than now minus this many seconds. 0 = do not use this rule.
+  # Max age in seconds for `snap.time`; 0 disables age-based pruning.
   max_age_secs: 3600
-  # Keep at most this many newest snapshots (by `time`). 0 = do not use this rule.
+  # Keep at most this many newest snapshots (by `time`); 0 disables count-based pruning.
   max_snapshots: 10
-  # How often to evaluate the two rules above.
+  # How often the cleanup job runs, in seconds.
   cleanup_interval_secs: 60
