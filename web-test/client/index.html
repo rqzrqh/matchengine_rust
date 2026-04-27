@@ -70,6 +70,28 @@
             </main>
           </div>
 
+          <section class="input-progress" aria-label="Input consumption progress">
+            <div class="panel ip-progress__panel panel--tight">
+              <h2 class="ip-progress__h">Input progress</h2>
+              <div class="ip-progress__row">
+                <code id="ob-input-topic" class="ip-progress__topic">—</code>
+                <span class="ip-sep" aria-hidden="true">·</span>
+                <span class="ip-stat"
+                  >Kafka end <strong id="ob-kafka-high">—</strong></span
+                >
+                <span class="ip-sep" aria-hidden="true">·</span>
+                <span class="ip-stat"
+                  >Processed (input_offset) <strong id="ob-input-off">—</strong></span
+                >
+                <span class="ip-sep" aria-hidden="true">·</span>
+                <span class="ip-stat"
+                  >Lag <strong id="ob-lag" class="ip-lag">—</strong></span
+                >
+              </div>
+              <p id="ob-input-err" class="ip-err" hidden></p>
+            </div>
+          </section>
+
           <section class="layout-ws ws-strip" aria-label="Real-time feed">
             <div class="panel ws-strip__panel panel--tight">
               <div class="panel-heading-row panel-heading-row--ws">
@@ -107,15 +129,39 @@
             <p class="ob-overview-label">Summary</p>
             <pre id="out-ob-overview" class="mono mono--ob-meta" aria-label="Market summary from engine"></pre>
             <div class="orderbook-split">
-              <div class="ob-side" aria-label="Ask side">
-                <h3>Ask (sell)</h3>
-                <p class="ob-detail-label">Orders</p>
-                <pre id="out-asks" class="mono mono--book"></pre>
+              <div class="ob-side ob-side--ask" aria-label="Asks (sell side)">
+                <h3 class="tag-ask">Asks (sell)</h3>
+                <div class="ob-table-wrap">
+                  <table class="ob-orders-table">
+                    <thead>
+                      <tr>
+                        <th>id</th>
+                        <th>user</th>
+                        <th>price</th>
+                        <th>left</th>
+                        <th>amount</th>
+                      </tr>
+                    </thead>
+                    <tbody id="asksBody"></tbody>
+                  </table>
+                </div>
               </div>
-              <div class="ob-side" aria-label="Bid side">
-                <h3>Bid (buy)</h3>
-                <p class="ob-detail-label">Orders</p>
-                <pre id="out-bids" class="mono mono--book"></pre>
+              <div class="ob-side ob-side--bid" aria-label="Bids (buy side)">
+                <h3 class="tag-bid">Bids (buy)</h3>
+                <div class="ob-table-wrap">
+                  <table class="ob-orders-table">
+                    <thead>
+                      <tr>
+                        <th>id</th>
+                        <th>user</th>
+                        <th>price</th>
+                        <th>left</th>
+                        <th>amount</th>
+                      </tr>
+                    </thead>
+                    <tbody id="bidsBody"></tbody>
+                  </table>
+                </div>
               </div>
             </div>
           </section>

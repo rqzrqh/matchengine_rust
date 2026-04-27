@@ -9,6 +9,24 @@ interface ApiErrorBody {
   detail?: string;
 }
 
+function buildHttpErrorMessage(r: Response, data: unknown): string {
+  const body = data as ApiErrorBody & { error?: string };
+  if (typeof body?.detail === "string" && body.detail.trim() !== "") {
+    return body.detail;
+  }
+  if (typeof body?.error === "string" && body.error.trim() !== "") {
+    return body.error;
+  }
+  if (typeof data === "string" && data.trim() !== "") {
+    return data;
+  }
+  if (data !== null && data !== undefined && typeof data === "object") {
+    const s = JSON.stringify(data);
+    if (s !== "{}" && s !== "null") return s;
+  }
+  return `Request failed (HTTP ${r.status}${r.statusText ? ` ${r.statusText}` : ""})`;
+}
+
 /** Same default as web-test; `loadConfig` overwrites with `engine_url` from `GET /api/config`. */
 const DEFAULT_ENGINE_HTTP = "http://127.0.0.1:8080";
 
@@ -44,16 +62,7 @@ async function engineApi<T>(path: string): Promise<T> {
     data = text;
   }
   if (!r.ok) {
-    const body = data as ApiErrorBody & { error?: string };
-    const msg =
-      typeof body?.detail === "string"
-        ? body.detail
-        : typeof body?.error === "string"
-          ? body.error
-          : typeof data === "string"
-            ? data
-            : JSON.stringify(data);
-    throw new Error(msg);
+    throw new Error(buildHttpErrorMessage(r, data));
   }
   return data as T;
 }
@@ -85,22 +94,129 @@ async function api<T>(path: string, opts: RequestInit = {}): Promise<T> {
     data = text;
   }
   if (!r.ok) {
-    const body = data as ApiErrorBody & { error?: string };
-    const msg =
-      typeof body?.detail === "string"
-        ? body.detail
-        : typeof body?.error === "string"
-          ? body.error
-          : typeof data === "string"
-            ? data
-            : JSON.stringify(data);
-    throw new Error(msg);
+    throw new Error(buildHttpErrorMessage(r, data));
   }
   return data as T;
 }
 
 function show(el: HTMLElement, obj: unknown): void {
   el.textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** Common engine order JSON field order, and display labels for row hover `title` tooltips. */
+const ORDER_DETAIL_KEYS: readonly string[] = [
+  "id",
+  "type",
+  "side",
+  "create_time",
+  "update_time",
+  "user_id",
+  "price",
+  "amount",
+  "taker_fee_rate",
+  "maker_fee_rate",
+  "left",
+  "deal_stock",
+  "deal_money",
+  "deal_fee",
+];
+const ORDER_DETAIL_LABEL: Record<string, string> = {
+  id: "order id",
+  type: "type",
+  side: "side",
+  create_time: "create_time",
+  update_time: "update_time",
+  user_id: "user_id",
+  price: "price",
+  amount: "amount",
+  taker_fee_rate: "taker_fee_rate",
+  maker_fee_rate: "maker_fee_rate",
+  left: "left",
+  deal_stock: "deal_stock",
+  deal_money: "deal_money",
+  deal_fee: "deal_fee",
+};
+
+function formatOrderDetailTitle(o: Record<string, unknown>): string {
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  for (const k of ORDER_DETAIL_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(o, k)) {
+      seen.add(k);
+      lines.push(formatOrderFieldLine(k, o[k]));
+    }
+  }
+  for (const k of Object.keys(o).sort()) {
+    if (seen.has(k)) continue;
+    lines.push(formatOrderFieldLine(k, o[k]));
+  }
+  return lines.join("\n");
+}
+
+function formatOrderFieldLine(k: string, v: unknown): string {
+  const label = ORDER_DETAIL_LABEL[k] ?? k;
+  if (k === "side") {
+    const n = typeof v === "number" ? v : Number(v);
+    const hint =
+      n === 1 ? " (sell / ask)" : n === 2 ? " (buy / bid)" : "";
+    return `${label}: ${v === null || v === undefined ? "—" : String(v)}${hint}`;
+  }
+  return `${label}: ${v === null || v === undefined ? "—" : String(v)}`;
+}
+
+function renderOrderRows(
+  tbody: HTMLTableSectionElement,
+  data: unknown,
+  errorText?: string,
+  fillFromBottom = false,
+): void {
+  tbody.replaceChildren();
+  if (errorText !== undefined) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.className = "ob-table-err";
+    td.textContent = errorText;
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  const rec = data as { orders?: Array<Record<string, unknown>> };
+  const orders = rec.orders;
+  if (!Array.isArray(orders) || orders.length === 0) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.className = "ob-table-empty";
+    td.textContent = "No orders";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  const toShow = fillFromBottom ? [...orders].reverse() : orders;
+  for (const o of toShow) {
+    const tr = document.createElement("tr");
+    tr.className = "ob-order-row";
+    tr.title = formatOrderDetailTitle(o);
+    tr.innerHTML = [
+      escapeHtml(String(o.id)),
+      escapeHtml(String(o.user_id)),
+      escapeHtml(String(o.price)),
+      escapeHtml(String(o.left)),
+      escapeHtml(String(o.amount)),
+    ]
+      .map((c) => `<td>${c}</td>`)
+      .join("");
+    tbody.appendChild(tr);
+  }
 }
 
 function formJson(form: HTMLFormElement): Record<string, string> {
@@ -130,6 +246,117 @@ async function refreshEngineStatus(): Promise<void> {
   }
 }
 
+type InputProgressPayload = {
+  topic?: string | null;
+  kafka_high?: string | null;
+  input_offset?: string | null;
+  lag?: string | null;
+  error?: string | null;
+};
+
+function fmtCell(v: unknown): string {
+  if (v === null || v === undefined) return "—";
+  const s = String(v).trim();
+  if (s === "" || s === "null" || s === "undefined") return "—";
+  return s;
+}
+
+/** Avoid assigning null/undefined to `textContent`—some engines render the literals "null" / "undefined". */
+function setText(el: HTMLElement, v: unknown, empty = "—"): void {
+  if (v === null || v === undefined) {
+    el.textContent = empty;
+    return;
+  }
+  if (typeof v === "string" && (v === "null" || v === "undefined")) {
+    el.textContent = empty;
+    return;
+  }
+  const t = String(v).trim();
+  if (t === "" || t === "null" || t === "undefined") {
+    el.textContent = empty;
+    return;
+  }
+  el.textContent = t;
+}
+
+function setErrLine(el: HTMLElement | null, message: string | null | undefined): void {
+  if (!el) return;
+  if (message == null) {
+    el.textContent = "";
+    el.hidden = true;
+    return;
+  }
+  const t = String(message).trim();
+  if (t === "" || t === "null" || t === "undefined") {
+    el.textContent = "";
+    el.hidden = true;
+    return;
+  }
+  el.textContent = t;
+  el.hidden = false;
+}
+
+function hasErrorMessage(j: InputProgressPayload): j is { error: string } {
+  return typeof j.error === "string" && j.error.trim() !== "";
+}
+
+async function refreshInputProgress(): Promise<void> {
+  const topicEl = document.getElementById("ob-input-topic");
+  const highEl = document.getElementById("ob-kafka-high");
+  const offEl = document.getElementById("ob-input-off");
+  const lagEl = document.getElementById("ob-lag");
+  const errEl = document.getElementById("ob-input-err");
+  if (!topicEl || !highEl || !offEl || !lagEl) return;
+  const m = encodeURIComponent(marketName);
+  const fallbackTopic = `offer.${marketName}`;
+  try {
+    const j = await api<InputProgressPayload>(`/api/markets/${m}/input-progress`);
+    if (hasErrorMessage(j)) {
+      setText(topicEl, fallbackTopic, fallbackTopic);
+      setText(highEl, "—");
+      setText(offEl, "—");
+      setText(lagEl, "—");
+      lagEl.classList.remove("ip-lag--warn");
+      setErrLine(errEl, j.error);
+      return;
+    }
+    const topicDisp = fmtCell(j.topic);
+    setText(topicEl, topicDisp !== "—" ? topicDisp : fallbackTopic, fallbackTopic);
+    setText(highEl, j.kafka_high);
+    setText(offEl, j.input_offset);
+    setText(lagEl, j.lag);
+    setErrLine(errEl, null);
+    try {
+      const lagStr = fmtCell(j.lag);
+      if (lagStr !== "—" && BigInt(lagStr) > 0n) {
+        lagEl.classList.add("ip-lag--warn");
+      } else {
+        lagEl.classList.remove("ip-lag--warn");
+      }
+    } catch {
+      lagEl.classList.remove("ip-lag--warn");
+    }
+  } catch (e) {
+    const msg =
+      e == null
+        ? "Network or API error (no error object)"
+        : e instanceof Error
+          ? e.message.trim() || e.name || "Error"
+          : String(e);
+    setText(topicEl, fallbackTopic, fallbackTopic);
+    setText(highEl, "—");
+    setText(offEl, "—");
+    setText(lagEl, "—");
+    lagEl.classList.remove("ip-lag--warn");
+    setErrLine(
+      errEl,
+      msg === "null" || msg === "undefined" || msg === ""
+        ? "Network or API error: ensure web-test is running on :8000 and /api/config is reachable."
+        : msg,
+    );
+  }
+}
+
 async function refreshOrderbook(): Promise<void> {
   const limit = Number((document.getElementById("ob-limit") as HTMLInputElement).value || 12);
   const offset = Math.max(
@@ -149,13 +376,17 @@ async function refreshOrderbook(): Promise<void> {
     ]);
 
     show($("out-ob-overview"), summary);
-    show($("out-asks"), asks);
-    show($("out-bids"), bids);
+    const asksBody = document.getElementById("asksBody") as HTMLTableSectionElement;
+    const bidsBody = document.getElementById("bidsBody") as HTMLTableSectionElement;
+    renderOrderRows(asksBody, asks, undefined, true);
+    renderOrderRows(bidsBody, bids);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     show($("out-ob-overview"), msg);
-    show($("out-asks"), msg);
-    show($("out-bids"), msg);
+    const asksBody = document.getElementById("asksBody") as HTMLTableSectionElement;
+    const bidsBody = document.getElementById("bidsBody") as HTMLTableSectionElement;
+    renderOrderRows(asksBody, null, msg, true);
+    renderOrderRows(bidsBody, null, msg);
   }
 }
 
@@ -276,5 +507,9 @@ void (async () => {
   void refreshOrderbook();
   setInterval(() => {
     void refreshOrderbook();
+  }, HTTP_POLL_MS);
+  void refreshInputProgress();
+  setInterval(() => {
+    void refreshInputProgress();
   }, HTTP_POLL_MS);
 })();

@@ -22,9 +22,11 @@ import { setupDatabase, disconnectDb, webRoot } from "./db.js";
 import { FeedHub } from "./services/feedHub.js";
 import { OfferDispatchService } from "./services/offerDispatchService.js";
 import { OfferService } from "./services/offerService.js";
+import { OfferTopicMonitor } from "./services/offerTopicMonitor.js";
 import { QuoteService } from "./services/quoteService.js";
 import { SettleService } from "./services/settleService.js";
 import { registerRoutes } from "./routes/registerRoutes.js";
+import { bindKafkaForInputProgress } from "./inputTopicProgress.js";
 
 dotenv.config();
 
@@ -62,11 +64,13 @@ async function runSession(): Promise<void> {
     clientId: `matchengine-web-test-${randomUUID()}`,
     brokers: getAppConfig().kafkaBootstrap.split(",").map((s) => s.trim()),
   });
+  bindKafkaForInputProgress(kafka);
 
   const producer = kafka.producer();
   const hub = new FeedHub();
   const offerDispatch = new OfferDispatchService(producer);
   const offerService = new OfferService();
+  const offerTopicMonitor = new OfferTopicMonitor(kafka);
   const quoteService = new QuoteService(kafka, hub);
   const settleService = new SettleService(kafka, hub);
 
@@ -86,6 +90,11 @@ async function runSession(): Promise<void> {
     }
     try {
       await offerDispatch.stop();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await offerTopicMonitor.stop();
     } catch {
       /* ignore */
     }
@@ -125,12 +134,15 @@ async function runSession(): Promise<void> {
     void settleService.start().catch((e) => {
       console.error("settle service consumer failed", e);
     });
+    void offerTopicMonitor.start().catch((e) => {
+      console.error("[offer-topic-monitor] failed", e);
+    });
 
     const app = express();
     app.use(cors());
     app.use(express.json({ limit: "1mb" }));
 
-    registerRoutes(app, offerService);
+    registerRoutes(app, offerService, offerTopicMonitor);
 
     if (isDev) {
       const { createServer: createViteServer } = await import("vite");

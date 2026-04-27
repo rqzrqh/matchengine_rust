@@ -8,10 +8,16 @@ import { getAppConfig } from "../config.js";
 import { getDb } from "../db.js";
 import { quoteDealTicks, settleMessages } from "../db/schema.js";
 import type { OfferService } from "../services/offerService.js";
+import type { OfferTopicMonitor } from "../services/offerTopicMonitor.js";
 import { serializeQuoteDealTick } from "../services/quoteService.js";
 import { serializeSettleMessage } from "../services/settleService.js";
+import { getInputTopicProgress } from "../inputTopicProgress.js";
 
-export function registerRoutes(app: Express, offerService: OfferService): void {
+export function registerRoutes(
+  app: Express,
+  offerService: OfferService,
+  offerTopicMonitor: OfferTopicMonitor,
+): void {
   app.get("/api/config", (_req: Request, res: Response) => {
     const cfg = getAppConfig();
     res.json({
@@ -41,6 +47,37 @@ export function registerRoutes(app: Express, offerService: OfferService): void {
       res.status(status).type("application/json").send(text);
     } catch (e) {
       res.status(502).json({ error: String(e) });
+    }
+  });
+
+  /**
+   * Offer topic: {@link OfferTopicMonitor} subscribes and keeps the last message; **end offset** is fetched
+   * from Kafka on each request (no server-side poll; the browser drives refresh via this route).
+   */
+  app.get("/api/markets/:market/offer-topic/end-offset", async (req: Request, res: Response) => {
+    const cfg = getAppConfig();
+    if (req.params.market !== cfg.marketName) {
+      res.status(404).json({ error: "unknown market" });
+      return;
+    }
+    try {
+      res.json(await offerTopicMonitor.getSnapshot());
+    } catch (e) {
+      res.status(500).json({ error: String(e) });
+    }
+  });
+
+  /** Input topic high vs `market.status.input_offset` (approx. backlog in messages). */
+  app.get("/api/markets/:market/input-progress", async (req: Request, res: Response) => {
+    try {
+      const out = await getInputTopicProgress(req.params.market);
+      if ("error" in out) {
+        res.status(200).json(out);
+        return;
+      }
+      res.json(out);
+    } catch (e) {
+      res.status(500).json({ error: String(e) });
     }
   });
 
