@@ -1,10 +1,9 @@
-import { and, eq } from "drizzle-orm";
 import { Kafka, type Consumer } from "kafkajs";
 import { getAppConfig } from "../config.js";
 import type { AppDb } from "../db.js";
 import { getDb } from "../db.js";
+import { SettleConsumerState, SettleMessage } from "../db/entities.js";
 import { unixSecondsNow } from "../time.js";
-import { settleConsumerState, settleMessages, type SettleMessageRow } from "../db/schema.js";
 import type { FeedHub } from "./feedHub.js";
 
 const SETTLE_TOPIC = "settle";
@@ -34,11 +33,10 @@ export class SettleService {
       maxWaitTimeInMs: 5000,
     });
 
-    const db = getDb();
-    const states = await db
-      .select()
-      .from(settleConsumerState)
-      .where(eq(settleConsumerState.market, marketName));
+    const mgr = getDb().manager;
+    const states = await mgr.find(SettleConsumerState, {
+      where: { market: marketName },
+    });
 
     const byGroup = new Map(states.map((s) => [s.settleGroupId, s]));
 
@@ -89,15 +87,7 @@ export class SettleService {
         const market = String(payload.market ?? marketName);
         const rootMsgid = numOrNull(payload.msgid);
 
-        await this.handleSettleMessage(
-          getDb(),
-          topic,
-          settleGroup,
-          market,
-          offset,
-          raw,
-          rootMsgid,
-        );
+        await this.handleSettleMessage(getDb(), topic, settleGroup, market, offset, raw, rootMsgid);
 
         this.hub.broadcast("settle", { topic, ...payload });
 
@@ -113,25 +103,22 @@ export class SettleService {
   }
 
   private async handleBadJson(
-    db: AppDb,
+    ds: AppDb,
     topic: string,
     settleGroup: number,
     market: string,
     offset: bigint,
   ): Promise<void> {
-    const [row] = await db
-      .select()
-      .from(settleConsumerState)
-      .where(
-        and(eq(settleConsumerState.settleGroupId, settleGroup), eq(settleConsumerState.market, market)),
-      )
-      .limit(1);
-    await this.upsertOffsetOnly(db, settleGroup, market, offset, row?.lastMsgid ?? null);
+    const mgr = ds.manager;
+    const row = await mgr.findOne(SettleConsumerState, {
+      where: { settleGroupId: settleGroup, market },
+    });
+    await this.upsertOffsetOnly(ds, settleGroup, market, offset, row?.lastMsgid ?? null);
   }
 
   /** Appends raw Kafka value to `settle_messages` when `msgid` advances. */
   private async handleSettleMessage(
-    db: AppDb,
+    ds: AppDb,
     topic: string,
     settleGroup: number,
     market: string,
@@ -139,68 +126,63 @@ export class SettleService {
     raw: string,
     rootMsgid: number | null,
   ): Promise<void> {
-    const [row] = await db
-      .select()
-      .from(settleConsumerState)
-      .where(
-        and(eq(settleConsumerState.settleGroupId, settleGroup), eq(settleConsumerState.market, market)),
-      )
-      .limit(1);
+    const mgr = ds.manager;
+    const row = await mgr.findOne(SettleConsumerState, {
+      where: { settleGroupId: settleGroup, market },
+    });
 
     const lastMsgid = row?.lastMsgid ?? null;
 
     if (rootMsgid === null) {
-      await this.upsertOffsetOnly(db, settleGroup, market, offset, lastMsgid);
+      await this.upsertOffsetOnly(ds, settleGroup, market, offset, lastMsgid);
       return;
     }
 
     if (lastMsgid !== null && rootMsgid < lastMsgid) {
-      await this.upsertOffsetOnly(db, settleGroup, market, offset, lastMsgid);
+      await this.upsertOffsetOnly(ds, settleGroup, market, offset, lastMsgid);
       return;
     }
 
     if (lastMsgid !== null && rootMsgid === lastMsgid) {
-      await this.upsertOffsetOnly(db, settleGroup, market, offset, lastMsgid);
+      await this.upsertOffsetOnly(ds, settleGroup, market, offset, lastMsgid);
       return;
     }
 
     const now = unixSecondsNow();
 
-    await db.insert(settleMessages).values({
+    await mgr.insert(SettleMessage, {
       ingestedAt: now,
       kafkaTopic: topic,
       rawJson: raw,
     });
 
-    await this.upsertWithMsgid(db, settleGroup, market, offset, rootMsgid, now);
+    await this.upsertWithMsgid(ds, settleGroup, market, offset, rootMsgid, now);
   }
 
   private async upsertOffsetOnly(
-    db: AppDb,
+    ds: AppDb,
     settleGroup: number,
     market: string,
     offset: bigint,
     keepMsgid: number | null,
   ): Promise<void> {
+    const mgr = ds.manager;
     const now = unixSecondsNow();
-    const [r] = await db
-      .select()
-      .from(settleConsumerState)
-      .where(
-        and(eq(settleConsumerState.settleGroupId, settleGroup), eq(settleConsumerState.market, market)),
-      )
-      .limit(1);
+    const r = await mgr.findOne(SettleConsumerState, {
+      where: { settleGroupId: settleGroup, market },
+    });
 
     if (r) {
-      await db
-        .update(settleConsumerState)
-        .set({ lastOffset: offset, updatedAt: now })
-        .where(eq(settleConsumerState.id, r.id));
+      await mgr.update(
+        SettleConsumerState,
+        { id: r.id },
+        { lastOffset: offset.toString(), updatedAt: now },
+      );
     } else {
-      await db.insert(settleConsumerState).values({
+      await mgr.insert(SettleConsumerState, {
         settleGroupId: settleGroup,
         market,
-        lastOffset: offset,
+        lastOffset: offset.toString(),
         lastMsgid: keepMsgid,
         updatedAt: now,
       });
@@ -208,31 +190,29 @@ export class SettleService {
   }
 
   private async upsertWithMsgid(
-    db: AppDb,
+    ds: AppDb,
     settleGroup: number,
     market: string,
     offset: bigint,
     msgid: number,
     now: number,
   ): Promise<void> {
-    const [r] = await db
-      .select()
-      .from(settleConsumerState)
-      .where(
-        and(eq(settleConsumerState.settleGroupId, settleGroup), eq(settleConsumerState.market, market)),
-      )
-      .limit(1);
+    const mgr = ds.manager;
+    const r = await mgr.findOne(SettleConsumerState, {
+      where: { settleGroupId: settleGroup, market },
+    });
 
     if (r) {
-      await db
-        .update(settleConsumerState)
-        .set({ lastOffset: offset, lastMsgid: msgid, updatedAt: now })
-        .where(eq(settleConsumerState.id, r.id));
+      await mgr.update(
+        SettleConsumerState,
+        { id: r.id },
+        { lastOffset: offset.toString(), lastMsgid: msgid, updatedAt: now },
+      );
     } else {
-      await db.insert(settleConsumerState).values({
+      await mgr.insert(SettleConsumerState, {
         settleGroupId: settleGroup,
         market,
-        lastOffset: offset,
+        lastOffset: offset.toString(),
         lastMsgid: msgid,
         updatedAt: now,
       });
@@ -253,7 +233,7 @@ function numOrNull(v: unknown): number | null {
   return Number.isFinite(n) ? Math.trunc(n) : null;
 }
 
-export function serializeSettleMessage(r: SettleMessageRow): Record<string, unknown> {
+export function serializeSettleMessage(r: SettleMessage): Record<string, unknown> {
   return {
     id: r.id,
     ingested_at: r.ingestedAt,

@@ -2,11 +2,10 @@
  * Express routes: `GET /api/config`, engine proxy paths, offer APIs, and DB-backed tick/history feeds.
  */
 import type { Express, Request, Response } from "express";
-import { desc } from "drizzle-orm";
 import { engineGet } from "../engineClient.js";
 import { getAppConfig } from "../config.js";
 import { getDb } from "../db.js";
-import { quoteDealTicks, settleMessages } from "../db/schema.js";
+import { QuoteDealTick, SettleMessage } from "../db/entities.js";
 import type { OfferService } from "../services/offerService.js";
 import type { OfferTopicMonitor } from "../services/offerTopicMonitor.js";
 import { serializeQuoteDealTick } from "../services/quoteService.js";
@@ -167,12 +166,11 @@ export function registerRoutes(
   app.get("/api/quote_ticks", async (req: Request, res: Response) => {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit ?? 200) || 200));
     try {
-      const db = getDb();
-      const rows = await db
-        .select()
-        .from(quoteDealTicks)
-        .orderBy(desc(quoteDealTicks.id))
-        .limit(limit);
+      const mgr = getDb().manager;
+      const rows = await mgr.find(QuoteDealTick, {
+        order: { id: "DESC" },
+        take: limit,
+      });
       res.json({ rows: rows.map(serializeQuoteDealTick) });
     } catch (e) {
       res.status(500).json({ error: String(e) });
@@ -182,12 +180,11 @@ export function registerRoutes(
   app.get("/api/settle_messages", async (req: Request, res: Response) => {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit ?? 200) || 200));
     try {
-      const db = getDb();
-      const rows = await db
-        .select()
-        .from(settleMessages)
-        .orderBy(desc(settleMessages.id))
-        .limit(limit);
+      const mgr = getDb().manager;
+      const rows = await mgr.find(SettleMessage, {
+        order: { id: "DESC" },
+        take: limit,
+      });
       res.json({ rows: rows.map(serializeSettleMessage) });
     } catch (e) {
       res.status(500).json({ error: String(e) });

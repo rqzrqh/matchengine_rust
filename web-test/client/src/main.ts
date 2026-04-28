@@ -1066,21 +1066,32 @@ document.getElementById("refresh-interval-ms")!.addEventListener("change", () =>
 });
 
 const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
-const ws = new WebSocket(`${wsProto}//${location.host}/ws`);
+const wsUrl = `${wsProto}//${location.host}/ws`;
 const wsOutSettle = $("out-ws-settle");
 const wsOutQuote = $("out-ws-quote");
 const maxLines = 150;
 const linesSettle: string[] = [];
 const linesQuote: string[] = [];
 
+/** Real-time feed (WebSocket settle / quote); default on, user can disconnect from header. */
+let wsLivePushEnabled = true;
+let ws: WebSocket | null = null;
+
 function renderWsPanels(): void {
   wsOutSettle.textContent = linesSettle.join("\n");
   wsOutQuote.textContent = linesQuote.join("\n");
 }
 
+function updateWsLivePushButton(): void {
+  const btn = document.getElementById("btn-ws-live-push") as HTMLButtonElement | null;
+  if (!btn) return;
+  btn.textContent = wsLivePushEnabled ? "Real-time feed: On" : "Real-time feed: Off";
+  setRunningStateButton(btn, wsLivePushEnabled);
+}
+
 type WsEnvelope = { channel?: string; data?: unknown };
 
-ws.addEventListener("message", (ev) => {
+function handleWsMessage(ev: MessageEvent): void {
   const raw = ev.data as string;
   let target: "settle" | "quote" = "settle";
   let line = raw;
@@ -1103,6 +1114,50 @@ ws.addEventListener("message", (ev) => {
     while (linesSettle.length > maxLines) linesSettle.shift();
   }
   renderWsPanels();
+}
+
+function connectWebSocketIfNeeded(): void {
+  if (!wsLivePushEnabled) return;
+  if (ws !== null && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+    return;
+  }
+  const socket = new WebSocket(wsUrl);
+  socket.addEventListener("message", handleWsMessage);
+  socket.addEventListener("close", () => {
+    if (ws === socket) {
+      ws = null;
+    }
+    if (wsLivePushEnabled) {
+      connectWebSocketIfNeeded();
+    }
+  });
+  ws = socket;
+}
+
+function disconnectWebSocket(): void {
+  if (!ws) return;
+  const prev = ws;
+  ws.removeEventListener("message", handleWsMessage);
+  ws = null;
+  try {
+    prev.close();
+  } catch {
+    /* ignore */
+  }
+}
+
+function setWsLivePushEnabled(on: boolean): void {
+  wsLivePushEnabled = on;
+  updateWsLivePushButton();
+  if (on) {
+    connectWebSocketIfNeeded();
+  } else {
+    disconnectWebSocket();
+  }
+}
+
+document.getElementById("btn-ws-live-push")!.addEventListener("click", () => {
+  setWsLivePushEnabled(!wsLivePushEnabled);
 });
 
 document.getElementById("btn-ws-clear")!.addEventListener("click", () => {
@@ -1116,5 +1171,7 @@ void (async () => {
   updateManualSubmitButton();
   updateAutoOrderButton();
   setAutoOrderStatus("Idle");
+  updateWsLivePushButton();
+  connectWebSocketIfNeeded();
   startHttpAutoRefresh();
 })();

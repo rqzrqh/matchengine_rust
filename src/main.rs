@@ -1,5 +1,5 @@
 use std::{thread, net::SocketAddr, str, sync::mpsc, env, process, time::Duration};
-use rdkafka::consumer::{BaseConsumer, StreamConsumer};
+use rdkafka::consumer::StreamConsumer;
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use rdkafka::consumer::Consumer;
 use rdkafka::config::RDKafkaLogLevel;
@@ -179,6 +179,7 @@ fn main() {
             .create()
             .expect("Failed to create client");
 
+        // `Market.input_offset` is the last Kafka offset consumed; assign partition 0 at `input_offset + 1`.
         let mut tpl = TopicPartitionList::new();
         tpl.add_partition_offset(&input_topic, 0, Offset::Offset(input_offset + 1))
             .unwrap();

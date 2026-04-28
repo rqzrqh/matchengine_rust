@@ -1,45 +1,71 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { MySql2Database } from "drizzle-orm/mysql2";
-import { drizzle } from "drizzle-orm/mysql2";
-import { migrate } from "drizzle-orm/mysql2/migrator";
-import mysql from "mysql2/promise";
-import * as schema from "./db/schema.js";
+import { DataSource } from "typeorm";
+import {
+  OfferDispatchState,
+  OfferOrder,
+  QuoteConsumerState,
+  QuoteDealTick,
+  SettleConsumerState,
+  SettleMessage,
+} from "./db/entities.js";
+import { unixSecondsNow } from "./time.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** `web-test/` root (parent of `src` or `dist`) */
 export const webRoot = path.join(__dirname, "..");
 
-export type AppDb = MySql2Database<typeof schema>;
+export type AppDb = DataSource;
 
-let pool: mysql.Pool | null = null;
-let db: AppDb | null = null;
+let ds: DataSource | null = null;
 
-/** Run Drizzle migrations and create the pool (same MySQL URL as config.yaml). */
-export async function setupDatabase(databaseUrl: string): Promise<AppDb> {
-  process.env.DATABASE_URL = databaseUrl;
-
-  const migrationConn = await mysql.createConnection(databaseUrl);
-  const migrationDb = drizzle(migrationConn);
-  await migrate(migrationDb, { migrationsFolder: path.join(webRoot, "drizzle") });
-  await migrationConn.end();
-
-  pool = mysql.createPool(databaseUrl);
-  db = drizzle(pool, { schema, mode: "default" });
-  return db;
+async function seedOfferDispatchState(dataSource: DataSource): Promise<void> {
+  const now = unixSecondsNow();
+  await dataSource.query(
+    `INSERT IGNORE INTO offer_dispatch_state (id, last_sequence_id, last_sent_sequence_id, updated_at) VALUES (?, ?, ?, ?)`,
+    [1, 0, 0, now],
+  );
 }
 
-export function getDb(): AppDb {
-  if (!db) {
+/**
+ * TypeORM `synchronize`: creates/updates tables for registered entities only.
+ * Other tables already in MySQL are left untouched (no Drizzle Kit rename prompts).
+ */
+export async function setupDatabase(databaseUrl: string): Promise<DataSource> {
+  process.env.DATABASE_URL = databaseUrl;
+
+  const dataSource = new DataSource({
+    type: "mysql",
+    url: databaseUrl,
+    entities: [
+      QuoteDealTick,
+      QuoteConsumerState,
+      SettleMessage,
+      SettleConsumerState,
+      OfferOrder,
+      OfferDispatchState,
+    ],
+    synchronize: true,
+    logging: false,
+  });
+
+  await dataSource.initialize();
+  await seedOfferDispatchState(dataSource);
+
+  ds = dataSource;
+  return dataSource;
+}
+
+export function getDb(): DataSource {
+  if (!ds) {
     throw new Error("setupDatabase was not called");
   }
-  return db;
+  return ds;
 }
 
 export async function disconnectDb(): Promise<void> {
-  if (pool) {
-    await pool.end();
-    pool = null;
-    db = null;
+  if (ds) {
+    await ds.destroy();
+    ds = null;
   }
 }

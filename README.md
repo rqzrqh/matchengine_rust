@@ -77,7 +77,7 @@ npm install
 npm run dev
 ```
 
-On startup, **`setupDatabase`** applies the bundled DDL in **`web-test/drizzle/schema.sql`** to the MySQL database named by **`config.yaml` → `market.name`** (using the same credentials as the engine). You only need a manual **`npm run db:migrate`** (with **`DATABASE_URL`** set) if you use Drizzle Kit CLI tools such as **`db:studio`**.
+On startup, **`setupDatabase`** uses **TypeORM** (`synchronize: true`) against **`web-test/src/db/entities.ts`**: only those entity tables are created/updated; **any other tables already in the same MySQL database are left alone** (**`config.yaml` → `market.name`**, same **`db`** credentials as the engine).
 
 Development server defaults to **`http://127.0.0.1:8000`** (see `web-test/src/config.ts`). Production-style run: **`npm run build && npm start`**.
 

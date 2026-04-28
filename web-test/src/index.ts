@@ -1,6 +1,7 @@
 /**
- * web-test entry: Express + Vite (dev), MySQL via Drizzle, Kafka producers/consumers, WebSocket fan-out.
+ * web-test entry: Express + Vite (dev), MySQL via TypeORM, Kafka producers/consumers, WebSocket fan-out.
  */
+import "reflect-metadata";
 import { randomUUID } from "crypto";
 import path from "node:path";
 import fs from "node:fs";
@@ -20,7 +21,9 @@ import {
 } from "./config.js";
 import { setupDatabase, disconnectDb, webRoot } from "./db.js";
 import { FeedHub } from "./services/feedHub.js";
+import { bootstrapOfferLastSequenceFromKafka } from "./services/offerKafkaBootstrap.js";
 import { OfferDispatchService } from "./services/offerDispatchService.js";
+import { OfferSequenceService } from "./services/offerSequenceService.js";
 import { OfferService } from "./services/offerService.js";
 import { OfferTopicMonitor } from "./services/offerTopicMonitor.js";
 import { QuoteService } from "./services/quoteService.js";
@@ -69,7 +72,8 @@ async function runSession(): Promise<void> {
   const producer = kafka.producer();
   const hub = new FeedHub();
   const offerDispatch = new OfferDispatchService(producer);
-  const offerService = new OfferService();
+  const offerSequence = new OfferSequenceService();
+  const offerService = new OfferService(offerSequence);
   const offerTopicMonitor = new OfferTopicMonitor(kafka);
   const quoteService = new QuoteService(kafka, hub);
   const settleService = new SettleService(kafka, hub);
@@ -90,6 +94,11 @@ async function runSession(): Promise<void> {
     }
     try {
       await offerDispatch.stop();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await offerSequence.stop();
     } catch {
       /* ignore */
     }
@@ -126,6 +135,8 @@ async function runSession(): Promise<void> {
 
   try {
     await producer.connect();
+    await bootstrapOfferLastSequenceFromKafka(kafka);
+    offerSequence.start();
     offerDispatch.start();
 
     void quoteService.start().catch((e) => {

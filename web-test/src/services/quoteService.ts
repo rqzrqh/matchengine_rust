@@ -1,10 +1,9 @@
-import { and, eq } from "drizzle-orm";
 import { Kafka, type Consumer } from "kafkajs";
 import { getAppConfig } from "../config.js";
 import type { AppDb } from "../db.js";
 import { getDb } from "../db.js";
+import { QuoteConsumerState, QuoteDealTick } from "../db/entities.js";
 import { unixSecondsNow } from "../time.js";
-import { quoteConsumerState, quoteDealTicks, type QuoteDealTick } from "../db/schema.js";
 import type { FeedHub } from "./feedHub.js";
 
 const PARTITION = 0;
@@ -33,14 +32,10 @@ export class QuoteService {
       maxWaitTimeInMs: 5000,
     });
 
-    const db = getDb();
-    const [st] = await db
-      .select()
-      .from(quoteConsumerState)
-      .where(
-        and(eq(quoteConsumerState.kafkaTopic, quoteTopic), eq(quoteConsumerState.partitionId, PARTITION)),
-      )
-      .limit(1);
+    const mgr = getDb().manager;
+    const st = await mgr.findOne(QuoteConsumerState, {
+      where: { kafkaTopic: quoteTopic, partitionId: PARTITION },
+    });
 
     let initialSeekDone = false;
     const onGroupJoin = async () => {
@@ -115,20 +110,19 @@ export class QuoteService {
     await this.consumer.commitOffsets([{ topic, partition, offset: next }]);
   }
 
-  private async handleBadJson(db: AppDb, topic: string, partition: number, offset: bigint): Promise<void> {
-    const [row] = await db
-      .select()
-      .from(quoteConsumerState)
-      .where(and(eq(quoteConsumerState.kafkaTopic, topic), eq(quoteConsumerState.partitionId, partition)))
-      .limit(1);
-    await this.upsertOffsetOnly(db, topic, partition, offset, row?.lastDealId ?? null);
+  private async handleBadJson(ds: AppDb, topic: string, partition: number, offset: bigint): Promise<void> {
+    const mgr = ds.manager;
+    const row = await mgr.findOne(QuoteConsumerState, {
+      where: { kafkaTopic: topic, partitionId: partition },
+    });
+    await this.upsertOffsetOnly(ds, topic, partition, offset, row?.lastDealId ?? null);
   }
 
   /**
    * @returns whether a new `quote_deal_ticks` row was inserted (triggers WebSocket push)
    */
   private async handleQuoteMessage(
-    db: AppDb,
+    ds: AppDb,
     topic: string,
     partition: number,
     offset: bigint,
@@ -140,31 +134,30 @@ export class QuoteService {
     price: string,
     amount: string,
   ): Promise<boolean> {
-    const [row] = await db
-      .select()
-      .from(quoteConsumerState)
-      .where(and(eq(quoteConsumerState.kafkaTopic, topic), eq(quoteConsumerState.partitionId, partition)))
-      .limit(1);
+    const mgr = ds.manager;
+    const row = await mgr.findOne(QuoteConsumerState, {
+      where: { kafkaTopic: topic, partitionId: partition },
+    });
 
     const lastDealId = row?.lastDealId ?? null;
 
     if (dealId === null) {
-      await this.upsertOffsetOnly(db, topic, partition, offset, lastDealId);
+      await this.upsertOffsetOnly(ds, topic, partition, offset, lastDealId);
       return false;
     }
 
     if (lastDealId !== null && dealId < lastDealId) {
-      await this.upsertOffsetOnly(db, topic, partition, offset, lastDealId);
+      await this.upsertOffsetOnly(ds, topic, partition, offset, lastDealId);
       return false;
     }
 
     if (lastDealId !== null && dealId === lastDealId) {
-      await this.upsertOffsetOnly(db, topic, partition, offset, lastDealId);
+      await this.upsertOffsetOnly(ds, topic, partition, offset, lastDealId);
       return false;
     }
 
     const now = unixSecondsNow();
-    await db.insert(quoteDealTicks).values({
+    await mgr.insert(QuoteDealTick, {
       ingestedAt: now,
       kafkaTopic: topic,
       market,
@@ -176,34 +169,34 @@ export class QuoteService {
       rawJson: raw,
     });
 
-    await this.upsertWithDeal(db, topic, partition, offset, dealId, now);
+    await this.upsertWithDeal(ds, topic, partition, offset, dealId, now);
     return true;
   }
 
   private async upsertOffsetOnly(
-    db: AppDb,
+    ds: AppDb,
     topic: string,
     partition: number,
     offset: bigint,
     keepDealId: number | null,
   ): Promise<void> {
+    const mgr = ds.manager;
     const now = unixSecondsNow();
-    const [row] = await db
-      .select()
-      .from(quoteConsumerState)
-      .where(and(eq(quoteConsumerState.kafkaTopic, topic), eq(quoteConsumerState.partitionId, partition)))
-      .limit(1);
+    const row = await mgr.findOne(QuoteConsumerState, {
+      where: { kafkaTopic: topic, partitionId: partition },
+    });
 
     if (row) {
-      await db
-        .update(quoteConsumerState)
-        .set({ lastOffset: offset, updatedAt: now })
-        .where(eq(quoteConsumerState.id, row.id));
+      await mgr.update(
+        QuoteConsumerState,
+        { id: row.id },
+        { lastOffset: offset.toString(), updatedAt: now },
+      );
     } else {
-      await db.insert(quoteConsumerState).values({
+      await mgr.insert(QuoteConsumerState, {
         kafkaTopic: topic,
         partitionId: partition,
-        lastOffset: offset,
+        lastOffset: offset.toString(),
         lastDealId: keepDealId,
         updatedAt: now,
       });
@@ -211,29 +204,29 @@ export class QuoteService {
   }
 
   private async upsertWithDeal(
-    db: AppDb,
+    ds: AppDb,
     topic: string,
     partition: number,
     offset: bigint,
     dealId: number,
     now: number,
   ): Promise<void> {
-    const [row] = await db
-      .select()
-      .from(quoteConsumerState)
-      .where(and(eq(quoteConsumerState.kafkaTopic, topic), eq(quoteConsumerState.partitionId, partition)))
-      .limit(1);
+    const mgr = ds.manager;
+    const row = await mgr.findOne(QuoteConsumerState, {
+      where: { kafkaTopic: topic, partitionId: partition },
+    });
 
     if (row) {
-      await db
-        .update(quoteConsumerState)
-        .set({ lastOffset: offset, lastDealId: dealId, updatedAt: now })
-        .where(eq(quoteConsumerState.id, row.id));
+      await mgr.update(
+        QuoteConsumerState,
+        { id: row.id },
+        { lastOffset: offset.toString(), lastDealId: dealId, updatedAt: now },
+      );
     } else {
-      await db.insert(quoteConsumerState).values({
+      await mgr.insert(QuoteConsumerState, {
         kafkaTopic: topic,
         partitionId: partition,
-        lastOffset: offset,
+        lastOffset: offset.toString(),
         lastDealId: dealId,
         updatedAt: now,
       });
