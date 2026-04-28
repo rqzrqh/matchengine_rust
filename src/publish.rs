@@ -1,16 +1,88 @@
 use crate::market::*;
-use std::{thread, str, sync::mpsc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
+    thread,
+    str,
+};
 use std::rc::Rc;
 use rust_decimal::prelude::*;
 use json::*;
 use crate::task::*;
 
-use rdkafka::producer::{ FutureProducer, FutureRecord };
+use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord};
 use rdkafka::{ config::ClientConfig };
 
 pub struct Publish {
-    sender: mpsc::Sender<Box<OutputPublishTask>>,
+    quote_sender: mpsc::Sender<QuotePublishTaskInfo>,
+    settle_sender: mpsc::Sender<SettlePublishTaskInfo>,
+    backlog: Arc<PublishBacklog>,
     settle_group_count:u32,
+}
+
+pub struct PublishBacklog {
+    quote_pending: AtomicUsize,
+    settle_pending: AtomicUsize,
+    settle_group_pending: Vec<AtomicUsize>,
+}
+
+pub struct PublishBacklogSnapshot {
+    pub quote_pending: usize,
+    pub settle_pending: usize,
+    pub total_pending: usize,
+    pub settle_group_pending: Vec<usize>,
+}
+
+impl PublishBacklog {
+    fn new(settle_group_count: usize) -> Self {
+        Self {
+            quote_pending: AtomicUsize::new(0),
+            settle_pending: AtomicUsize::new(0),
+            settle_group_pending: (0..settle_group_count)
+                .map(|_| AtomicUsize::new(0))
+                .collect(),
+        }
+    }
+
+    fn inc_quote(&self) {
+        self.quote_pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn dec_quote(&self) {
+        let prev = self.quote_pending.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(prev > 0, "quote backlog underflow");
+    }
+
+    fn inc_settle(&self, group_id: usize) {
+        self.settle_pending.fetch_add(1, Ordering::Relaxed);
+        self.settle_group_pending[group_id].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn dec_settle(&self, group_id: usize) {
+        let total_prev = self.settle_pending.fetch_sub(1, Ordering::Relaxed);
+        let group_prev = self.settle_group_pending[group_id].fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(total_prev > 0, "settle backlog underflow");
+        debug_assert!(group_prev > 0, "settle group backlog underflow");
+    }
+
+    pub fn snapshot(&self) -> PublishBacklogSnapshot {
+        let quote_pending = self.quote_pending.load(Ordering::Relaxed);
+        let settle_pending = self.settle_pending.load(Ordering::Relaxed);
+        let settle_group_pending = self
+            .settle_group_pending
+            .iter()
+            .map(|x| x.load(Ordering::Relaxed))
+            .collect::<Vec<_>>();
+
+        PublishBacklogSnapshot {
+            quote_pending,
+            settle_pending,
+            total_pending: quote_pending + settle_pending,
+            settle_group_pending,
+        }
+    }
 }
 
 struct QuotePublishTaskInfo {
@@ -26,105 +98,223 @@ struct SettlePublishTaskInfo {
     data:JsonValue,
 }
 
-enum OutputPublishTask {
-    QuotePublishTask(QuotePublishTaskInfo),
-    SettlePublishTask(SettlePublishTaskInfo),
+fn collect_publish_batch<T>(receiver: &mpsc::Receiver<T>, batch_size: usize) -> Vec<T> {
+    let mut batch = Vec::with_capacity(batch_size);
+    batch.push(receiver.recv().unwrap());
+
+    while batch.len() < batch_size {
+        match receiver.try_recv() {
+            Ok(task) => batch.push(task),
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => panic!("publish task channel disconnected"),
+        }
+    }
+
+    batch
+}
+
+fn enqueue_publish(
+    producer: &FutureProducer,
+    topic: &str,
+    data: &JsonValue,
+    ) -> DeliveryFuture {
+    let payload = data.to_string();
+    let record = FutureRecord::to(topic).payload(payload.as_bytes());
+    producer
+        .send_result::<Vec<u8>, _>(record)
+        .unwrap_or_else(|(e, _)| panic!("publish enqueue failed topic={} error={}", topic, e))
+}
+
+fn build_kafka_producer(brokers: &str, batch_size: usize, linger_ms: u64) -> FutureProducer {
+    let linger_ms_str = linger_ms.to_string();
+    let batch_size_str = batch_size.to_string();
+
+    ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("message.timeout.ms", "5000")
+        // Allow duplicates, but keep strict per-topic ordering by sending at most one
+        // in-flight request per connection.
+        .set("max.in.flight.requests.per.connection", "1")
+        .set("linger.ms", &linger_ms_str)
+        .set("batch.num.messages", &batch_size_str)
+        .create()
+        .expect("Producer creation error")
+}
+
+fn spawn_quote_publish_thread(
+    brokers: String,
+    main_routine_sender: mpsc::Sender<Task>,
+    quote_deals_id: u64,
+    batch_size: usize,
+    linger_ms: u64,
+    receiver: mpsc::Receiver<QuotePublishTaskInfo>,
+    backlog: Arc<PublishBacklog>,
+) {
+    thread::spawn(move || {
+        let producer_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        producer_rt.block_on(async move {
+            let producer = build_kafka_producer(&brokers, batch_size, linger_ms);
+            let mut quote_deals_id = quote_deals_id;
+
+            loop {
+                let batch = collect_publish_batch(&receiver, batch_size);
+                let batch_len = batch.len();
+                let mut pending = Vec::with_capacity(batch_len);
+                let mut next_quote_deals_id = quote_deals_id;
+
+                for task in batch {
+                    if task.deals_id > next_quote_deals_id {
+                        pending.push((task.deals_id, enqueue_publish(&producer, &task.topic, &task.data)));
+                        next_quote_deals_id = task.deals_id;
+                    } else {
+                        backlog.dec_quote();
+                    }
+                }
+
+                if pending.len() > 1 {
+                    info!(
+                        "quote batch flush: queued={} delivered_after_ack={} linger_ms={}",
+                        batch_len,
+                        pending.len(),
+                        linger_ms
+                    );
+                }
+
+                for (deals_id, delivery) in pending {
+                    match delivery.await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err((e, _))) => panic!("quote publish delivery failed: {}", e),
+                        Err(e) => panic!("quote publish delivery canceled: {}", e),
+                    }
+
+                    backlog.dec_quote();
+                    quote_deals_id = deals_id;
+                    let task = QuotePublishProgressTask { quote_deals_id };
+                    main_routine_sender
+                        .send(Task::QuoteProgressUpdateTask(task))
+                        .expect("send quote progress update task failed");
+                }
+            }
+        })
+    });
+}
+
+fn spawn_settle_publish_thread(
+    brokers: String,
+    main_routine_sender: mpsc::Sender<Task>,
+    settle_message_ids: Vec<u64>,
+    batch_size: usize,
+    linger_ms: u64,
+    receiver: mpsc::Receiver<SettlePublishTaskInfo>,
+    backlog: Arc<PublishBacklog>,
+) {
+    thread::spawn(move || {
+        let producer_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        producer_rt.block_on(async move {
+            let producer = build_kafka_producer(&brokers, batch_size, linger_ms);
+            let mut settle_message_ids = settle_message_ids;
+
+            loop {
+                let batch = collect_publish_batch(&receiver, batch_size);
+                let batch_len = batch.len();
+                let mut pending = Vec::with_capacity(batch_len);
+                let mut next_settle_message_ids = settle_message_ids.clone();
+
+                for task in batch {
+                    let group_id = task.group_id as usize;
+                    if task.message_id > next_settle_message_ids[group_id] {
+                        pending.push((
+                            group_id,
+                            task.message_id,
+                            enqueue_publish(&producer, &task.topic, &task.data),
+                        ));
+                        next_settle_message_ids[group_id] = task.message_id;
+                    } else {
+                        backlog.dec_settle(group_id);
+                    }
+                }
+
+                if pending.len() > 1 {
+                    info!(
+                        "settle batch flush: queued={} delivered_after_ack={} linger_ms={}",
+                        batch_len,
+                        pending.len(),
+                        linger_ms
+                    );
+                }
+
+                for (group_id, message_id, delivery) in pending {
+                    match delivery.await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err((e, _))) => panic!("settle publish delivery failed: {}", e),
+                        Err(e) => panic!("settle publish delivery canceled: {}", e),
+                    }
+
+                    backlog.dec_settle(group_id);
+                    settle_message_ids[group_id] = message_id;
+                    let task = SettlePublishProgressTask { group_id, message_id };
+                    main_routine_sender
+                        .send(Task::SettleProgressUpdateTask(task))
+                        .expect("send settle progress update task failed");
+                }
+            }
+        })
+    });
 }
 
 impl Publish {
-    pub fn new(brokers: String, main_routine_sender: mpsc::Sender<Task>, quote_deals_id: u64, settle_message_ids: Vec<u64>) -> Publish {
-        let (sender, receiver) = mpsc::channel();
+    pub fn new(
+        brokers: String,
+        main_routine_sender: mpsc::Sender<Task>,
+        quote_deals_id: u64,
+        settle_message_ids: Vec<u64>,
+        batch_size: usize,
+        linger_ms: u64,
+    ) -> Publish {
+        let (quote_sender, quote_receiver) = mpsc::channel();
+        let (settle_sender, settle_receiver) = mpsc::channel();
         let settle_group_count = settle_message_ids.len() as u32;
+        let backlog = Arc::new(PublishBacklog::new(settle_group_count as usize));
 
-        thread::spawn(move || {
-
-            let producer_rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)// one thread
-                .enable_all()
-                .build()
-                .unwrap();
-
-            producer_rt.block_on(async {
-
-                let producer: &FutureProducer = &ClientConfig::new()
-                    .set("bootstrap.servers", brokers)
-                    .set("message.timeout.ms", "5000")
-                    .create()
-                    .expect("Producer creation error");
-
-                let mut quote_deals_id = quote_deals_id;
-                let mut settle_message_ids:Vec<u64> = settle_message_ids.clone();
-
-                loop {
-                    let task:Box<OutputPublishTask> = receiver.recv().unwrap();
-                    let x = task.as_ref();
-                    match x {
-                        OutputPublishTask::QuotePublishTask(tsk) => {
-                            if tsk.deals_id > quote_deals_id {
-                                // check continuous
-
-                                let topic = &tsk.topic;
-                                let data = &tsk.data;
-
-                                let x = data.to_string();
-                                let y = x.as_bytes();
-                                let record = FutureRecord::to(&topic).payload(y);
-                                let delivery_status = producer.send::<Vec<u8>, _, _>(
-                                    record,
-                                    Duration::from_secs(5000)
-                                );
-                                match delivery_status.await {
-                                    Ok(_) => {},
-                                    Err(_) => {panic!("publish settle failed");},
-                                }
-
-                                quote_deals_id = tsk.deals_id;
-
-                                let task = PublishProgressTask{
-                                    quote_deals_id: quote_deals_id,
-                                    settle_message_ids: settle_message_ids.clone(),
-                                };
-                                main_routine_sender.send(Task::ProgressUpdateTask(task)).expect("send progress update task failed");
-                            }
-                        },
-                        OutputPublishTask::SettlePublishTask(tsk) => {
-
-                            let group_id = tsk.group_id as usize;
-
-                            if tsk.message_id > settle_message_ids[group_id] {
-                                let topic = &tsk.topic;
-                                let data = &tsk.data;
-
-                                let x = data.to_string();
-                                let y = x.as_bytes();
-                                let record = FutureRecord::to(&topic).payload(y);
-                                let delivery_status = producer.send::<Vec<u8>, _, _>(
-                                    record,
-                                    Duration::from_secs(5000)
-                                );
-                                match delivery_status.await {
-                                    Ok(_) => {},
-                                    Err(_) => {panic!("publish quote failed");},
-                                }
-
-                                settle_message_ids[group_id] = tsk.message_id;
-
-                                let task = PublishProgressTask{
-                                    quote_deals_id: quote_deals_id,
-                                    settle_message_ids: settle_message_ids.clone(),
-                                };
-                                main_routine_sender.send(Task::ProgressUpdateTask(task)).expect("send progress update task failed");
-                            }
-                        }
-                    }
-                }
-            })
-        });
+        spawn_quote_publish_thread(
+            brokers.clone(),
+            main_routine_sender.clone(),
+            quote_deals_id,
+            batch_size,
+            linger_ms,
+            quote_receiver,
+            backlog.clone(),
+        );
+        spawn_settle_publish_thread(
+            brokers,
+            main_routine_sender,
+            settle_message_ids,
+            batch_size,
+            linger_ms,
+            settle_receiver,
+            backlog.clone(),
+        );
 
         Publish {
-            sender: sender,
+            quote_sender,
+            settle_sender,
+            backlog,
             settle_group_count: settle_group_count,
         }
+    }
+
+    pub fn backlog(&self) -> Arc<PublishBacklog> {
+        self.backlog.clone()
     }
 
     pub fn publish_put_order(&self, m: &Market, extern_id: u64, order: &Rc<Order>) {
@@ -148,11 +338,13 @@ impl Publish {
             data: object,
         };
 
-        let res = self.sender.send(Box::new(OutputPublishTask::SettlePublishTask(message)));
+        self.backlog.inc_settle(group_id as usize);
+        let res = self.settle_sender.send(message);
         match res {
             Ok(_) => {
             },
             Err(e) => {
+                self.backlog.dec_settle(group_id as usize);
                 panic!("publish_put_order failed.{}", e);
             }
         }
@@ -179,11 +371,13 @@ impl Publish {
             data: object,
         };
 
-        let res = self.sender.send(Box::new(OutputPublishTask::SettlePublishTask(message)));
+        self.backlog.inc_settle(group_id as usize);
+        let res = self.settle_sender.send(message);
         match res {
             Ok(_) => {
             },
             Err(e) => {
+                self.backlog.dec_settle(group_id as usize);
                 panic!("publish_cancel_order failed.{}", e);
             }
         }
@@ -227,11 +421,13 @@ impl Publish {
             data: object,
         };
 
-        let res = self.sender.send(Box::new(OutputPublishTask::SettlePublishTask(message)));
+        self.backlog.inc_settle(group_id as usize);
+        let res = self.settle_sender.send(message);
         match res {
             Ok(_) => {
             },
             Err(e) => {
+                self.backlog.dec_settle(group_id as usize);
                 panic!("publish_deal failed.{}", e);
             }
         }
@@ -261,11 +457,13 @@ impl Publish {
             data: object,
         };
 
-        let res = self.sender.send(Box::new(OutputPublishTask::SettlePublishTask(message)));
+        self.backlog.inc_settle(group_id as usize);
+        let res = self.settle_sender.send(message);
         match res {
             Ok(_) => {
             },
             Err(e) => {
+                self.backlog.dec_settle(group_id as usize);
                 panic!("publish_error failed.{}", e);
             }
         }
@@ -297,11 +495,13 @@ impl Publish {
             data: object,
         };
 
-        let res = self.sender.send(Box::new(OutputPublishTask::QuotePublishTask(message)));
+        self.backlog.inc_quote();
+        let res = self.quote_sender.send(message);
         match res {
             Ok(_) => {
             },
             Err(e) => {
+                self.backlog.dec_quote();
                 panic!("publish_quote_deal failed.{}", e);
             }
         }

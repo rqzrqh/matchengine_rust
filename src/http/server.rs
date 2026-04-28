@@ -1,3 +1,4 @@
+use crate::publish::PublishBacklog;
 use crate::task::{self, HttpOp, HttpRequestTask, HttpResponse};
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
@@ -5,13 +6,16 @@ use axum::http::{header, Method, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
+use json::JsonValue;
 use serde::Deserialize;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 pub struct EngineHttpState {
     pub main_routine_sender: mpsc::Sender<task::Task>,
+    pub market_name: String,
+    pub publish_backlog: Arc<PublishBacklog>,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +64,7 @@ pub async fn serve_engine_http(addr: std::net::SocketAddr, state: EngineHttpStat
     let app = Router::new()
         .route("/markets/:market/summary", get(get_market_summary))
         .route("/markets/:market/status", get(get_market_status))
+        .route("/markets/:market/publish-pending", get(get_publish_pending))
         .route(
             "/markets/:market/orders/:order_id",
             get(get_order_detail_http),
@@ -95,6 +100,39 @@ async fn get_market_status(
 ) -> Response {
     let res = forward_http_request(st, HttpOp::MarketStatus { market }).await;
     http_response_to_axum(res)
+}
+
+async fn get_publish_pending(
+    State(st): State<EngineHttpState>,
+    Path(MarketPath { market }): Path<MarketPath>,
+) -> Response {
+    if st.market_name != market {
+        return http_response_to_axum(HttpResponse {
+            status: 404,
+            body: "{\"error\":\"unknown market\"}".to_string(),
+        });
+    }
+
+    let snapshot = st.publish_backlog.snapshot();
+    let mut body = JsonValue::new_object();
+    body["market"] = market.into();
+    body["quote_pending"] = snapshot.quote_pending.into();
+    body["settle_pending"] = snapshot.settle_pending.into();
+    body["total_pending"] = snapshot.total_pending.into();
+
+    let mut settle_group_pending = JsonValue::new_array();
+    for (idx, pending) in snapshot.settle_group_pending.into_iter().enumerate() {
+        let mut item = JsonValue::new_object();
+        item["group_id"] = (idx as u32).into();
+        item["pending"] = pending.into();
+        settle_group_pending[idx] = item;
+    }
+    body["settle_group_pending"] = settle_group_pending;
+
+    http_response_to_axum(HttpResponse {
+        status: 200,
+        body: body.dump(),
+    })
 }
 
 async fn get_order_detail_http(

@@ -35,11 +35,18 @@ mod task;
 // - Timer thread: periodic `DumpTask` to fork snapshot writers.
 // - Snapshot cleanup thread: periodic `prune_snapshots` against MySQL.
 
-async fn start_httpserver(main_routine_sender: mpsc::Sender<task::Task>, addr: SocketAddr) {
+async fn start_httpserver(
+    main_routine_sender: mpsc::Sender<task::Task>,
+    market_name: String,
+    publish_backlog: std::sync::Arc<publish::PublishBacklog>,
+    addr: SocketAddr,
+) {
     http::serve_engine_http(
         addr,
         http::EngineHttpState {
             main_routine_sender,
+            market_name,
+            publish_backlog,
         },
     )
     .await;
@@ -72,6 +79,7 @@ fn main() {
     let db_addr = cfg.db.addr.clone();
     let db_user = cfg.db.user.clone();
     let db_passwd = cfg.db.passwd.clone();
+    let output_publish_cfg = cfg.output_publish.clone();
 
     const ENGINE_HTTP_IP: &str = "127.0.0.1";
     const ENGINE_HTTP_PORT: u16 = 8080;
@@ -118,10 +126,26 @@ fn main() {
 
     let (main_routine_sender, main_routine_receiver) = mpsc::channel();
 
+    let publisher = publish::Publish::new(
+        brokers.clone(),
+        main_routine_sender.clone(),
+        mk.quote_deals_id,
+        mk.settle_message_ids.to_vec(),
+        output_publish_cfg.batch_size,
+        output_publish_cfg.linger_ms,
+    );
+
     let main_routine_sender_http_clone = main_routine_sender.clone();
+    let market_name_http = market_name.clone();
+    let publish_backlog_http = publisher.backlog();
     let http_thread = thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        rt.block_on(start_httpserver(main_routine_sender_http_clone, http_addr));
+        rt.block_on(start_httpserver(
+            main_routine_sender_http_clone,
+            market_name_http,
+            publish_backlog_http,
+            http_addr,
+        ));
     });
 
     let main_routine_sender_mq_clone = main_routine_sender.clone();
@@ -192,8 +216,6 @@ fn main() {
         }
     });
 
-    let publisher = publish::Publish::new(brokers, main_routine_sender.clone(), mk.quote_deals_id, mk.settle_message_ids.to_vec());
-
     loop {
         let task = main_routine_receiver.recv().unwrap();
 
@@ -208,8 +230,11 @@ fn main() {
             task::Task::DumpTask(b) => {
                 dump::handle_dump(&mut mk, b.tm, url.as_str());
             },
-            task::Task::ProgressUpdateTask(t) => {
-                mainprocess::update_output_progress(&mut mk, t.quote_deals_id, t.settle_message_ids);
+            task::Task::QuoteProgressUpdateTask(t) => {
+                mainprocess::update_quote_progress(&mut mk, t.quote_deals_id);
+            }
+            task::Task::SettleProgressUpdateTask(t) => {
+                mainprocess::update_settle_progress(&mut mk, t.group_id, t.message_id);
             }
             task::Task::Terminate => {
                 warn!("terminate and exit");

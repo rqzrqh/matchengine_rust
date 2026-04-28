@@ -31,3 +31,10 @@ snap_cleanup:
   max_snapshots: 10
   # How often the cleanup job runs, in seconds.
   cleanup_interval_secs: 60
+
+# --- Downstream Kafka publish batching ---
+output_publish:
+  # Max publish tasks to enqueue to Kafka in one batch.
+  batch_size: 256
+  # Let the Kafka producer wait briefly so adjacent messages can coalesce into one batch.
+  linger_ms: 5

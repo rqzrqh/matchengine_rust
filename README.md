@@ -27,6 +27,7 @@ Edit repo root **`config.yaml`** so that:
 - **`market.name`** is the MySQL database name and the Kafka topic suffix (e.g. `eth_btc` → DB `eth_btc`, topics `offer.eth_btc`, `quote_deals.eth_btc`).
 - **`brokers`** matches your Kafka bootstrap servers.
 - **`db.addr` / `db.user` / `db.passwd`** match MySQL.
+- Optional: tune **`output_publish.batch_size`** and **`output_publish.linger_ms`** to control downstream Kafka batching for **`settle.*`** and **`quote_deals.<market>`**.
 
 The engine reads this file (default path `./config.yaml` relative to the process working directory, or pass another path as the first CLI argument). **web-test** also resolves `config.yaml` from the repo root or from `web-test/../`.
 
@@ -84,6 +85,7 @@ REST surface on the engine (the UI calls these from the browser; web-test also i
 
 - `GET /markets/:market/summary`
 - `GET /markets/:market/status`
+- `GET /markets/:market/publish-pending`
 - `GET /markets/:market/orders/:order_id`
 - `GET /markets/:market/order-book?side=&offset=&limit=`
 - `GET /markets/:market/users/:user_id/orders?offset=&limit=`

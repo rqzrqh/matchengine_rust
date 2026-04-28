@@ -50,6 +50,33 @@ impl Default for SnapDumpCfg {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutputPublishCfg {
+    /// Max publish tasks to enqueue to Kafka in one batch.
+    #[serde(default = "default_output_publish_batch_size")]
+    pub batch_size: usize,
+    /// How long the producer may wait for more messages before flushing a batch.
+    #[serde(default = "default_output_publish_linger_ms")]
+    pub linger_ms: u64,
+}
+
+fn default_output_publish_batch_size() -> usize {
+    256
+}
+
+fn default_output_publish_linger_ms() -> u64 {
+    5
+}
+
+impl Default for OutputPublishCfg {
+    fn default() -> Self {
+        Self {
+            batch_size: default_output_publish_batch_size(),
+            linger_ms: default_output_publish_linger_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub market: MarketCfg,
@@ -59,6 +86,8 @@ pub struct Config {
     pub snap_cleanup: SnapCleanupCfg,
     #[serde(default)]
     pub snap_dump: SnapDumpCfg,
+    #[serde(default)]
+    pub output_publish: OutputPublishCfg,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +124,9 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
     }
     if cfg.db.addr.trim().is_empty() || cfg.db.user.trim().is_empty() {
         return Err("db.addr and db.user must be non-empty".into());
+    }
+    if cfg.output_publish.batch_size == 0 {
+        return Err("output_publish.batch_size must be > 0".into());
     }
 
     let m = &cfg.market;

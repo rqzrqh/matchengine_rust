@@ -244,12 +244,13 @@ fn on_order_cancel(publisher: &Publish, m: &mut Market, extern_id: u64, params: 
     }
 }
 
-pub fn update_output_progress(m: &mut Market, quote_deals_id: u64, settle_message_ids: Vec<u64>) {
+pub fn update_quote_progress(m: &mut Market, quote_deals_id: u64) {
     m.quote_deals_id = quote_deals_id;
-    for i in 0..settle_message_ids.len() {
-        m.settle_message_ids[i] = settle_message_ids[i]
-    }
 
     println!("quote_deals_id={}", quote_deals_id);
+}
+
+pub fn update_settle_progress(m: &mut Market, group_id: usize, message_id: u64) {
+    m.settle_message_ids[group_id] = message_id;
     println!("settle_message_ids={:?}", m.settle_message_ids);
 }
