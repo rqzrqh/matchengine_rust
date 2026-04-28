@@ -83,6 +83,10 @@ pub fn load_config(path: &str) -> Result<Config, String> {
 }
 
 /// Fail fast before the matcher runs: precision fields must fit `rust_decimal` and relate consistently.
+///
+/// This engine keeps the precision model intentionally simple: price-related rescaling
+/// derives from `money_prec - stock_prec`, so startup rejects markets where
+/// `stock_prec > money_prec` instead of supporting more complex mixed-precision rules.
 pub fn validate_config(cfg: &Config) -> Result<(), String> {
     const MAX_SCALE: u32 = Decimal::MAX_SCALE;
 
@@ -116,11 +120,11 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
         ));
     }
     if m.stock_prec > m.money_prec {
-        log::warn!(
-            "market.stock_prec ({}) > money_prec ({}): price rescale uses money_prec.saturating_sub(stock_prec) (=0); ensure this matches your market rules",
+        return Err(format!(
+            "market.stock_prec ({}) must be <= market.money_prec ({}) to keep price rescaling simple in this engine",
             m.stock_prec,
             m.money_prec
-        );
+        ));
     }
 
     let mut min_amount = Decimal::from_str(&m.min_amount)

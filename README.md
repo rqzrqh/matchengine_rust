@@ -130,6 +130,3 @@ There is no bundled load-test binary in this repo. For integration testing, run 
 ### TODO
 
 1. Use ordered batch sends for higher data-push throughput.
-
-2. Consider a richer decimal library for rescaling: `rust_decimal`’s rescale helper only adjusts the fractional part, not the integer part.
-

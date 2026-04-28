@@ -14,6 +14,7 @@ extern crate process_lock;
 use process_lock::*;
 
 mod config;
+mod decimal_util;
 mod error;
 mod engine;
 mod market;

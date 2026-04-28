@@ -121,6 +121,11 @@ pub struct Market {
 }
 
 impl Market {
+    /// Price precision is intentionally derived from `money_prec - stock_prec`
+    /// to keep this engine's precision model simple.
+    pub fn price_prec(&self) -> u32 {
+        self.money_prec - self.stock_prec
+    }
 
     pub fn new(name:&String, stock_prec: u32, money_prec: u32, fee_rate: u32, min_amount: &Decimal) -> Market {
         Market {
