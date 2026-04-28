@@ -8,7 +8,6 @@ use uuid::{uuid, Uuid};
 use rust_decimal::prelude::*;
 use mysql::*;
 use chrono::prelude::*;
-extern crate pretty_env_logger;
 #[macro_use] extern crate log;
 extern crate process_lock;
 use process_lock::*;
@@ -52,20 +51,28 @@ async fn start_httpserver(
     .await;
 }
 
+fn init_logging() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    )
+    .format_timestamp_millis()
+    .init();
+}
+
 fn main() {
 
-    pretty_env_logger::init();
+    init_logging();
 
     let args: Vec<String> = env::args().collect();
     let cfg_path = args.get(1).map(|s| s.as_str()).unwrap_or("config.yaml");
 
     let cfg = config::load_config(cfg_path).unwrap_or_else(|e| {
-        eprintln!("config load failed: {}", e);
+        error!("config load failed: {}", e);
         process::exit(1);
     });
 
     if let Err(e) = config::validate_config(&cfg) {
-        eprintln!("config invalid: {}", e);
+        error!("config invalid: {}", e);
         process::exit(1);
     }
 
@@ -87,7 +94,7 @@ fn main() {
         .parse()
         .expect("engine http bind addr");
 
-    println!(
+    info!(
         "Matching engine REST base: http://{}:{}/markets/<market>/…",
         ENGINE_HTTP_IP, ENGINE_HTTP_PORT
     );
@@ -181,7 +188,7 @@ fn main() {
 
             match consumer.recv().await {
                 Ok(message) => {
-                    println!(
+                    debug!(
                         "Received message at topic: {} partition: {} offset: {} payload: {:?}",
                         message.topic(),
                         message.partition(),
@@ -197,7 +204,7 @@ fn main() {
 
                 }
                 Err(e) => {
-                    eprintln!("consume failed {}", e);
+                    error!("consume failed {}", e);
                 }
             }
         }

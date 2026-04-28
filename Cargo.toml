@@ -20,7 +20,7 @@ skiplist = "0.6.0"
 rust_decimal = {version = "1.14.3", features = ["maths"]}
 nix= { version = "0.30.1", features = ["process"] }
 log = "0.4"
-pretty_env_logger = "0.4"
+env_logger = "0.11"
 process_lock = "0.1.0"
 rdkafka = "0.38.0"
 uuid = { version = "*", features = ["v4"] }

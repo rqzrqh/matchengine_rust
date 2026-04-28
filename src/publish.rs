@@ -346,7 +346,7 @@ impl Publish {
 
         let group_id = order.user_id%self.settle_group_count;
 
-        info!("settle partition={} {}", group_id, object);
+        debug!("settle partition={} {}", group_id, object);
 
         let message = SettlePublishTaskInfo {
             group_id:group_id,
@@ -377,7 +377,7 @@ impl Publish {
 
         let group_id = order.user_id%self.settle_group_count;
 
-        info!("settle partition={} {}", group_id, object);
+        debug!("settle partition={} {}", group_id, object);
 
         let message = SettlePublishTaskInfo {
             group_id:group_id,
@@ -425,7 +425,7 @@ impl Publish {
 
         let group_id = user_id%self.settle_group_count;
 
-        info!("settle partition={} {}", group_id, object);
+        debug!("settle partition={} {}", group_id, object);
 
         let message = SettlePublishTaskInfo {
             group_id:group_id,
@@ -459,7 +459,7 @@ impl Publish {
 
         let group_id = user_id%self.settle_group_count;
 
-        info!("settle partition={} {}", group_id, object);
+        debug!("settle partition={} {}", group_id, object);
 
         let message = SettlePublishTaskInfo {
             group_id:group_id,
@@ -497,7 +497,7 @@ impl Publish {
 
         let topic = format!("quote_deals.{}", m.name);
 
-        info!("{} {}", topic, object);
+        debug!("{} {}", topic, object);
 
         let message = QuotePublishTaskInfo {
             deals_id: m.deals_id,

@@ -7,7 +7,7 @@ use crate::error::*;
 
 pub fn handle_mq_message(publisher: &Publish, m: &mut Market, offset: i64, data: &String) {
     let parsed = json::parse(data).unwrap();
-    info!("{}", parsed);
+    debug!("{}", parsed);
 
     if !parsed.is_object() {
         error!("mq msg not object {}", parsed);
@@ -40,7 +40,7 @@ pub fn handle_mq_message(publisher: &Publish, m: &mut Market, offset: i64, data:
         return;
     };
     if msg_seq != expected_seq {
-        error!(
+        warn!(
             "input_sequence_id mismatch: message {} expected next {}",
             msg_seq, expected_seq
         );
@@ -247,10 +247,10 @@ fn on_order_cancel(publisher: &Publish, m: &mut Market, extern_id: u64, params: 
 pub fn update_quote_progress(m: &mut Market, quote_deals_id: u64) {
     m.quote_deals_id = quote_deals_id;
 
-    println!("quote_deals_id={}", quote_deals_id);
+    debug!("quote_deals_id={}", quote_deals_id);
 }
 
 pub fn update_settle_progress(m: &mut Market, group_id: usize, message_id: u64) {
     m.settle_message_ids[group_id] = message_id;
-    println!("settle_message_ids={:?}", m.settle_message_ids);
+    debug!("settle_message_ids={:?}", m.settle_message_ids);
 }
