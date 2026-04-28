@@ -30,11 +30,14 @@ function buildHttpErrorMessage(r: Response, data: unknown): string {
 /** Same default as web-test; `loadConfig` overwrites with `engine_url` from `GET /api/config`. */
 const DEFAULT_ENGINE_HTTP = "http://127.0.0.1:8080";
 
-/** Interval for all polled HTTP requests on this page (engine status, order book). */
-const HTTP_POLL_MS = 500;
+/** Minimum/initial interval used when HTTP auto refresh is enabled. */
+const MIN_HTTP_REFRESH_MS = 500;
+const DEFAULT_HTTP_REFRESH_MS = 1000;
 
 let marketName = __MATCENGINE_CONFIG__.market.name;
 let engineHttpBase = DEFAULT_ENGINE_HTTP;
+let previousEngineStatus: EngineStatusNumericSnapshot | null = null;
+let lastHttpRefreshText = "Waiting for first refresh";
 
 async function loadConfig(): Promise<void> {
   try {
@@ -66,6 +69,25 @@ async function engineApi<T>(path: string): Promise<T> {
   }
   return data as T;
 }
+
+type EngineStatusPayload = {
+  oper_id?: number | string | null;
+  order_id?: number | string | null;
+  deals_id?: number | string | null;
+  message_id?: number | string | null;
+  input_offset?: number | string | null;
+  input_sequence_id?: number | string | null;
+  error?: string | null;
+};
+
+type EngineStatusNumericSnapshot = {
+  oper_id: bigint | null;
+  order_id: bigint | null;
+  deals_id: bigint | null;
+  message_id: bigint | null;
+  input_offset: bigint | null;
+  input_sequence_id: bigint | null;
+};
 
 async function api<T>(path: string, opts: RequestInit = {}): Promise<T> {
   const hasJsonBody = opts.body !== undefined && typeof opts.body === "string";
@@ -235,14 +257,79 @@ function $(id: string): HTMLElement {
 }
 
 async function refreshEngineStatus(): Promise<void> {
-  const el = $("out-status");
+  const operEl = document.getElementById("st-oper-id");
+  const orderEl = document.getElementById("st-order-id");
+  const dealsEl = document.getElementById("st-deals-id");
+  const messageEl = document.getElementById("st-message-id");
+  const offsetEl = document.getElementById("st-input-offset");
+  const seqEl = document.getElementById("st-input-seq-id");
+  const operDeltaEl = document.getElementById("st-oper-id-delta");
+  const orderDeltaEl = document.getElementById("st-order-id-delta");
+  const dealsDeltaEl = document.getElementById("st-deals-id-delta");
+  const messageDeltaEl = document.getElementById("st-message-id-delta");
+  const offsetDeltaEl = document.getElementById("st-input-offset-delta");
+  const seqDeltaEl = document.getElementById("st-input-seq-id-delta");
+  const errEl = document.getElementById("st-engine-err");
+  if (
+    !operEl ||
+    !orderEl ||
+    !dealsEl ||
+    !messageEl ||
+    !offsetEl ||
+    !seqEl ||
+    !operDeltaEl ||
+    !orderDeltaEl ||
+    !dealsDeltaEl ||
+    !messageDeltaEl ||
+    !offsetDeltaEl ||
+    !seqDeltaEl
+  ) {
+    return;
+  }
   try {
-    const market_status = await engineApi<unknown>(
+    const marketStatus = await engineApi<EngineStatusPayload>(
       `/markets/${encodeURIComponent(marketName)}/status`,
     );
-    show(el, market_status);
+    const currentSnapshot: EngineStatusNumericSnapshot = {
+      oper_id: parseBigIntOrNull(marketStatus.oper_id),
+      order_id: parseBigIntOrNull(marketStatus.order_id),
+      deals_id: parseBigIntOrNull(marketStatus.deals_id),
+      message_id: parseBigIntOrNull(marketStatus.message_id),
+      input_offset: parseBigIntOrNull(marketStatus.input_offset),
+      input_sequence_id: parseBigIntOrNull(marketStatus.input_sequence_id),
+    };
+    setText(operEl, marketStatus.oper_id);
+    setText(orderEl, marketStatus.order_id);
+    setText(dealsEl, marketStatus.deals_id);
+    setText(messageEl, marketStatus.message_id);
+    setText(offsetEl, marketStatus.input_offset);
+    setText(seqEl, marketStatus.input_sequence_id);
+    setStatusDelta(operDeltaEl, currentSnapshot.oper_id, previousEngineStatus?.oper_id ?? null);
+    setStatusDelta(orderDeltaEl, currentSnapshot.order_id, previousEngineStatus?.order_id ?? null);
+    setStatusDelta(dealsDeltaEl, currentSnapshot.deals_id, previousEngineStatus?.deals_id ?? null);
+    setStatusDelta(messageDeltaEl, currentSnapshot.message_id, previousEngineStatus?.message_id ?? null);
+    setStatusDelta(offsetDeltaEl, currentSnapshot.input_offset, previousEngineStatus?.input_offset ?? null);
+    setStatusDelta(
+      seqDeltaEl,
+      currentSnapshot.input_sequence_id,
+      previousEngineStatus?.input_sequence_id ?? null,
+    );
+    previousEngineStatus = currentSnapshot;
+    setErrLine(errEl, null);
   } catch (e) {
-    show(el, { error: e instanceof Error ? e.message : String(e) });
+    setText(operEl, "—");
+    setText(orderEl, "—");
+    setText(dealsEl, "—");
+    setText(messageEl, "—");
+    setText(offsetEl, "—");
+    setText(seqEl, "—");
+    setStatusDelta(operDeltaEl, null, null);
+    setStatusDelta(orderDeltaEl, null, null);
+    setStatusDelta(dealsDeltaEl, null, null);
+    setStatusDelta(messageDeltaEl, null, null);
+    setStatusDelta(offsetDeltaEl, null, null);
+    setStatusDelta(seqDeltaEl, null, null);
+    setErrLine(errEl, e instanceof Error ? e.message : String(e));
   }
 }
 
@@ -252,6 +339,47 @@ type InputProgressPayload = {
   input_offset?: string | null;
   lag?: string | null;
   error?: string | null;
+};
+
+type PublishPendingPayload = {
+  quote_pending?: number | string | null;
+  settle_pending?: number | string | null;
+  total_pending?: number | string | null;
+  settle_group_pending?:
+    | Array<{ group_id?: number | string | null; pending?: number | string | null }>
+    | null;
+  error?: string | null;
+};
+
+type UserOrdersPayload = {
+  orders?: Array<Record<string, unknown>>;
+};
+
+type AutoActionKind = "limit" | "market" | "cancel";
+type ManualTabKind = "limit" | "market" | "cancel";
+
+type AutoOrderConfig = {
+  userStart: number;
+  userEnd: number;
+  intervalMs: number;
+  priceMin: string;
+  priceMax: string;
+  amountMin: string;
+  amountMax: string;
+  actions: AutoActionKind[];
+};
+
+const autoOrderState = {
+  running: false,
+  timerId: 0 as number | undefined,
+  nextUserId: 1,
+};
+let activeManualTab: ManualTabKind = "limit";
+const httpRefreshState = {
+  enabled: false,
+  timerId: 0 as number | undefined,
+  inFlight: false,
+  queued: false,
 };
 
 function fmtCell(v: unknown): string {
@@ -294,6 +422,247 @@ function setErrLine(el: HTMLElement | null, message: string | null | undefined):
   }
   el.textContent = t;
   el.hidden = false;
+}
+
+function parseBigIntOrNull(v: unknown): bigint | null {
+  const s = fmtCell(v);
+  if (s === "—") return null;
+  try {
+    return BigInt(s);
+  } catch {
+    return null;
+  }
+}
+
+function setStatusDelta(el: HTMLElement | null, current: bigint | null, previous: bigint | null): void {
+  if (!el) return;
+  if (current === null || previous === null) {
+    el.textContent = "—";
+    return;
+  }
+  const delta = current - previous;
+  el.textContent = delta >= 0n ? `+${delta}` : `${delta}`;
+}
+
+function setAutoOrderStatus(message: string): void {
+  void message;
+}
+
+function updateManualSubmitButton(): void {
+  const btn = document.getElementById("btn-manual-submit") as HTMLButtonElement | null;
+  if (!btn) return;
+  btn.textContent =
+    activeManualTab === "limit"
+      ? "Submit limit order"
+      : activeManualTab === "market"
+        ? "Submit market order"
+        : "Cancel order";
+}
+
+function updateAutoOrderButton(): void {
+  const btn = document.getElementById("btn-auto-order") as HTMLButtonElement | null;
+  if (!btn) return;
+  btn.textContent = autoOrderState.running ? "Stop" : "Start";
+  setRunningStateButton(btn, autoOrderState.running);
+}
+
+function countDecimals(raw: string): number {
+  const trimmed = raw.trim();
+  const dot = trimmed.indexOf(".");
+  return dot >= 0 ? trimmed.length - dot - 1 : 0;
+}
+
+function randomDecimalString(minRaw: string, maxRaw: string): string {
+  const minNum = Number(minRaw);
+  const maxNum = Number(maxRaw);
+  if (!Number.isFinite(minNum) || !Number.isFinite(maxNum)) {
+    throw new Error("invalid numeric range");
+  }
+  const lo = Math.min(minNum, maxNum);
+  const hi = Math.max(minNum, maxNum);
+  const scale = Math.max(countDecimals(minRaw), countDecimals(maxRaw));
+  const factor = 10 ** scale;
+  const loScaled = Math.round(lo * factor);
+  const hiScaled = Math.round(hi * factor);
+  const pickScaled =
+    loScaled + Math.floor(Math.random() * Math.max(1, hiScaled - loScaled + 1));
+  return (pickScaled / factor).toFixed(scale).replace(/\.?0+$/, "");
+}
+
+function readAutoOrderConfig(): AutoOrderConfig {
+  const userStart = Number((document.getElementById("auto-user-start") as HTMLInputElement).value);
+  const userEnd = Number((document.getElementById("auto-user-end") as HTMLInputElement).value);
+  const intervalMs = Number((document.getElementById("auto-interval-ms") as HTMLInputElement).value);
+  const priceMin = (document.getElementById("auto-price-min") as HTMLInputElement).value.trim();
+  const priceMax = (document.getElementById("auto-price-max") as HTMLInputElement).value.trim();
+  const amountMin = (document.getElementById("auto-amount-min") as HTMLInputElement).value.trim();
+  const amountMax = (document.getElementById("auto-amount-max") as HTMLInputElement).value.trim();
+
+  const actions: AutoActionKind[] = [];
+  if ((document.getElementById("auto-enable-limit") as HTMLInputElement).checked) actions.push("limit");
+  if ((document.getElementById("auto-enable-market") as HTMLInputElement).checked) actions.push("market");
+  if ((document.getElementById("auto-enable-cancel") as HTMLInputElement).checked) actions.push("cancel");
+
+  if (!Number.isInteger(userStart) || !Number.isInteger(userEnd) || userStart <= 0 || userEnd <= 0) {
+    throw new Error("user_id range must be positive integers");
+  }
+  if (userEnd < userStart) {
+    throw new Error("user_id end must be >= start");
+  }
+  if (!Number.isFinite(intervalMs) || intervalMs < 10) {
+    throw new Error("interval ms must be >= 10");
+  }
+  if (actions.length === 0) {
+    throw new Error("enable at least one auto action");
+  }
+  void randomDecimalString(priceMin, priceMax);
+  void randomDecimalString(amountMin, amountMax);
+
+  return { userStart, userEnd, intervalMs, priceMin, priceMax, amountMin, amountMax, actions };
+}
+
+function nextAutoUserId(cfg: AutoOrderConfig): number {
+  if (autoOrderState.nextUserId < cfg.userStart || autoOrderState.nextUserId > cfg.userEnd) {
+    autoOrderState.nextUserId = cfg.userStart;
+  }
+  const userId = autoOrderState.nextUserId;
+  autoOrderState.nextUserId =
+    userId >= cfg.userEnd ? cfg.userStart : userId + 1;
+  return userId;
+}
+
+function pickRandomAction(actions: AutoActionKind[]): AutoActionKind {
+  return actions[Math.floor(Math.random() * actions.length)]!;
+}
+
+async function submitLimitOrder(userId: number, side: number, price: string, amount: string): Promise<void> {
+  await api<unknown>("/api/orders/limit", {
+    method: "POST",
+    body: JSON.stringify({
+      user_id: userId,
+      side,
+      price,
+      amount,
+    }),
+  });
+}
+
+async function submitMarketOrder(userId: number, side: number, amount: string): Promise<void> {
+  await api<unknown>("/api/orders/market", {
+    method: "POST",
+    body: JSON.stringify({
+      user_id: userId,
+      side,
+      amount,
+    }),
+  });
+}
+
+async function submitCancelOrder(userId: number, orderId: number): Promise<void> {
+  await api<unknown>("/api/orders/cancel", {
+    method: "POST",
+    body: JSON.stringify({
+      user_id: userId,
+      order_id: orderId,
+    }),
+  });
+}
+
+async function fetchUserPendingOrders(userId: number): Promise<number[]> {
+  const market = encodeURIComponent(marketName);
+  const payload = await engineApi<UserOrdersPayload>(
+    `/markets/${market}/users/${encodeURIComponent(String(userId))}/orders?offset=0&limit=50`,
+  );
+  const orders = Array.isArray(payload.orders) ? payload.orders : [];
+  return orders
+    .map((order) => Number(order.id))
+    .filter((id) => Number.isFinite(id) && id > 0);
+}
+
+async function performAutoOrderStep(): Promise<void> {
+  const cfg = readAutoOrderConfig();
+  const userId = nextAutoUserId(cfg);
+  let action = pickRandomAction(cfg.actions);
+
+  if (action === "cancel") {
+    const orderIds = await fetchUserPendingOrders(userId);
+    if (orderIds.length > 0) {
+      const orderId = orderIds[Math.floor(Math.random() * orderIds.length)]!;
+      setAutoOrderStatus(`Running: cancel user=${userId} order=${orderId}`);
+      await submitCancelOrder(userId, orderId);
+      return;
+    }
+
+    const fallback = cfg.actions.filter((item) => item !== "cancel");
+    if (fallback.length === 0) {
+      setAutoOrderStatus(`Running: no pending orders to cancel for user=${userId}`);
+      return;
+    }
+    action = pickRandomAction(fallback);
+  }
+
+  const side = Math.random() < 0.5 ? 1 : 2;
+  const amount = randomDecimalString(cfg.amountMin, cfg.amountMax);
+
+  if (action === "limit") {
+    const price = randomDecimalString(cfg.priceMin, cfg.priceMax);
+    setAutoOrderStatus(`Running: limit user=${userId} side=${side} price=${price} amount=${amount}`);
+    await submitLimitOrder(userId, side, price, amount);
+    return;
+  }
+
+  setAutoOrderStatus(`Running: market user=${userId} side=${side} amount=${amount}`);
+  await submitMarketOrder(userId, side, amount);
+}
+
+function clearAutoOrderTimer(): void {
+  if (autoOrderState.timerId !== undefined) {
+    window.clearTimeout(autoOrderState.timerId);
+    autoOrderState.timerId = undefined;
+  }
+}
+
+function scheduleAutoOrderNextTick(delayMs: number): void {
+  clearAutoOrderTimer();
+  autoOrderState.timerId = window.setTimeout(() => {
+    void runAutoOrderLoop();
+  }, delayMs);
+}
+
+async function runAutoOrderLoop(): Promise<void> {
+  if (!autoOrderState.running) return;
+  let cfg: AutoOrderConfig;
+  try {
+    cfg = readAutoOrderConfig();
+  } catch (e) {
+    stopAutoOrder(e instanceof Error ? e.message : String(e));
+    return;
+  }
+
+  try {
+    await performAutoOrderStep();
+  } catch (e) {
+    setAutoOrderStatus(`Auto order error: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  if (!autoOrderState.running) return;
+  scheduleAutoOrderNextTick(cfg.intervalMs);
+}
+
+function startAutoOrder(): void {
+  const cfg = readAutoOrderConfig();
+  autoOrderState.running = true;
+  autoOrderState.nextUserId = cfg.userStart;
+  updateAutoOrderButton();
+  setAutoOrderStatus("Starting...");
+  scheduleAutoOrderNextTick(0);
+}
+
+function stopAutoOrder(status = "Stopped"): void {
+  autoOrderState.running = false;
+  clearAutoOrderTimer();
+  updateAutoOrderButton();
+  setAutoOrderStatus(status);
 }
 
 function hasErrorMessage(j: InputProgressPayload): j is { error: string } {
@@ -357,6 +726,85 @@ async function refreshInputProgress(): Promise<void> {
   }
 }
 
+async function refreshPublishPending(): Promise<void> {
+  const quoteEl = document.getElementById("ob-publish-quote");
+  const settleEl = document.getElementById("ob-publish-settle");
+  const totalEl = document.getElementById("ob-publish-total");
+  const groupsEl = document.getElementById("ob-publish-groups");
+  const errEl = document.getElementById("ob-publish-err");
+  if (!quoteEl || !settleEl || !totalEl || !groupsEl) return;
+
+  const m = encodeURIComponent(marketName);
+  try {
+    const j = await api<PublishPendingPayload>(`/api/markets/${m}/publish-pending`);
+    if (typeof j.error === "string" && j.error.trim() !== "") {
+      setText(quoteEl, "—");
+      setText(settleEl, "—");
+      setText(totalEl, "—");
+      totalEl.classList.remove("ip-lag--warn");
+      groupsEl.textContent = "—";
+      setErrLine(errEl, j.error);
+      return;
+    }
+
+    setText(quoteEl, j.quote_pending);
+    setText(settleEl, j.settle_pending);
+    setText(totalEl, j.total_pending);
+    setErrLine(errEl, null);
+
+    let totalPending = 0n;
+    try {
+      const totalStr = fmtCell(j.total_pending);
+      totalPending = totalStr === "—" ? 0n : BigInt(totalStr);
+    } catch {
+      totalPending = 0n;
+    }
+    if (totalPending > 0n) {
+      totalEl.classList.add("ip-lag--warn");
+    } else {
+      totalEl.classList.remove("ip-lag--warn");
+    }
+
+    const groups = Array.isArray(j.settle_group_pending) ? j.settle_group_pending : [];
+    const groupItems = groups
+      .map((item) => ({
+        groupId: fmtCell(item.group_id),
+        pending: fmtCell(item.pending),
+      }))
+      .filter((item) => item.groupId !== "—" && item.pending !== "—");
+
+    if (groupItems.length === 0) {
+      groupsEl.textContent = "—";
+      return;
+    }
+
+    groupsEl.innerHTML = groupItems
+      .map((item) => {
+        const level = classifyPendingLevel(item.pending);
+        return `<code class="ip-group-chip ip-group-chip--${level}">settle.${escapeHtml(item.groupId)}=${escapeHtml(item.pending)}</code>`;
+      })
+      .join("");
+  } catch (e) {
+    const msg =
+      e == null
+        ? "Network or API error (no error object)"
+        : e instanceof Error
+          ? e.message.trim() || e.name || "Error"
+          : String(e);
+    setText(quoteEl, "—");
+    setText(settleEl, "—");
+    setText(totalEl, "—");
+    totalEl.classList.remove("ip-lag--warn");
+    groupsEl.textContent = "—";
+    setErrLine(
+      errEl,
+      msg === "null" || msg === "undefined" || msg === ""
+        ? "Network or API error: ensure web-test is running on :8000 and /api/config is reachable."
+        : msg,
+    );
+  }
+}
+
 async function refreshOrderbook(): Promise<void> {
   const limit = Number((document.getElementById("ob-limit") as HTMLInputElement).value || 12);
   const offset = Math.max(
@@ -390,30 +838,176 @@ async function refreshOrderbook(): Promise<void> {
   }
 }
 
+function clearHttpRefreshTimer(): void {
+  if (httpRefreshState.timerId !== undefined) {
+    window.clearTimeout(httpRefreshState.timerId);
+    httpRefreshState.timerId = undefined;
+  }
+}
+
+function formatRefreshTime(d: Date): string {
+  return d.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function classifyPendingLevel(pending: string): string {
+  try {
+    const n = BigInt(pending);
+    if (n <= 0n) return "zero";
+    if (n < 5n) return "low";
+    if (n < 20n) return "medium";
+    return "high";
+  } catch {
+    return "unknown";
+  }
+}
+
+function getRefreshIntervalInput(): HTMLInputElement | null {
+  return document.getElementById("refresh-interval-ms") as HTMLInputElement | null;
+}
+
+function normalizeHttpRefreshInterval(raw: unknown): number {
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n)) return DEFAULT_HTTP_REFRESH_MS;
+  return Math.max(MIN_HTTP_REFRESH_MS, n);
+}
+
+function getHttpRefreshInterval(): number {
+  const input = getRefreshIntervalInput();
+  if (!input) return DEFAULT_HTTP_REFRESH_MS;
+  const intervalMs = normalizeHttpRefreshInterval(input.value);
+  if (String(intervalMs) !== input.value) {
+    input.value = String(intervalMs);
+  }
+  return intervalMs;
+}
+
+function setRunningStateButton(btn: HTMLButtonElement, running: boolean): void {
+  btn.classList.toggle("state-toggle-btn--running", running);
+  btn.classList.toggle("state-toggle-btn--idle", !running);
+}
+
+function updateRefreshControls(statusOverride?: string): void {
+  const refreshBtn = document.getElementById("btn-refresh-now") as HTMLButtonElement | null;
+  const autoBtn = document.getElementById("btn-auto-refresh") as HTMLButtonElement | null;
+  const statusEl = document.getElementById("refresh-status");
+  const intervalInput = getRefreshIntervalInput();
+  if (!refreshBtn || !autoBtn || !statusEl || !intervalInput) return;
+  const intervalMs = getHttpRefreshInterval();
+
+  refreshBtn.disabled = httpRefreshState.inFlight;
+  refreshBtn.textContent = httpRefreshState.inFlight ? "Refreshing..." : "Refresh";
+  autoBtn.textContent = httpRefreshState.enabled ? "Auto refresh: On" : "Auto refresh: Off";
+  setRunningStateButton(autoBtn, httpRefreshState.enabled);
+  intervalInput.min = String(MIN_HTTP_REFRESH_MS);
+
+  if (statusOverride !== undefined) {
+    statusEl.textContent = statusOverride;
+    return;
+  }
+
+  statusEl.textContent = httpRefreshState.enabled
+    ? `Auto refresh every ${intervalMs}ms`
+    : lastHttpRefreshText;
+}
+
+function scheduleHttpAutoRefresh(delayMs = getHttpRefreshInterval()): void {
+  clearHttpRefreshTimer();
+  if (!httpRefreshState.enabled) return;
+  httpRefreshState.timerId = window.setTimeout(() => {
+    void triggerHttpRefresh("auto");
+  }, delayMs);
+}
+
+async function refreshHttpDataSections(): Promise<void> {
+  await Promise.all([
+    refreshEngineStatus(),
+    refreshOrderbook(),
+    refreshInputProgress(),
+    refreshPublishPending(),
+  ]);
+}
+
+async function triggerHttpRefresh(reason: "manual" | "auto" | "init"): Promise<void> {
+  if (httpRefreshState.inFlight) {
+    httpRefreshState.queued = true;
+    return;
+  }
+
+  clearHttpRefreshTimer();
+  httpRefreshState.inFlight = true;
+  updateRefreshControls("Refreshing...");
+
+  try {
+    await refreshHttpDataSections();
+    lastHttpRefreshText = `Last refresh ${formatRefreshTime(new Date())}`;
+    updateRefreshControls(
+      lastHttpRefreshText,
+    );
+  } finally {
+    httpRefreshState.inFlight = false;
+
+    if (httpRefreshState.queued) {
+      httpRefreshState.queued = false;
+      void triggerHttpRefresh(reason);
+      return;
+    }
+
+    if (httpRefreshState.enabled) {
+      scheduleHttpAutoRefresh();
+    } else {
+      updateRefreshControls();
+    }
+  }
+}
+
+function startHttpAutoRefresh(): void {
+  if (httpRefreshState.enabled) return;
+  httpRefreshState.enabled = true;
+  updateRefreshControls();
+  void triggerHttpRefresh("auto");
+}
+
+function stopHttpAutoRefresh(): void {
+  httpRefreshState.enabled = false;
+  httpRefreshState.queued = false;
+  clearHttpRefreshTimer();
+  updateRefreshControls();
+}
+
 document.querySelectorAll(".tab").forEach((btn) => {
   btn.addEventListener("click", () => {
     document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
     btn.classList.add("active");
-    const id = (btn as HTMLElement).dataset.tab;
+    const id = (btn as HTMLElement).dataset.tab as ManualTabKind | undefined;
+    if (!id) return;
+    activeManualTab = id;
     document.getElementById("form-limit")!.classList.toggle("hidden", id !== "limit");
     document.getElementById("form-market")!.classList.toggle("hidden", id !== "market");
     document.getElementById("form-cancel")!.classList.toggle("hidden", id !== "cancel");
+    updateManualSubmitButton();
   });
+});
+
+document.getElementById("btn-manual-submit")!.addEventListener("click", () => {
+  const formId =
+    activeManualTab === "limit"
+      ? "form-limit"
+      : activeManualTab === "market"
+        ? "form-market"
+        : "form-cancel";
+  const form = document.getElementById(formId) as HTMLFormElement | null;
+  form?.requestSubmit();
 });
 
 document.getElementById("form-limit")!.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const f = formJson(ev.target as HTMLFormElement);
   try {
-    await api<unknown>("/api/orders/limit", {
-      method: "POST",
-      body: JSON.stringify({
-        user_id: Number(f.user_id),
-        side: Number(f.side),
-        price: String(f.price),
-        amount: String(f.amount),
-      }),
-    });
+    await submitLimitOrder(Number(f.user_id), Number(f.side), String(f.price), String(f.amount));
   } catch (e) {
     console.error(e);
   }
@@ -423,14 +1017,7 @@ document.getElementById("form-market")!.addEventListener("submit", async (ev) =>
   ev.preventDefault();
   const f = formJson(ev.target as HTMLFormElement);
   try {
-    await api<unknown>("/api/orders/market", {
-      method: "POST",
-      body: JSON.stringify({
-        user_id: Number(f.user_id),
-        side: Number(f.side),
-        amount: String(f.amount),
-      }),
-    });
+    await submitMarketOrder(Number(f.user_id), Number(f.side), String(f.amount));
   } catch (e) {
     console.error(e);
   }
@@ -440,16 +1027,42 @@ document.getElementById("form-cancel")!.addEventListener("submit", async (ev) =>
   ev.preventDefault();
   const f = formJson(ev.target as HTMLFormElement);
   try {
-    await api<unknown>("/api/orders/cancel", {
-      method: "POST",
-      body: JSON.stringify({
-        user_id: Number(f.user_id),
-        order_id: Number(f.order_id),
-      }),
-    });
+    await submitCancelOrder(Number(f.user_id), Number(f.order_id));
   } catch (e) {
     console.error(e);
   }
+});
+
+document.getElementById("btn-auto-order")!.addEventListener("click", () => {
+  if (autoOrderState.running) {
+    stopAutoOrder();
+    return;
+  }
+  try {
+    startAutoOrder();
+  } catch (e) {
+    setAutoOrderStatus(`Auto order config error: ${e instanceof Error ? e.message : String(e)}`);
+  }
+});
+
+document.getElementById("btn-refresh-now")!.addEventListener("click", () => {
+  void triggerHttpRefresh("manual");
+});
+
+document.getElementById("btn-auto-refresh")!.addEventListener("click", () => {
+  if (httpRefreshState.enabled) {
+    stopHttpAutoRefresh();
+    return;
+  }
+  startHttpAutoRefresh();
+});
+
+document.getElementById("refresh-interval-ms")!.addEventListener("change", () => {
+  void getHttpRefreshInterval();
+  if (httpRefreshState.enabled) {
+    scheduleHttpAutoRefresh();
+  }
+  updateRefreshControls(lastHttpRefreshText);
 });
 
 const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -500,16 +1113,8 @@ document.getElementById("btn-ws-clear")!.addEventListener("click", () => {
 
 void (async () => {
   await loadConfig();
-  void refreshEngineStatus();
-  setInterval(() => {
-    void refreshEngineStatus();
-  }, HTTP_POLL_MS);
-  void refreshOrderbook();
-  setInterval(() => {
-    void refreshOrderbook();
-  }, HTTP_POLL_MS);
-  void refreshInputProgress();
-  setInterval(() => {
-    void refreshInputProgress();
-  }, HTTP_POLL_MS);
+  updateManualSubmitButton();
+  updateAutoOrderButton();
+  setAutoOrderStatus("Idle");
+  startHttpAutoRefresh();
 })();

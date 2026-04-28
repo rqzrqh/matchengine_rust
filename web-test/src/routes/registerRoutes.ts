@@ -50,6 +50,17 @@ export function registerRoutes(
     }
   });
 
+  app.get("/api/markets/:market/publish-pending", async (req: Request, res: Response) => {
+    try {
+      const { status, text } = await engineGet(
+        `/markets/${encodeURIComponent(req.params.market)}/publish-pending`,
+      );
+      res.status(status).type("application/json").send(text);
+    } catch (e) {
+      res.status(502).json({ error: String(e) });
+    }
+  });
+
   /**
    * Offer topic: {@link OfferTopicMonitor} subscribes and keeps the last message; **end offset** is fetched
    * from Kafka on each request (no server-side poll; the browser drives refresh via this route).

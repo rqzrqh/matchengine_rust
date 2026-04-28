@@ -7,65 +7,143 @@
   </head>
   <body>
     <header class="app-header">
-      <h1>Matching Engine Test</h1>
+      <div class="app-header__row">
+        <h1>Matching Engine Test</h1>
+        <div class="app-header__actions" aria-label="Refresh controls">
+          <span id="refresh-status" class="app-header__status">Starting auto refresh...</span>
+          <label class="app-header__interval">
+            Interval (ms)
+            <input id="refresh-interval-ms" type="number" value="1000" min="500" step="100" />
+          </label>
+          <button type="button" id="btn-refresh-now">Refresh</button>
+          <button
+            type="button"
+            id="btn-auto-refresh"
+            class="state-toggle-btn state-toggle-btn--running app-header__toggle"
+          >
+            Auto refresh: On
+          </button>
+        </div>
+      </div>
     </header>
 
     <div class="app-body">
       <div class="layout-grid" aria-label="Main workspace">
-        <div class="layout-cell layout-compact" aria-label="Engine, trading, and real-time feed">
+        <div class="layout-cell layout-compact" aria-label="Trading and real-time feed">
           <div class="layout-compact__pair">
-            <aside class="layout-engine" aria-label="Engine">
-              <section class="panel panel--fill panel--tight">
-                <h2>Engine status</h2>
-                <pre id="out-status" class="mono mono--grow"></pre>
-              </section>
-            </aside>
-
             <main class="layout-form">
               <section class="panel cell cell--form panel--tight">
                 <div class="panel-heading-row">
                   <h2>Place order</h2>
                   <span class="muted panel-heading-meta">Default fee rate 0.1</span>
                 </div>
-                <div class="tabs">
-                  <button type="button" class="tab active" data-tab="limit">Limit</button>
-                  <button type="button" class="tab" data-tab="market">Market</button>
-                  <button type="button" class="tab" data-tab="cancel">Cancel</button>
+                <div class="trade-panels">
+                  <section class="trade-panel trade-panel--manual" aria-label="Manual order">
+                    <div class="tabs">
+                      <button type="button" class="tab active" data-tab="limit">Limit</button>
+                      <button type="button" class="tab" data-tab="market">Market</button>
+                      <button type="button" class="tab" data-tab="cancel">Cancel</button>
+                    </div>
+                    <form id="form-limit" class="tab-panel">
+                      <div class="tab-panel__body">
+                        <label>user_id <input type="number" name="user_id" value="1" /></label>
+                        <div class="row side-choose" role="group" aria-label="Side">
+                          <span class="side-choose__text">Side</span>
+                          <label class="side-choose__opt"
+                            ><input type="radio" name="side" value="2" checked /> Buy</label
+                          >
+                          <label class="side-choose__opt"
+                            ><input type="radio" name="side" value="1" /> Sell</label
+                          >
+                        </div>
+                        <label>price <input name="price" value="100" /></label>
+                        <label>amount <input name="amount" value="10" /></label>
+                      </div>
+                    </form>
+                    <form id="form-market" class="tab-panel hidden">
+                      <div class="tab-panel__body">
+                        <label>user_id <input type="number" name="user_id" value="1" /></label>
+                        <div class="row side-choose" role="group" aria-label="Side">
+                          <span class="side-choose__text">Side</span>
+                          <label class="side-choose__opt"
+                            ><input type="radio" name="side" value="2" checked /> Buy</label
+                          >
+                          <label class="side-choose__opt"
+                            ><input type="radio" name="side" value="1" /> Sell</label
+                          >
+                        </div>
+                        <label>amount <input name="amount" value="10" /></label>
+                      </div>
+                    </form>
+                    <form id="form-cancel" class="tab-panel hidden">
+                      <div class="tab-panel__body">
+                        <label>user_id <input type="number" name="user_id" value="1" /></label>
+                        <label>order_id <input type="number" name="order_id" value="1" /></label>
+                      </div>
+                    </form>
+                    <div class="manual-submit-row">
+                      <button type="button" id="btn-manual-submit">Submit limit order</button>
+                    </div>
+                  </section>
+                  <section class="trade-panel auto-order" aria-label="Auto order">
+                    <div class="auto-order__heading">
+                      <h3>Auto order</h3>
+                      <div class="row auto-order__row auto-order__checks" role="group" aria-label="Auto order actions">
+                        <label><input id="auto-enable-limit" type="checkbox" checked /> limit</label>
+                        <label><input id="auto-enable-market" type="checkbox" checked /> market</label>
+                        <label><input id="auto-enable-cancel" type="checkbox" checked /> cancel</label>
+                      </div>
+                    </div>
+                    <div class="row auto-order__row auto-order__row--pair">
+                      <label>user_id start <input id="auto-user-start" type="number" value="1" min="1" /></label>
+                      <label>user_id end <input id="auto-user-end" type="number" value="20" min="1" /></label>
+                    </div>
+                    <div class="row auto-order__row auto-order__row--pair">
+                      <label>price min <input id="auto-price-min" value="90" /></label>
+                      <label>price max <input id="auto-price-max" value="110" /></label>
+                    </div>
+                    <div class="row auto-order__row auto-order__row--pair">
+                      <label>amount min <input id="auto-amount-min" value="1" /></label>
+                      <label>amount max <input id="auto-amount-max" value="10" /></label>
+                    </div>
+                    <div class="row auto-order__row">
+                      <label>interval ms <input id="auto-interval-ms" type="number" value="400" min="10" step="10" /></label>
+                    </div>
+                    <div class="row auto-order__row">
+                      <button type="button" id="btn-auto-order" class="state-toggle-btn">Start</button>
+                    </div>
+                  </section>
                 </div>
-                <form id="form-limit" class="tab-panel">
-                  <label>user_id <input type="number" name="user_id" value="1" /></label>
-                  <div class="row side-choose" role="group" aria-label="Side">
-                    <span class="side-choose__text">Side</span>
-                    <label class="side-choose__opt"
-                      ><input type="radio" name="side" value="2" checked /> Buy</label
-                    >
-                    <label class="side-choose__opt"
-                      ><input type="radio" name="side" value="1" /> Sell</label
-                    >
+              </section>
+              <section class="panel panel--tight engine-status-card" aria-label="Engine status">
+                <h2>Engine status</h2>
+                <div class="status-form">
+                  <div class="status-field">
+                    <span class="status-field__label">oper_id</span>
+                    <div class="status-field__value-row"><strong id="st-oper-id">—</strong><span id="st-oper-id-delta" class="status-delta">—</span></div>
                   </div>
-                  <label>price <input name="price" value="100" /></label>
-                  <label>amount <input name="amount" value="10" /></label>
-                  <button type="submit">Submit limit order</button>
-                </form>
-                <form id="form-market" class="tab-panel hidden">
-                  <label>user_id <input type="number" name="user_id" value="1" /></label>
-                  <div class="row side-choose" role="group" aria-label="Side">
-                    <span class="side-choose__text">Side</span>
-                    <label class="side-choose__opt"
-                      ><input type="radio" name="side" value="2" checked /> Buy</label
-                    >
-                    <label class="side-choose__opt"
-                      ><input type="radio" name="side" value="1" /> Sell</label
-                    >
+                  <div class="status-field">
+                    <span class="status-field__label">order_id</span>
+                    <div class="status-field__value-row"><strong id="st-order-id">—</strong><span id="st-order-id-delta" class="status-delta">—</span></div>
                   </div>
-                  <label>amount <input name="amount" value="10" /></label>
-                  <button type="submit">Submit market order</button>
-                </form>
-                <form id="form-cancel" class="tab-panel hidden">
-                  <label>user_id <input type="number" name="user_id" value="1" /></label>
-                  <label>order_id <input type="number" name="order_id" value="1" /></label>
-                  <button type="submit">Cancel order</button>
-                </form>
+                  <div class="status-field">
+                    <span class="status-field__label">deals_id</span>
+                    <div class="status-field__value-row"><strong id="st-deals-id">—</strong><span id="st-deals-id-delta" class="status-delta">—</span></div>
+                  </div>
+                  <div class="status-field">
+                    <span class="status-field__label">message_id</span>
+                    <div class="status-field__value-row"><strong id="st-message-id">—</strong><span id="st-message-id-delta" class="status-delta">—</span></div>
+                  </div>
+                  <div class="status-field">
+                    <span class="status-field__label">input_offset</span>
+                    <div class="status-field__value-row"><strong id="st-input-offset">—</strong><span id="st-input-offset-delta" class="status-delta">—</span></div>
+                  </div>
+                  <div class="status-field">
+                    <span class="status-field__label">input_sequence_id</span>
+                    <div class="status-field__value-row"><strong id="st-input-seq-id">—</strong><span id="st-input-seq-id-delta" class="status-delta">—</span></div>
+                  </div>
+                </div>
+                <p id="st-engine-err" class="ip-err" hidden></p>
               </section>
             </main>
           </div>
@@ -90,38 +168,26 @@
               </div>
               <p id="ob-input-err" class="ip-err" hidden></p>
             </div>
-          </section>
-
-          <section class="layout-ws ws-strip" aria-label="Real-time feed">
-            <div class="panel ws-strip__panel panel--tight">
-              <div class="panel-heading-row panel-heading-row--ws">
-                <h2>Real-time feed</h2>
-                <button type="button" id="btn-ws-clear">Clear</button>
+            <div class="panel ip-progress__panel panel--tight">
+              <h2 class="ip-progress__h">Publish pending</h2>
+              <div class="ip-progress__row">
+                <span class="ip-stat">Quote <strong id="ob-publish-quote">—</strong></span>
+                <span class="ip-sep" aria-hidden="true">·</span>
+                <span class="ip-stat">Settle <strong id="ob-publish-settle">—</strong></span>
+                <span class="ip-sep" aria-hidden="true">·</span>
+                <span class="ip-stat">Total <strong id="ob-publish-total" class="ip-lag">—</strong></span>
               </div>
-              <div class="ws-feed-split">
-                <div class="feed-channel feed-channel--settle" aria-label="Settle messages">
-                  <h3 class="feed-channel__title">
-                    Settle messages
-                    <span class="feed-channel__hint">Kafka <code>settle.*</code></span>
-                  </h3>
-                  <pre id="out-ws-settle" class="mono mono--feed"></pre>
-                </div>
-                <div class="feed-channel feed-channel--quote" aria-label="Quote deals">
-                  <h3 class="feed-channel__title">
-                    Quote deals
-                    <span class="feed-channel__hint">Kafka <code>quote_deals.*</code></span>
-                  </h3>
-                  <pre id="out-ws-quote" class="mono mono--feed"></pre>
-                </div>
-              </div>
+              <div id="ob-publish-groups" class="ip-groups">—</div>
+              <p id="ob-publish-err" class="ip-err" hidden></p>
             </div>
           </section>
+
         </div>
 
         <div class="layout-cell layout-orderbook" aria-label="Order book">
           <section class="panel cell cell--orderbook">
             <h2>Order book</h2>
-            <p class="muted">Auto-refresh every 0.5s. Change limit or offset to apply on the next tick.</p>
+            <p class="muted">Use Refresh to request HTTP data immediately, or enable auto refresh every 0.5s.</p>
             <div class="row ob-controls">
               <label>Depth limit <input type="number" id="ob-limit" value="12" min="1" max="50" /></label>
               <label>Offset <input type="number" id="ob-offset" value="0" min="0" step="1" /></label>
@@ -167,6 +233,30 @@
           </section>
         </div>
       </div>
+      <section class="layout-ws layout-ws--bottom ws-strip" aria-label="Real-time feed">
+        <div class="panel ws-strip__panel panel--tight">
+          <div class="panel-heading-row panel-heading-row--ws">
+            <h2>Real-time feed</h2>
+            <button type="button" id="btn-ws-clear">Clear</button>
+          </div>
+          <div class="ws-feed-split">
+            <div class="feed-channel feed-channel--settle" aria-label="Settle messages">
+              <h3 class="feed-channel__title">
+                Settle messages
+                <span class="feed-channel__hint">Kafka <code>settle.*</code></span>
+              </h3>
+              <pre id="out-ws-settle" class="mono mono--feed"></pre>
+            </div>
+            <div class="feed-channel feed-channel--quote" aria-label="Quote deals">
+              <h3 class="feed-channel__title">
+                Quote deals
+                <span class="feed-channel__hint">Kafka <code>quote_deals.*</code></span>
+              </h3>
+              <pre id="out-ws-quote" class="mono mono--feed"></pre>
+            </div>
+          </div>
+        </div>
+      </section>
     </div>
 
     <script type="module" src="/src/main.ts"></script>
