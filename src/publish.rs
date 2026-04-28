@@ -94,7 +94,6 @@ struct QuotePublishTaskInfo {
 struct SettlePublishTaskInfo {
     group_id:u32,
     message_id:u64,
-    topic:String,
     data:JsonValue,
 }
 
@@ -123,6 +122,25 @@ fn enqueue_publish(
     producer
         .send_result::<Vec<u8>, _>(record)
         .unwrap_or_else(|(e, _)| panic!("publish enqueue failed topic={} error={}", topic, e))
+}
+
+fn enqueue_settle_publish(
+    producer: &FutureProducer,
+    partition: i32,
+    data: &JsonValue,
+) -> DeliveryFuture {
+    let payload = data.to_string();
+    let record = FutureRecord::to("settle")
+        .partition(partition)
+        .payload(payload.as_bytes());
+    producer
+        .send_result::<Vec<u8>, _>(record)
+        .unwrap_or_else(|(e, _)| {
+            panic!(
+                "settle publish enqueue failed partition={} error={}",
+                partition, e
+            )
+        })
 }
 
 fn build_kafka_producer(brokers: &str, batch_size: usize, linger_ms: u64) -> FutureProducer {
@@ -236,7 +254,7 @@ fn spawn_settle_publish_thread(
                         pending.push((
                             group_id,
                             task.message_id,
-                            enqueue_publish(&producer, &task.topic, &task.data),
+                            enqueue_settle_publish(&producer, task.group_id as i32, &task.data),
                         ));
                         next_settle_message_ids[group_id] = task.message_id;
                     } else {
@@ -327,14 +345,12 @@ impl Publish {
         object["order"] = order.to_json(m);
 
         let group_id = order.user_id%self.settle_group_count;
-        let topic = format!("settle.{}", group_id);
 
-        info!("{} {}", topic, object);
+        info!("settle partition={} {}", group_id, object);
 
         let message = SettlePublishTaskInfo {
             group_id:group_id,
             message_id:m.message_id,
-            topic: topic,
             data: object,
         };
 
@@ -360,14 +376,12 @@ impl Publish {
         object["order"] = order.to_json(m);
 
         let group_id = order.user_id%self.settle_group_count;
-        let topic = format!("settle.{}", group_id);
 
-        info!("{} {}", topic, object);
+        info!("settle partition={} {}", group_id, object);
 
         let message = SettlePublishTaskInfo {
             group_id:group_id,
             message_id:m.message_id,
-            topic: topic,
             data: object,
         };
 
@@ -410,14 +424,12 @@ impl Publish {
 
 
         let group_id = user_id%self.settle_group_count;
-        let topic = format!("settle.{}", group_id);
 
-        info!("{} {}", topic, object);
+        info!("settle partition={} {}", group_id, object);
 
         let message = SettlePublishTaskInfo {
             group_id:group_id,
             message_id:m.message_id,
-            topic: topic,
             data: object,
         };
 
@@ -446,14 +458,12 @@ impl Publish {
         object["code"] = code.into();
 
         let group_id = user_id%self.settle_group_count;
-        let topic = format!("settle.{}", group_id);
 
-        info!("{} {}", topic, object);
+        info!("settle partition={} {}", group_id, object);
 
         let message = SettlePublishTaskInfo {
             group_id:group_id,
             message_id:m.message_id,
-            topic: topic,
             data: object,
         };
 

@@ -31,7 +31,7 @@ export const quoteConsumerState = mysqlTable(
   (t) => [uniqueIndex("uq_quote_consumer_state_topic_part").on(t.kafkaTopic, t.partitionId)],
 );
 
-/** Raw Kafka payload for settle topics (`settle.*`), one row per consumed message that advances `msgid`. */
+/** Raw Kafka payload for topic `settle`, one row per consumed message that advances `msgid`. */
 export const settleMessages = mysqlTable(
   "settle_messages",
   {

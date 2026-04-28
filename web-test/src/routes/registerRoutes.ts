@@ -62,8 +62,8 @@ export function registerRoutes(
   });
 
   /**
-   * Offer topic: {@link OfferTopicMonitor} subscribes and keeps the last message; **end offset** is fetched
-   * from Kafka on each request (no server-side poll; the browser drives refresh via this route).
+   * Offer topic: {@link OfferTopicMonitor} reads partition high watermark via Admin on each request
+   * (no consumer; browser drives refresh via this route).
    */
   app.get("/api/markets/:market/offer-topic/end-offset", async (req: Request, res: Response) => {
     const cfg = getAppConfig();

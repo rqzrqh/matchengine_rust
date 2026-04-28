@@ -7,10 +7,10 @@ import { unixSecondsNow } from "../time.js";
 import { settleConsumerState, settleMessages, type SettleMessageRow } from "../db/schema.js";
 import type { FeedHub } from "./feedHub.js";
 
-const PARTITION = 0;
+const SETTLE_TOPIC = "settle";
 
 /**
- * Consumes `settle.0`..`settle.N-1`; stores progress per (settle_group_id, market) with offset and msgid.
+ * Consumes Kafka topic `settle` (N partitions, default 64); `settle_group_id` = message partition index.
  * Seeks each partition on startup. When `msgid` moves forward, appends the raw payload to `settle_messages` and updates state; otherwise only the offset advances.
  */
 export class SettleService {
@@ -25,7 +25,6 @@ export class SettleService {
     const cfg = getAppConfig();
     const marketName = cfg.marketName;
     const groupCount = cfg.userSettleGroupSize;
-    const settleTopics = Array.from({ length: groupCount }, (_, i) => `settle.${i}`);
     const groupId = `web-settle-messages-${marketName}`;
 
     this.consumer = this.kafka.consumer({
@@ -49,13 +48,12 @@ export class SettleService {
       initialSeekDone = true;
       try {
         for (let i = 0; i < groupCount; i++) {
-          const topic = `settle.${i}`;
           const st = byGroup.get(i);
           if (st) {
             const next = (BigInt(st.lastOffset) + 1n).toString();
-            await this.consumer.seek({ topic, partition: PARTITION, offset: next });
+            await this.consumer.seek({ topic: SETTLE_TOPIC, partition: i, offset: next });
           } else if (cfg.kafkaAutoOffsetReset !== "earliest") {
-            await this.consumer.seek({ topic, partition: PARTITION, offset: "-1" });
+            await this.consumer.seek({ topic: SETTLE_TOPIC, partition: i, offset: "-1" });
           }
         }
       } catch (e) {
@@ -65,18 +63,18 @@ export class SettleService {
     this.consumer.on(this.consumer.events.GROUP_JOIN, onGroupJoin);
 
     await this.consumer.connect();
-    await this.consumer.subscribe({ topics: settleTopics, fromBeginning: true });
+    await this.consumer.subscribe({ topics: [SETTLE_TOPIC], fromBeginning: true });
 
     await this.consumer.run({
       autoCommit: false,
       eachMessage: async ({ topic, partition, message }) => {
         if (!this.consumer) return;
         const offset = BigInt(message.offset);
-        const settleGroup = parseSettleGroup(topic);
-        if (settleGroup === null) {
+        if (topic !== SETTLE_TOPIC) {
           await this.safeCommit(topic, partition, offset);
           return;
         }
+        const settleGroup = partition;
 
         const raw = message.value?.toString() ?? "{}";
         let payload: Record<string, unknown>;
@@ -247,12 +245,6 @@ export class SettleService {
       this.consumer = null;
     }
   }
-}
-
-function parseSettleGroup(topic: string): number | null {
-  const m = /^settle\.(\d+)$/.exec(topic);
-  if (!m) return null;
-  return parseInt(m[1]!, 10);
 }
 
 function numOrNull(v: unknown): number | null {
