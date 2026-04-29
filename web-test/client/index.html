@@ -123,6 +123,27 @@
                   </section>
                 </div>
               </section>
+              <section class="input-progress" aria-label="Input consumption progress">
+                <div class="panel ip-progress__panel panel--tight">
+                  <h2 class="ip-progress__h">Input progress</h2>
+                  <div class="ip-progress__row">
+                    <code id="ob-input-topic" class="ip-progress__topic">—</code>
+                    <span class="ip-sep" aria-hidden="true">·</span>
+                    <span class="ip-stat"
+                      >Kafka end <strong id="ob-kafka-high">—</strong></span
+                    >
+                    <span class="ip-sep" aria-hidden="true">·</span>
+                    <span class="ip-stat"
+                      >Processed (input_offset) <strong id="ob-input-off">—</strong></span
+                    >
+                    <span class="ip-sep" aria-hidden="true">·</span>
+                    <span class="ip-stat"
+                      >Lag <strong id="ob-lag" class="ip-lag">—</strong></span
+                    >
+                  </div>
+                  <p id="ob-input-err" class="ip-err" hidden></p>
+                </div>
+              </section>
               <section class="panel panel--tight engine-status-card" aria-label="Engine status">
                 <h2>Engine status</h2>
                 <div class="status-form">
@@ -156,34 +177,15 @@
             </main>
           </div>
 
-          <section class="input-progress" aria-label="Input consumption progress">
+          <section class="input-progress" aria-label="Output progress">
             <div class="panel ip-progress__panel panel--tight">
-              <h2 class="ip-progress__h">Input progress</h2>
+              <h2 class="ip-progress__h">Output Progress</h2>
               <div class="ip-progress__row">
-                <code id="ob-input-topic" class="ip-progress__topic">—</code>
+                <span class="ip-stat">Quote pushed <strong id="ob-publish-quote">—</strong></span>
                 <span class="ip-sep" aria-hidden="true">·</span>
-                <span class="ip-stat"
-                  >Kafka end <strong id="ob-kafka-high">—</strong></span
-                >
+                <span class="ip-stat">Settle pushed <strong id="ob-publish-settle">—</strong></span>
                 <span class="ip-sep" aria-hidden="true">·</span>
-                <span class="ip-stat"
-                  >Processed (input_offset) <strong id="ob-input-off">—</strong></span
-                >
-                <span class="ip-sep" aria-hidden="true">·</span>
-                <span class="ip-stat"
-                  >Lag <strong id="ob-lag" class="ip-lag">—</strong></span
-                >
-              </div>
-              <p id="ob-input-err" class="ip-err" hidden></p>
-            </div>
-            <div class="panel ip-progress__panel panel--tight">
-              <h2 class="ip-progress__h">Publish pending</h2>
-              <div class="ip-progress__row">
-                <span class="ip-stat">Quote <strong id="ob-publish-quote">—</strong></span>
-                <span class="ip-sep" aria-hidden="true">·</span>
-                <span class="ip-stat">Settle <strong id="ob-publish-settle">—</strong></span>
-                <span class="ip-sep" aria-hidden="true">·</span>
-                <span class="ip-stat">Total <strong id="ob-publish-total" class="ip-lag">—</strong></span>
+                <span class="ip-stat">Lag <strong id="ob-publish-total" class="ip-lag">—</strong></span>
               </div>
               <div id="ob-publish-groups" class="ip-groups">—</div>
               <p id="ob-publish-err" class="ip-err" hidden></p>

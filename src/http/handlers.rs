@@ -41,10 +41,7 @@ pub fn handle_http_request(m: &Market, op: HttpOp) -> HttpResponse {
                 body: json_market_status(m),
             }
         }
-        HttpOp::OrderDetail {
-            market,
-            order_id,
-        } => {
+        HttpOp::OrderDetail { market, order_id } => {
             if !m.name.eq(&market) {
                 return unknown_market();
             }
@@ -99,19 +96,33 @@ pub fn handle_http_request(m: &Market, op: HttpOp) -> HttpResponse {
 fn json_market_summary(m: &Market) -> String {
     let mut object = JsonValue::new_object();
     let mut ask_amount = Decimal::ZERO;
+    let mut ask_money_amount = Decimal::ZERO;
     let mut bid_amount = Decimal::ZERO;
+    let mut bid_money_amount = Decimal::ZERO;
     for order in &m.asks {
         ask_amount += order.left.get();
+        ask_money_amount += order.price * order.left.get();
     }
     for order in &m.bids {
         bid_amount += order.left.get();
+        bid_money_amount += order.price * order.left.get();
     }
     object["name"] = m.name.clone().into();
     object["ask_count"] = (m.asks.len() as u32).into();
-    object["ask_amount"] = ask_amount.to_string().into();
+    object["ask_stock_amount"] = ask_amount.to_string().into();
+    object["ask_money_amount"] = ask_money_amount.to_string().into();
     object["bid_count"] = (m.bids.len() as u32).into();
-    object["bid_amount"] = bid_amount.to_string().into();
+    object["bid_stock_amount"] = bid_amount.to_string().into();
+    object["bid_money_amount"] = bid_money_amount.to_string().into();
     object.dump()
+}
+
+fn ids_to_json(ids: &[u64]) -> JsonValue {
+    let mut array = JsonValue::new_array();
+    for id in ids {
+        let _ = array.push(*id);
+    }
+    array
 }
 
 fn json_market_status(m: &Market) -> String {
@@ -120,8 +131,11 @@ fn json_market_status(m: &Market) -> String {
     object["order_id"] = m.order_id.into();
     object["deals_id"] = m.deals_id.into();
     object["message_id"] = m.message_id.into();
+    object["settle_message_ids"] = ids_to_json(&m.settle_message_ids);
     object["input_offset"] = m.input_offset.into();
     object["input_sequence_id"] = m.input_sequence_id.into();
+    object["pushed_quote_deals_id"] = m.pushed_quote_deals_id.into();
+    object["pushed_settle_message_ids"] = ids_to_json(&m.pushed_settle_message_ids);
     object.dump()
 }
 
@@ -163,12 +177,7 @@ fn json_order_book(m: &Market, side: u32, offset: u32, limit: u32) -> String {
     object.dump()
 }
 
-fn json_user_orders_pending(
-    m: &Market,
-    user_id: &u32,
-    offset: u32,
-    limit: u32,
-) -> String {
+fn json_user_orders_pending(m: &Market, user_id: &u32, offset: u32, limit: u32) -> String {
     let mut object = JsonValue::new_object();
     object["limit"] = limit.into();
     object["offset"] = offset.into();

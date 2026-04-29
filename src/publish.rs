@@ -1,38 +1,31 @@
 use crate::market::*;
+use crate::task::*;
+use json::*;
+use rust_decimal::prelude::*;
+use std::rc::Rc;
 use std::{
+    str,
     sync::{
+        Arc,
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc,
+        mpsc,
     },
     thread,
-    str,
 };
-use std::rc::Rc;
-use rust_decimal::prelude::*;
-use json::*;
-use crate::task::*;
 
+use rdkafka::config::ClientConfig;
 use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord};
-use rdkafka::{ config::ClientConfig };
 
 pub struct Publish {
     quote_sender: mpsc::Sender<QuotePublishTaskInfo>,
     settle_sender: mpsc::Sender<SettlePublishTaskInfo>,
     backlog: Arc<PublishBacklog>,
-    settle_group_count:u32,
 }
 
 pub struct PublishBacklog {
     quote_pending: AtomicUsize,
     settle_pending: AtomicUsize,
     settle_group_pending: Vec<AtomicUsize>,
-}
-
-pub struct PublishBacklogSnapshot {
-    pub quote_pending: usize,
-    pub settle_pending: usize,
-    pub total_pending: usize,
-    pub settle_group_pending: Vec<usize>,
 }
 
 impl PublishBacklog {
@@ -66,35 +59,18 @@ impl PublishBacklog {
         debug_assert!(total_prev > 0, "settle backlog underflow");
         debug_assert!(group_prev > 0, "settle group backlog underflow");
     }
-
-    pub fn snapshot(&self) -> PublishBacklogSnapshot {
-        let quote_pending = self.quote_pending.load(Ordering::Relaxed);
-        let settle_pending = self.settle_pending.load(Ordering::Relaxed);
-        let settle_group_pending = self
-            .settle_group_pending
-            .iter()
-            .map(|x| x.load(Ordering::Relaxed))
-            .collect::<Vec<_>>();
-
-        PublishBacklogSnapshot {
-            quote_pending,
-            settle_pending,
-            total_pending: quote_pending + settle_pending,
-            settle_group_pending,
-        }
-    }
 }
 
 struct QuotePublishTaskInfo {
-    deals_id:u64,
-    topic:String,
-    data:JsonValue,
+    deals_id: u64,
+    topic: String,
+    data: JsonValue,
 }
 
 struct SettlePublishTaskInfo {
-    group_id:u32,
-    message_id:u64,
-    data:JsonValue,
+    group_id: u32,
+    settle_message_id: u64,
+    data: JsonValue,
 }
 
 fn collect_publish_batch<T>(receiver: &mpsc::Receiver<T>, batch_size: usize) -> Vec<T> {
@@ -112,11 +88,7 @@ fn collect_publish_batch<T>(receiver: &mpsc::Receiver<T>, batch_size: usize) -> 
     batch
 }
 
-fn enqueue_publish(
-    producer: &FutureProducer,
-    topic: &str,
-    data: &JsonValue,
-    ) -> DeliveryFuture {
+fn enqueue_publish(producer: &FutureProducer, topic: &str, data: &JsonValue) -> DeliveryFuture {
     let payload = data.to_string();
     let record = FutureRecord::to(topic).payload(payload.as_bytes());
     producer
@@ -162,7 +134,7 @@ fn build_kafka_producer(brokers: &str, batch_size: usize, linger_ms: u64) -> Fut
 fn spawn_quote_publish_thread(
     brokers: String,
     main_routine_sender: mpsc::Sender<Task>,
-    quote_deals_id: u64,
+    pushed_quote_deals_id: u64,
     batch_size: usize,
     linger_ms: u64,
     receiver: mpsc::Receiver<QuotePublishTaskInfo>,
@@ -177,18 +149,21 @@ fn spawn_quote_publish_thread(
 
         producer_rt.block_on(async move {
             let producer = build_kafka_producer(&brokers, batch_size, linger_ms);
-            let mut quote_deals_id = quote_deals_id;
+            let mut pushed_quote_deals_id = pushed_quote_deals_id;
 
             loop {
                 let batch = collect_publish_batch(&receiver, batch_size);
                 let batch_len = batch.len();
                 let mut pending = Vec::with_capacity(batch_len);
-                let mut next_quote_deals_id = quote_deals_id;
+                let mut next_pushed_quote_deals_id = pushed_quote_deals_id;
 
                 for task in batch {
-                    if task.deals_id > next_quote_deals_id {
-                        pending.push((task.deals_id, enqueue_publish(&producer, &task.topic, &task.data)));
-                        next_quote_deals_id = task.deals_id;
+                    if task.deals_id > next_pushed_quote_deals_id {
+                        pending.push((
+                            task.deals_id,
+                            enqueue_publish(&producer, &task.topic, &task.data),
+                        ));
+                        next_pushed_quote_deals_id = task.deals_id;
                     } else {
                         backlog.dec_quote();
                     }
@@ -211,8 +186,10 @@ fn spawn_quote_publish_thread(
                     }
 
                     backlog.dec_quote();
-                    quote_deals_id = deals_id;
-                    let task = QuotePublishProgressTask { quote_deals_id };
+                    pushed_quote_deals_id = deals_id;
+                    let task = QuotePublishProgressTask {
+                        pushed_quote_deals_id,
+                    };
                     main_routine_sender
                         .send(Task::QuoteProgressUpdateTask(task))
                         .expect("send quote progress update task failed");
@@ -225,7 +202,7 @@ fn spawn_quote_publish_thread(
 fn spawn_settle_publish_thread(
     brokers: String,
     main_routine_sender: mpsc::Sender<Task>,
-    settle_message_ids: Vec<u64>,
+    pushed_settle_message_ids: Vec<u64>,
     batch_size: usize,
     linger_ms: u64,
     receiver: mpsc::Receiver<SettlePublishTaskInfo>,
@@ -240,23 +217,23 @@ fn spawn_settle_publish_thread(
 
         producer_rt.block_on(async move {
             let producer = build_kafka_producer(&brokers, batch_size, linger_ms);
-            let mut settle_message_ids = settle_message_ids;
+            let mut pushed_settle_message_ids = pushed_settle_message_ids;
 
             loop {
                 let batch = collect_publish_batch(&receiver, batch_size);
                 let batch_len = batch.len();
                 let mut pending = Vec::with_capacity(batch_len);
-                let mut next_settle_message_ids = settle_message_ids.clone();
+                let mut next_pushed_settle_message_ids = pushed_settle_message_ids.clone();
 
                 for task in batch {
                     let group_id = task.group_id as usize;
-                    if task.message_id > next_settle_message_ids[group_id] {
+                    if task.settle_message_id > next_pushed_settle_message_ids[group_id] {
                         pending.push((
                             group_id,
-                            task.message_id,
+                            task.settle_message_id,
                             enqueue_settle_publish(&producer, task.group_id as i32, &task.data),
                         ));
-                        next_settle_message_ids[group_id] = task.message_id;
+                        next_pushed_settle_message_ids[group_id] = task.settle_message_id;
                     } else {
                         backlog.dec_settle(group_id);
                     }
@@ -271,7 +248,7 @@ fn spawn_settle_publish_thread(
                     );
                 }
 
-                for (group_id, message_id, delivery) in pending {
+                for (group_id, settle_message_id, delivery) in pending {
                     match delivery.await {
                         Ok(Ok(_)) => {}
                         Ok(Err((e, _))) => panic!("settle publish delivery failed: {}", e),
@@ -279,8 +256,11 @@ fn spawn_settle_publish_thread(
                     }
 
                     backlog.dec_settle(group_id);
-                    settle_message_ids[group_id] = message_id;
-                    let task = SettlePublishProgressTask { group_id, message_id };
+                    pushed_settle_message_ids[group_id] = settle_message_id;
+                    let task = SettlePublishProgressTask {
+                        group_id,
+                        pushed_settle_message_id: settle_message_id,
+                    };
                     main_routine_sender
                         .send(Task::SettleProgressUpdateTask(task))
                         .expect("send settle progress update task failed");
@@ -294,20 +274,20 @@ impl Publish {
     pub fn new(
         brokers: String,
         main_routine_sender: mpsc::Sender<Task>,
-        quote_deals_id: u64,
-        settle_message_ids: Vec<u64>,
+        pushed_quote_deals_id: u64,
+        pushed_settle_message_ids: Vec<u64>,
         batch_size: usize,
         linger_ms: u64,
     ) -> Publish {
         let (quote_sender, quote_receiver) = mpsc::channel();
         let (settle_sender, settle_receiver) = mpsc::channel();
-        let settle_group_count = settle_message_ids.len() as u32;
+        let settle_group_count = pushed_settle_message_ids.len() as u32;
         let backlog = Arc::new(PublishBacklog::new(settle_group_count as usize));
 
         spawn_quote_publish_thread(
             brokers.clone(),
             main_routine_sender.clone(),
-            quote_deals_id,
+            pushed_quote_deals_id,
             batch_size,
             linger_ms,
             quote_receiver,
@@ -316,7 +296,7 @@ impl Publish {
         spawn_settle_publish_thread(
             brokers,
             main_routine_sender,
-            settle_message_ids,
+            pushed_settle_message_ids,
             batch_size,
             linger_ms,
             settle_receiver,
@@ -327,38 +307,33 @@ impl Publish {
             quote_sender,
             settle_sender,
             backlog,
-            settle_group_count: settle_group_count,
         }
     }
 
-    pub fn backlog(&self) -> Arc<PublishBacklog> {
-        self.backlog.clone()
-    }
-
-    pub fn publish_put_order(&self, m: &Market, extern_id: u64, order: &Rc<Order>) {
-
+    pub fn publish_put_order(&self, m: &mut Market, extern_id: u64, order: &Rc<Order>) {
         let mut object = JsonValue::new_object();
         object["type"] = "put_order".into();
         object["market"] = m.name.clone().into();
         object["msgid"] = m.message_id.into();
+        let settle_message_id = m.next_settle_message_id(order.user_id);
+        object["settle_message_id"] = settle_message_id.into();
         object["txid"] = extern_id.into();
         object["order"] = order.to_json(m);
 
-        let group_id = order.user_id%self.settle_group_count;
+        let group_id = Market::settle_group_id(order.user_id) as u32;
 
         debug!("settle partition={} {}", group_id, object);
 
         let message = SettlePublishTaskInfo {
-            group_id:group_id,
-            message_id:m.message_id,
+            group_id: group_id,
+            settle_message_id,
             data: object,
         };
 
         self.backlog.inc_settle(group_id as usize);
         let res = self.settle_sender.send(message);
         match res {
-            Ok(_) => {
-            },
+            Ok(_) => {}
             Err(e) => {
                 self.backlog.dec_settle(group_id as usize);
                 panic!("publish_put_order failed.{}", e);
@@ -366,30 +341,30 @@ impl Publish {
         }
     }
 
-    pub fn publish_cancel_order(&self, m: &Market, extern_id: u64, order: &Rc<Order>) {
-
+    pub fn publish_cancel_order(&self, m: &mut Market, extern_id: u64, order: &Rc<Order>) {
         let mut object = JsonValue::new_object();
         object["type"] = "cancel_order".into();
         object["market"] = m.name.clone().into();
         object["msgid"] = m.message_id.into();
+        let settle_message_id = m.next_settle_message_id(order.user_id);
+        object["settle_message_id"] = settle_message_id.into();
         object["txid"] = extern_id.into();
         object["order"] = order.to_json(m);
 
-        let group_id = order.user_id%self.settle_group_count;
+        let group_id = Market::settle_group_id(order.user_id) as u32;
 
         debug!("settle partition={} {}", group_id, object);
 
         let message = SettlePublishTaskInfo {
-            group_id:group_id,
-            message_id:m.message_id,
+            group_id: group_id,
+            settle_message_id,
             data: object,
         };
 
         self.backlog.inc_settle(group_id as usize);
         let res = self.settle_sender.send(message);
         match res {
-            Ok(_) => {
-            },
+            Ok(_) => {}
             Err(e) => {
                 self.backlog.dec_settle(group_id as usize);
                 panic!("publish_cancel_order failed.{}", e);
@@ -397,13 +372,27 @@ impl Publish {
         }
     }
 
-    pub fn publish_deal(&self, m: &Market, extern_id: u64, tm: i64, user_id: u32, rival_user_id: u32, order_id: u64, role: u32,
-            price: &Decimal, amount: &Decimal, deal: &Decimal, fee: &Decimal, rival_fee: &Decimal) {
-
+    pub fn publish_deal(
+        &self,
+        m: &mut Market,
+        extern_id: u64,
+        tm: i64,
+        user_id: u32,
+        rival_user_id: u32,
+        order_id: u64,
+        role: u32,
+        price: &Decimal,
+        amount: &Decimal,
+        deal: &Decimal,
+        fee: &Decimal,
+        rival_fee: &Decimal,
+    ) {
         let mut object = JsonValue::new_object();
         object["type"] = "deals".into();
         object["market"] = m.name.clone().into();
         object["msgid"] = m.message_id.into();
+        let settle_message_id = m.next_settle_message_id(user_id);
+        object["settle_message_id"] = settle_message_id.into();
         object["txid"] = extern_id.into();
 
         let mut deals = JsonValue::new_object();
@@ -422,22 +411,20 @@ impl Publish {
 
         object["deals"] = deals;
 
-
-        let group_id = user_id%self.settle_group_count;
+        let group_id = Market::settle_group_id(user_id) as u32;
 
         debug!("settle partition={} {}", group_id, object);
 
         let message = SettlePublishTaskInfo {
-            group_id:group_id,
-            message_id:m.message_id,
+            group_id: group_id,
+            settle_message_id,
             data: object,
         };
 
         self.backlog.inc_settle(group_id as usize);
         let res = self.settle_sender.send(message);
         match res {
-            Ok(_) => {
-            },
+            Ok(_) => {}
             Err(e) => {
                 self.backlog.dec_settle(group_id as usize);
                 panic!("publish_deal failed.{}", e);
@@ -445,33 +432,40 @@ impl Publish {
         }
     }
 
-    pub fn publish_error(&self, m: &mut Market, extern_id: u64, user_id: u32, params: &JsonValue, code: u32) {
-
+    pub fn publish_error(
+        &self,
+        m: &mut Market,
+        extern_id: u64,
+        user_id: u32,
+        params: &JsonValue,
+        code: u32,
+    ) {
         m.message_id += 1;
 
         let mut object = JsonValue::new_object();
         object["type"] = "error".into();
         object["market"] = m.name.clone().into();
         object["msgid"] = m.message_id.into();
+        let settle_message_id = m.next_settle_message_id(user_id);
+        object["settle_message_id"] = settle_message_id.into();
         object["txid"] = extern_id.into();
         object["params"] = params.clone();
         object["code"] = code.into();
 
-        let group_id = user_id%self.settle_group_count;
+        let group_id = Market::settle_group_id(user_id) as u32;
 
         debug!("settle partition={} {}", group_id, object);
 
         let message = SettlePublishTaskInfo {
-            group_id:group_id,
-            message_id:m.message_id,
+            group_id: group_id,
+            settle_message_id,
             data: object,
         };
 
         self.backlog.inc_settle(group_id as usize);
         let res = self.settle_sender.send(message);
         match res {
-            Ok(_) => {
-            },
+            Ok(_) => {}
             Err(e) => {
                 self.backlog.dec_settle(group_id as usize);
                 panic!("publish_error failed.{}", e);
@@ -479,7 +473,14 @@ impl Publish {
         }
     }
 
-    pub fn publish_quote_deal(&self, m: &Market, tm: i64, price: &Decimal, amount: &Decimal, side: u32) {
+    pub fn publish_quote_deal(
+        &self,
+        m: &Market,
+        tm: i64,
+        price: &Decimal,
+        amount: &Decimal,
+        side: u32,
+    ) {
         let mut object = JsonValue::new_object();
 
         object["type"] = "quote_deals".into();
@@ -508,8 +509,7 @@ impl Publish {
         self.backlog.inc_quote();
         let res = self.quote_sender.send(message);
         match res {
-            Ok(_) => {
-            },
+            Ok(_) => {}
             Err(e) => {
                 self.backlog.dec_quote();
                 panic!("publish_quote_deal failed.{}", e);

@@ -54,8 +54,8 @@ async function applyKafkaParsedSequence(seq: number): Promise<void> {
  * If `offer_orders` is empty, read the latest `offer.<market>` p0 message and set both
  * `last_sequence_id` and `last_sent_sequence_id` from its `sequence_id` / `input_sequence_id`.
  *
- * Uses `eachBatch` + deferred `seek` after `GROUP_JOIN` to avoid racing `fromBeginning`
- * with the target offset (KafkaJS).
+ * Uses `eachBatch` + deferred `seek` after `GROUP_JOIN`; subscribes from beginning as
+ * a fallback so bootstrap still reaches the target if KafkaJS ignores an early seek.
  */
 export async function bootstrapOfferLastSequenceFromKafka(kafka: Kafka): Promise<void> {
   const mgr = getDb().manager;
@@ -139,52 +139,67 @@ export async function bootstrapOfferLastSequenceFromKafka(kafka: Kafka): Promise
   consumer.on(consumer.events.GROUP_JOIN, scheduleSeek);
 
   let handled = false;
+  let finished = false;
+  let finish: () => void = () => {};
+  const done = new Promise<void>((resolve) => {
+    finish = () => {
+      if (finished) return;
+      finished = true;
+      resolve();
+    };
+  });
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
   try {
     await consumer.connect();
-    await consumer.subscribe({ topics: [topic], fromBeginning: false });
+    await consumer.subscribe({ topics: [topic], fromBeginning: true });
 
-    const runPromise = consumer.run({
+    timeoutId = setTimeout(() => {
+      if (!handled) {
+        console.error(
+          `[offer-bootstrap] timed out after ${BOOTSTRAP_RUN_MS}ms (no target batch); sequence columns not updated`,
+        );
+        finish();
+      }
+    }, BOOTSTRAP_RUN_MS);
+
+    await consumer.run({
       autoCommit: false,
       eachBatch: async ({ batch, heartbeat, pause }) => {
         await heartbeat();
         if (handled) return;
         if (batch.messages.length === 0) return;
 
+        const eligible = batch.messages.filter((m) => BigInt(m.offset) >= targetOffset);
+        if (eligible.length === 0) {
+          return;
+        }
+
         handled = true;
         if (timeoutId !== undefined) clearTimeout(timeoutId);
         pause();
 
-        const lastMsg = batch.messages[batch.messages.length - 1]!;
+        const lastMsg = eligible[eligible.length - 1]!;
         const raw = lastMsg.value?.toString() ?? "{}";
 
         try {
           const seq = parseSequenceIdFromPayload(raw);
           await applyKafkaParsedSequence(seq);
           console.log(
-            `[offer-bootstrap] last_sequence_id=${seq} last_sent_sequence_id=${seq} (from Kafka)`,
+            `[offer-bootstrap] last_sequence_id=${seq} last_sent_sequence_id=${seq} (from Kafka offset=${lastMsg.offset})`,
           );
         } catch (e) {
           console.error("[offer-bootstrap] could not apply bootstrap:", e);
         } finally {
-          await consumer.stop().catch(() => {});
+          finish();
         }
       },
     });
 
-    timeoutId = setTimeout(() => {
-      if (!handled) {
-        console.error(
-          `[offer-bootstrap] timed out after ${BOOTSTRAP_RUN_MS}ms (no batch); sequence columns not updated`,
-        );
-        void consumer.stop().catch(() => {});
-      }
-    }, BOOTSTRAP_RUN_MS);
-
-    await runPromise;
+    await done;
   } catch (e) {
     console.error("[offer-bootstrap] consumer failed:", e);
+    finish();
   } finally {
     if (timeoutId !== undefined) clearTimeout(timeoutId);
     await consumer.disconnect().catch(() => {});

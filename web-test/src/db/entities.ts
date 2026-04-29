@@ -105,7 +105,7 @@ export class SettleConsumerState {
 
 @Entity("offer_orders")
 @Index("idx_offer_orders_time", ["createdAt"])
-@Index("idx_offer_orders_sequence", ["sequenceId"])
+@Index("idx_offer_orders_sequence", ["sequenceId"], { unique: true })
 export class OfferOrder {
   @PrimaryColumn({ type: "int" })
   id!: number;

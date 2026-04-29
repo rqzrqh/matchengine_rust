@@ -11,6 +11,15 @@ import type { OfferTopicMonitor } from "../services/offerTopicMonitor.js";
 import { serializeQuoteDealTick } from "../services/quoteService.js";
 import { serializeSettleMessage } from "../services/settleService.js";
 import { getInputTopicProgress } from "../inputTopicProgress.js";
+import { OfferValidationError } from "../services/offerService.js";
+
+function sendOfferError(res: Response, e: unknown): void {
+  if (e instanceof OfferValidationError) {
+    res.status(400).json({ error: e.message });
+    return;
+  }
+  res.status(500).json({ error: String(e) });
+}
 
 export function registerRoutes(
   app: Express,
@@ -42,17 +51,6 @@ export function registerRoutes(
     try {
       const { status, text } = await engineGet(
         `/markets/${encodeURIComponent(req.params.market)}/status`,
-      );
-      res.status(status).type("application/json").send(text);
-    } catch (e) {
-      res.status(502).json({ error: String(e) });
-    }
-  });
-
-  app.get("/api/markets/:market/publish-pending", async (req: Request, res: Response) => {
-    try {
-      const { status, text } = await engineGet(
-        `/markets/${encodeURIComponent(req.params.market)}/publish-pending`,
       );
       res.status(status).type("application/json").send(text);
     } catch (e) {
@@ -143,7 +141,7 @@ export function registerRoutes(
     try {
       res.json(await offerService.placeLimit(req.body as Record<string, unknown>));
     } catch (e) {
-      res.status(500).json({ error: String(e) });
+      sendOfferError(res, e);
     }
   });
 
@@ -151,7 +149,7 @@ export function registerRoutes(
     try {
       res.json(await offerService.placeMarket(req.body as Record<string, unknown>));
     } catch (e) {
-      res.status(500).json({ error: String(e) });
+      sendOfferError(res, e);
     }
   });
 
@@ -159,7 +157,7 @@ export function registerRoutes(
     try {
       res.json(await offerService.cancel(req.body as Record<string, unknown>));
     } catch (e) {
-      res.status(500).json({ error: String(e) });
+      sendOfferError(res, e);
     }
   });
 

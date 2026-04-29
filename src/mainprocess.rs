@@ -1,11 +1,14 @@
+use crate::decimal_util::parse_decimal_with_max_scale;
+use crate::engine::*;
+use crate::error::*;
 use crate::market::*;
 use crate::publish::*;
-use crate::engine::*;
-use crate::decimal_util::parse_decimal_with_max_scale;
 use json::JsonValue;
-use crate::error::*;
 
 pub fn handle_mq_message(publisher: &Publish, m: &mut Market, offset: i64, data: &String) {
+    m.oper_id += 1;
+    m.input_offset = offset;
+
     let parsed = json::parse(data).unwrap();
     debug!("{}", parsed);
 
@@ -39,6 +42,14 @@ pub fn handle_mq_message(publisher: &Publish, m: &mut Market, offset: i64, data:
         error!("market input_sequence_id overflow {}", m.input_sequence_id);
         return;
     };
+
+    if msg_seq <= m.input_sequence_id {
+        warn!(
+            "stale input_sequence_id skipped: message {} current {}",
+            msg_seq, m.input_sequence_id
+        );
+        return;
+    }
     if msg_seq != expected_seq {
         warn!(
             "input_sequence_id mismatch: message {} expected next {}",
@@ -51,8 +62,6 @@ pub fn handle_mq_message(publisher: &Publish, m: &mut Market, offset: i64, data:
     let extern_id = parsed["id"].as_u64().unwrap();
     let params = &parsed["params"];
 
-    m.oper_id += 1;
-    m.input_offset = offset;
     m.input_sequence_id = msg_seq;
 
     match method {
@@ -66,7 +75,6 @@ pub fn handle_mq_message(publisher: &Publish, m: &mut Market, offset: i64, data:
 }
 
 fn on_order_put_limit(publisher: &Publish, m: &mut Market, extern_id: u64, params: &JsonValue) {
-
     if !params.has_key("user_id") || !params["user_id"].is_number() {
         error!("user_id parse failed {}", params);
         return;
@@ -148,13 +156,23 @@ fn on_order_put_limit(publisher: &Publish, m: &mut Market, extern_id: u64, param
         }
     };
 
-    market_put_limit_order(publisher, m, extern_id, user_id, side, amount, price, taker_fee_rate, maker_fee_rate).unwrap_or_else(|e| {
+    market_put_limit_order(
+        publisher,
+        m,
+        extern_id,
+        user_id,
+        side,
+        amount,
+        price,
+        taker_fee_rate,
+        maker_fee_rate,
+    )
+    .unwrap_or_else(|e| {
         publisher.publish_error(m, extern_id, user_id, params, e);
     });
 }
 
 fn on_order_put_market(publisher: &Publish, m: &mut Market, extern_id: u64, params: &JsonValue) {
-
     if !params.has_key("user_id") || !params["user_id"].is_number() {
         error!("user_id parse failed {}", params);
         return;
@@ -206,12 +224,20 @@ fn on_order_put_market(publisher: &Publish, m: &mut Market, extern_id: u64, para
         }
     };
 
-    market_put_market_order(publisher, m, extern_id, user_id, side, amount, taker_fee_rate).unwrap_or_else(|e| {
+    market_put_market_order(
+        publisher,
+        m,
+        extern_id,
+        user_id,
+        side,
+        amount,
+        taker_fee_rate,
+    )
+    .unwrap_or_else(|e| {
         publisher.publish_error(m, extern_id, user_id, params, e);
     });
 }
 fn on_order_cancel(publisher: &Publish, m: &mut Market, extern_id: u64, params: &JsonValue) {
-
     if !params.has_key("user_id") || !params["user_id"].is_number() {
         error!("user_id parse failed {}", params);
         return;
@@ -234,23 +260,26 @@ fn on_order_cancel(publisher: &Publish, m: &mut Market, extern_id: u64, params: 
             if order.side == MARKET_ORDER_SIDE_ASK {
                 m.stock_amount -= order.left.get();
             } else {
-                m.money_amount -= order.price*order.left.get();
+                m.money_amount -= order.price * order.left.get();
             }
             m.order_finish(&order.clone());
-        },
+        }
         None => {
             publisher.publish_error(m, extern_id, user_id, params, MATCH_ERROR_ORDER_NOT_FOUND);
         }
     }
 }
 
-pub fn update_quote_progress(m: &mut Market, quote_deals_id: u64) {
-    m.quote_deals_id = quote_deals_id;
+pub fn update_quote_progress(m: &mut Market, pushed_quote_deals_id: u64) {
+    m.pushed_quote_deals_id = pushed_quote_deals_id;
 
-    debug!("quote_deals_id={}", quote_deals_id);
+    debug!("pushed_quote_deals_id={}", pushed_quote_deals_id);
 }
 
-pub fn update_settle_progress(m: &mut Market, group_id: usize, message_id: u64) {
-    m.settle_message_ids[group_id] = message_id;
-    debug!("settle_message_ids={:?}", m.settle_message_ids);
+pub fn update_settle_progress(m: &mut Market, group_id: usize, pushed_settle_message_id: u64) {
+    m.pushed_settle_message_ids[group_id] = pushed_settle_message_id;
+    debug!(
+        "pushed_settle_message_ids={:?}",
+        m.pushed_settle_message_ids
+    );
 }

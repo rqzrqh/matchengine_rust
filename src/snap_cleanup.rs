@@ -25,13 +25,14 @@ pub(crate) fn prune_snapshots(pool: &Pool, age_secs: u64, max_keep: u32) {
         }
     };
 
-    let rows: Vec<(u64, i64)> = match conn.query("SELECT `id`, `time` FROM `snap` ORDER BY `time` ASC") {
-        Ok(r) => r,
-        Err(e) => {
-            error!("snap retention: list snaps: {}", e);
-            return;
-        }
-    };
+    let rows: Vec<(u64, i64)> =
+        match conn.query("SELECT `id`, `time` FROM `snap` ORDER BY `time` ASC") {
+            Ok(r) => r,
+            Err(e) => {
+                error!("snap retention: list snaps: {}", e);
+                return;
+            }
+        };
 
     if rows.is_empty() {
         return;

@@ -30,6 +30,7 @@ CREATE TABLE `snap` (
 	`input_sequence_id` BIGINT UNSIGNED NOT NULL DEFAULT '0',
 	`asks`   			INT UNSIGNED NOT NULL,
 	`bids`   			INT UNSIGNED NOT NULL,
+	`settle_message_ids` TEXT NOT NULL,
 	`pushed_quote_deals_id`    BIGINT UNSIGNED NOT NULL,
 	`pushed_settle_message_ids` TEXT NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;

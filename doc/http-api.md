@@ -35,8 +35,10 @@
 | `name` | string | 市场名 |
 | `ask_count` | number | 卖单（asks）条数 |
 | `bid_count` | number | 买单（bids）条数 |
-| `ask_amount` | string | 所有卖单 `left` 之和（十进制字符串，经 `stock_prec` 定标） |
-| `bid_amount` | string | 所有买单 `left` 之和（十进制字符串，经 `stock_prec` 定标） |
+| `ask_stock_amount` | string | 总卖 stock 的量，即所有卖单 `left` 之和 |
+| `ask_money_amount` | string | 总卖 token 量乘以价格的总金额，即所有卖单 `price * left` 之和 |
+| `bid_stock_amount` | string | 总买 stock 的量，即所有买单 `left` 之和 |
+| `bid_money_amount` | string | 总买 stock 的量乘以价格的总金额，即所有买单 `price * left` 之和 |
 
 ---
 

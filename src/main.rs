@@ -1,29 +1,31 @@
-use std::{thread, net::SocketAddr, str, sync::mpsc, env, process, time::Duration};
-use rdkafka::consumer::StreamConsumer;
-use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
-use rdkafka::consumer::Consumer;
 use rdkafka::config::RDKafkaLogLevel;
-use uuid::{uuid, Uuid};
+use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::consumer::StreamConsumer;
+use rdkafka::util::Timeout;
+use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
+use std::{env, net::SocketAddr, process, str, sync::mpsc, thread, time::Duration};
+use uuid::Uuid;
 
-use rust_decimal::prelude::*;
-use mysql::*;
 use chrono::prelude::*;
-#[macro_use] extern crate log;
+use mysql::*;
+use rust_decimal::prelude::*;
+#[macro_use]
+extern crate log;
 extern crate process_lock;
 use process_lock::*;
 
 mod config;
-mod decimal_util;
-mod error;
-mod engine;
-mod market;
-mod publish;
-mod dump;
 mod correct_snap;
-mod snap_cleanup;
+mod decimal_util;
+mod dump;
+mod engine;
+mod error;
+mod http;
 mod load;
 mod mainprocess;
-mod http;
+mod market;
+mod publish;
+mod snap_cleanup;
 mod task;
 
 // Runtime layout (one OS process, one market):
@@ -34,33 +36,78 @@ mod task;
 // - Timer thread: periodic `DumpTask` to fork snapshot writers.
 // - Snapshot cleanup thread: periodic `prune_snapshots` against MySQL.
 
-async fn start_httpserver(
-    main_routine_sender: mpsc::Sender<task::Task>,
-    market_name: String,
-    publish_backlog: std::sync::Arc<publish::PublishBacklog>,
-    addr: SocketAddr,
-) {
+async fn start_httpserver(main_routine_sender: mpsc::Sender<task::Task>, addr: SocketAddr) {
     http::serve_engine_http(
         addr,
         http::EngineHttpState {
             main_routine_sender,
-            market_name,
-            publish_backlog,
         },
     )
     .await;
 }
 
 fn init_logging() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .format_timestamp_millis()
-    .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
+}
+
+fn kafka_partition_count(brokers: &str, topic: &str) -> Result<usize, String> {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set(
+            "group.id",
+            format!("match-startup-check-{}", Uuid::new_v4()),
+        )
+        .set("enable.auto.commit", "false")
+        .create()
+        .map_err(|e| format!("create Kafka metadata client failed: {}", e))?;
+
+    let metadata = consumer
+        .fetch_metadata(Some(topic), Timeout::After(Duration::from_secs(5)))
+        .map_err(|e| format!("fetch Kafka metadata for topic {} failed: {}", topic, e))?;
+
+    let topic_meta = metadata
+        .topics()
+        .iter()
+        .find(|x| x.name() == topic)
+        .ok_or_else(|| format!("Kafka topic {} not found", topic))?;
+
+    if let Some(e) = topic_meta.error() {
+        return Err(format!("Kafka topic {} metadata error: {:?}", topic, e));
+    }
+
+    Ok(topic_meta.partitions().len())
+}
+
+fn validate_kafka_topics(
+    brokers: &str,
+    input_topic: &str,
+    quote_topic: &str,
+    settle_group_count: usize,
+) -> Result<(), String> {
+    let input_partitions = kafka_partition_count(brokers, input_topic)?;
+    if input_partitions == 0 {
+        return Err(format!("Kafka topic {} has no partitions", input_topic));
+    }
+
+    let quote_partitions = kafka_partition_count(brokers, quote_topic)?;
+    if quote_partitions == 0 {
+        return Err(format!("Kafka topic {} has no partitions", quote_topic));
+    }
+
+    let settle_partitions = kafka_partition_count(brokers, "settle")?;
+    if settle_partitions < settle_group_count {
+        return Err(format!(
+            "Kafka topic settle has {} partition(s), but matcher requires at least {} because user settle group size is {}; recreate it with deploy/kafka_settle.sh",
+            settle_partitions, settle_group_count, settle_group_count
+        ));
+    }
+
+    Ok(())
 }
 
 fn main() {
-
     init_logging();
 
     let args: Vec<String> = env::args().collect();
@@ -100,8 +147,20 @@ fn main() {
     );
 
     let input_topic = format!("offer.{}", market_name);
+    let quote_topic = format!("quote_deals.{}", market_name);
 
-    let mut lock = ProcessLock::new(String::from(format!("matchengine.{}", market_name)), None).unwrap();    
+    if let Err(e) = validate_kafka_topics(
+        &brokers,
+        &input_topic,
+        &quote_topic,
+        market::USER_SETTLE_GROUP_SIZE,
+    ) {
+        error!("Kafka topic validation failed: {}", e);
+        process::exit(1);
+    }
+
+    let mut lock =
+        ProcessLock::new(String::from(format!("matchengine.{}", market_name)), None).unwrap();
     let guard = lock.trylock().unwrap_or_else(|e| {
         error!("get process lock failed {}", e.to_string());
         process::exit(0);
@@ -114,7 +173,10 @@ fn main() {
 
     let mut mk = market::Market::new(&market_name, stock_prec, money_prec, fee_prec, &min_amount);
 
-    let url = format!("mysql://{}:{}@{}/{}", db_user, db_passwd, db_addr, market_name);
+    let url = format!(
+        "mysql://{}:{}@{}/{}",
+        db_user, db_passwd, db_addr, market_name
+    );
     let ops = Opts::from_url(url.as_str()).unwrap();
     let pool = Pool::new(ops).unwrap();
 
@@ -122,13 +184,17 @@ fn main() {
 
     let pool_snap_cleanup = pool.clone();
     let snap_cleanup_cfg = cfg.snap_cleanup.clone();
-    let _snap_cleanup_thread = thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(snap_cleanup_cfg.cleanup_interval_secs.max(1)));
-        snap_cleanup::prune_snapshots(
-            &pool_snap_cleanup,
-            snap_cleanup_cfg.max_age_secs,
-            snap_cleanup_cfg.max_snapshots,
-        );
+    let _snap_cleanup_thread = thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(
+                snap_cleanup_cfg.cleanup_interval_secs.max(1),
+            ));
+            snap_cleanup::prune_snapshots(
+                &pool_snap_cleanup,
+                snap_cleanup_cfg.max_age_secs,
+                snap_cleanup_cfg.max_snapshots,
+            );
+        }
     });
 
     let (main_routine_sender, main_routine_receiver) = mpsc::channel();
@@ -136,23 +202,16 @@ fn main() {
     let publisher = publish::Publish::new(
         brokers.clone(),
         main_routine_sender.clone(),
-        mk.quote_deals_id,
-        mk.settle_message_ids.to_vec(),
+        mk.pushed_quote_deals_id,
+        mk.pushed_settle_message_ids.to_vec(),
         output_publish_cfg.batch_size,
         output_publish_cfg.linger_ms,
     );
 
     let main_routine_sender_http_clone = main_routine_sender.clone();
-    let market_name_http = market_name.clone();
-    let publish_backlog_http = publisher.backlog();
     let http_thread = thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        rt.block_on(start_httpserver(
-            main_routine_sender_http_clone,
-            market_name_http,
-            publish_backlog_http,
-            http_addr,
-        ));
+        rt.block_on(start_httpserver(main_routine_sender_http_clone, http_addr));
     });
 
     let main_routine_sender_mq_clone = main_routine_sender.clone();
@@ -166,8 +225,7 @@ fn main() {
         .unwrap();
 
     let consumer_handler = consumer_rt.spawn(async move {
-
-        let consumer:StreamConsumer = ClientConfig::new()
+        let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", brokers_clone2)
             .set("enable.partition.eof", "false")
             // Unique group id per run so this process reads the full topic from the assigned offset.
@@ -186,7 +244,6 @@ fn main() {
         consumer.assign(&tpl).expect("failed to assign");
 
         loop {
-
             match consumer.recv().await {
                 Ok(message) => {
                     debug!(
@@ -194,15 +251,21 @@ fn main() {
                         message.topic(),
                         message.partition(),
                         message.offset(),
-                        message.payload().map(|p| String::from_utf8_lossy(p).into_owned())
+                        message
+                            .payload()
+                            .map(|p| String::from_utf8_lossy(p).into_owned())
                     );
 
                     let task = task::KafkaMqTask {
-                            offset: message.offset(),
-                            data: message.payload().map(|p| String::from_utf8_lossy(p).to_string()).unwrap(),
+                        offset: message.offset(),
+                        data: message
+                            .payload()
+                            .map(|p| String::from_utf8_lossy(p).to_string())
+                            .unwrap(),
                     };
-                    main_routine_sender_mq_clone.send(task::Task::MqTask(task)).expect("send mqtask failed");
-
+                    main_routine_sender_mq_clone
+                        .send(task::Task::MqTask(task))
+                        .expect("send mqtask failed");
                 }
                 Err(e) => {
                     error!("consume failed {}", e);
@@ -217,10 +280,12 @@ fn main() {
         loop {
             thread::sleep(Duration::from_secs(dump_every_secs));
             let now = Utc::now();
-            let task = task::SqlDumpTask{
+            let task = task::SqlDumpTask {
                 tm: now.timestamp(),
             };
-            main_routine_sender_timer_clone.send(task::Task::DumpTask(task)).expect("send dumptask failed");
+            main_routine_sender_timer_clone
+                .send(task::Task::DumpTask(task))
+                .expect("send dumptask failed");
         }
     });
 
@@ -230,24 +295,28 @@ fn main() {
         match task {
             task::Task::MqTask(t) => {
                 mainprocess::handle_mq_message(&publisher, &mut mk, t.offset, &t.data);
-            },
+            }
             task::Task::HttpRequest(a) => {
                 let res = http::handle_http_request(&mk, a.op);
                 let _ = a.rsp.send(res);
-            },
+            }
             task::Task::DumpTask(b) => {
                 dump::handle_dump(&mut mk, b.tm, url.as_str());
-            },
+            }
             task::Task::QuoteProgressUpdateTask(t) => {
-                mainprocess::update_quote_progress(&mut mk, t.quote_deals_id);
+                mainprocess::update_quote_progress(&mut mk, t.pushed_quote_deals_id);
             }
             task::Task::SettleProgressUpdateTask(t) => {
-                mainprocess::update_settle_progress(&mut mk, t.group_id, t.message_id);
+                mainprocess::update_settle_progress(
+                    &mut mk,
+                    t.group_id,
+                    t.pushed_settle_message_id,
+                );
             }
             task::Task::Terminate => {
                 warn!("terminate and exit");
                 break;
-            },
+            }
         }
     }
 

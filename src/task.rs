@@ -7,9 +7,16 @@ pub struct KafkaMqTask {
 
 #[derive(Debug)]
 pub enum HttpOp {
-    MarketSummary { market: String },
-    MarketStatus { market: String },
-    OrderDetail { market: String, order_id: u64 },
+    MarketSummary {
+        market: String,
+    },
+    MarketStatus {
+        market: String,
+    },
+    OrderDetail {
+        market: String,
+        order_id: u64,
+    },
     OrderBook {
         market: String,
         side: u32,
@@ -40,12 +47,12 @@ pub struct SqlDumpTask {
 }
 
 pub struct QuotePublishProgressTask {
-    pub quote_deals_id: u64,
+    pub pushed_quote_deals_id: u64,
 }
 
 pub struct SettlePublishProgressTask {
     pub group_id: usize,
-    pub message_id: u64,
+    pub pushed_settle_message_id: u64,
 }
 
 pub enum Task {

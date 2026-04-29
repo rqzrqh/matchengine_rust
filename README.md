@@ -85,7 +85,6 @@ REST surface on the engine (the UI calls these from the browser; web-test also i
 
 - `GET /markets/:market/summary`
 - `GET /markets/:market/status`
-- `GET /markets/:market/publish-pending`
 - `GET /markets/:market/orders/:order_id`
 - `GET /markets/:market/order-book?side=&offset=&limit=`
 - `GET /markets/:market/users/:user_id/orders?offset=&limit=`

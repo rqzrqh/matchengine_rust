@@ -15,14 +15,61 @@ pub(crate) struct SnapStateForRestore {
     pub(crate) input_sequence_id: u64,
     pub(crate) asks: u32,
     pub(crate) bids: u32,
+    pub(crate) settle_message_ids: [u64; USER_SETTLE_GROUP_SIZE],
 }
 
 struct Anchor {
     newest_id: u64,
     first_bound: u64,
-    quote_deals_id: u64,
-    min_settle_msg: u64,
-    settle_message_ids: [u64; USER_SETTLE_GROUP_SIZE],
+    pushed_quote_deals_id: u64,
+    pushed_settle_message_ids: [u64; USER_SETTLE_GROUP_SIZE],
+}
+
+fn parse_settle_message_ids(
+    raw: &str,
+    field: &str,
+    verbose: bool,
+) -> [u64; USER_SETTLE_GROUP_SIZE] {
+    let parsed = json::parse(raw).expect("json decode failed");
+    if verbose {
+        info!("{}", parsed);
+    }
+    if !parsed.is_array() {
+        error!("{} is not array {}", field, parsed);
+        process::exit(0);
+    }
+    if parsed.len() != USER_SETTLE_GROUP_SIZE {
+        error!(
+            "{} length not equal expected {} (got {})",
+            field,
+            USER_SETTLE_GROUP_SIZE,
+            parsed.len()
+        );
+        process::exit(0);
+    }
+
+    std::array::from_fn(|i| parsed[i].as_u64().unwrap())
+}
+
+fn settle_ids_within_pushed(
+    snapshot_ids: &[u64; USER_SETTLE_GROUP_SIZE],
+    pushed_ids: &[u64; USER_SETTLE_GROUP_SIZE],
+) -> bool {
+    snapshot_ids
+        .iter()
+        .zip(pushed_ids.iter())
+        .all(|(snapshot_id, pushed_id)| snapshot_id <= pushed_id)
+}
+
+fn snapshot_output_within_pushed(
+    row: &SnapStateForRestore,
+    pushed_quote_deals_id: u64,
+    pushed_settle_message_ids: &[u64; USER_SETTLE_GROUP_SIZE],
+) -> (bool, bool) {
+    (
+        row.deals_id <= pushed_quote_deals_id,
+        settle_ids_within_pushed(&row.settle_message_ids, pushed_settle_message_ids),
+    )
 }
 
 fn read_anchor_from_db(pool: &Pool, verbose: bool) -> Option<Anchor> {
@@ -30,7 +77,7 @@ fn read_anchor_from_db(pool: &Pool, verbose: bool) -> Option<Anchor> {
     let row: Option<(u64, u64, String)> = conn
         .query_first("SELECT `id`, `pushed_quote_deals_id`, `pushed_settle_message_ids` from `snap` ORDER BY `id` DESC LIMIT 1")
         .unwrap();
-    let (id, quote_deals_id, settle_json) = match row {
+    let (id, pushed_quote_deals_id, settle_json) = match row {
         Some(r) => r,
         None => {
             if verbose {
@@ -40,55 +87,38 @@ fn read_anchor_from_db(pool: &Pool, verbose: bool) -> Option<Anchor> {
         }
     };
 
-    let parsed = json::parse(&settle_json).expect("json decode failed");
-    if verbose {
-        info!("{}", parsed);
-    }
-    if !parsed.is_array() {
-        error!("settle_message_ids is not array {}", parsed);
-        process::exit(0);
-    }
-    if parsed.len() != USER_SETTLE_GROUP_SIZE {
-        error!(
-            "settle message ids length not equal expected {} (got {})",
-            USER_SETTLE_GROUP_SIZE,
-            parsed.len()
-        );
-        process::exit(0);
-    }
-
-    let settle_message_ids =
-        std::array::from_fn(|i| parsed[i].as_u64().unwrap());
-    let mut sorted = settle_message_ids;
-    sorted.sort_unstable();
-    let min_settle_msg = sorted.iter().copied().find(|&x| x != 0).unwrap_or(0);
+    let pushed_settle_message_ids =
+        parse_settle_message_ids(&settle_json, "pushed_settle_message_ids", verbose);
 
     if verbose {
         info!(
-            "output state id:{} quote_deals_id:{} min_settle_message_id:{}",
-            id, quote_deals_id, min_settle_msg
+            "output state id:{} pushed_quote_deals_id:{} pushed_settle_message_ids:{:?}",
+            id, pushed_quote_deals_id, pushed_settle_message_ids
         );
     }
 
     Some(Anchor {
         newest_id: id,
         first_bound: id + 1,
-        quote_deals_id,
-        min_settle_msg,
-        settle_message_ids,
+        pushed_quote_deals_id,
+        pushed_settle_message_ids,
     })
 }
 
-fn load_snap_row(conn: &mut PooledConn, last_bound: u64, verbose: bool) -> Option<SnapStateForRestore> {
+fn load_snap_row(
+    conn: &mut PooledConn,
+    last_bound: u64,
+    verbose: bool,
+) -> Option<SnapStateForRestore> {
     let sql = format!(
-        "SELECT `id`, `time`, `oper_id`, `order_id`, `deals_id`, `message_id`, `input_offset`, `input_sequence_id`, `asks`, `bids` from `snap` WHERE `id` < {} ORDER BY `id` DESC LIMIT 1",
+        "SELECT `id`, `time`, `oper_id`, `order_id`, `deals_id`, `message_id`, `input_offset`, `input_sequence_id`, `asks`, `bids`, `settle_message_ids` from `snap` WHERE `id` < {} ORDER BY `id` DESC LIMIT 1",
         last_bound
     );
     if verbose {
         info!("{}", sql);
     }
-    conn.query_first(&sql).unwrap().map(|v: (u64, i64, u64, u64, u64, u64, i64, u64, u32, u32)| {
-        SnapStateForRestore {
+    conn.query_first(&sql).unwrap().map(
+        |v: (u64, i64, u64, u64, u64, u64, i64, u64, u32, u32, String)| SnapStateForRestore {
             id: v.0,
             time: v.1,
             oper_id: v.2,
@@ -99,8 +129,9 @@ fn load_snap_row(conn: &mut PooledConn, last_bound: u64, verbose: bool) -> Optio
             input_sequence_id: v.7,
             asks: v.8,
             bids: v.9,
-        }
-    })
+            settle_message_ids: parse_settle_message_ids(&v.10, "settle_message_ids", verbose),
+        },
+    )
 }
 
 #[derive(Default)]
@@ -112,30 +143,42 @@ struct RetentionTrace {
 
 impl RetentionTrace {
     fn from_anchor(a: &Anchor) -> Self {
-        let nz = a.settle_message_ids.iter().filter(|&&x| x != 0).count();
+        let nz = a
+            .pushed_settle_message_ids
+            .iter()
+            .filter(|&&x| x != 0)
+            .count();
         Self {
             snap_empty: false,
             anchor_line: format!(
-                "snap restore trace (retention): newest_snap_id={} first_bound(id<{}) anchor_Q={} anchor_M={} nonzero_settle_slots={}/{}",
-                a.newest_id, a.first_bound, a.quote_deals_id, a.min_settle_msg, nz, USER_SETTLE_GROUP_SIZE
+                "snap restore trace (retention): newest_snap_id={} first_bound(id<{}) anchor_Q={} nonzero_pushed_settle_slots={}/{}",
+                a.newest_id, a.first_bound, a.pushed_quote_deals_id, nz, USER_SETTLE_GROUP_SIZE
             ),
             steps: Vec::new(),
         }
     }
 
-    fn push_scan_step(&mut self, step: usize, bound: u64, q: u64, m: u64, row: Option<&SnapStateForRestore>) {
+    fn push_scan_step(
+        &mut self,
+        step: usize,
+        bound: u64,
+        q: u64,
+        pushed_settle_message_ids: &[u64; USER_SETTLE_GROUP_SIZE],
+        row: Option<&SnapStateForRestore>,
+    ) {
         let line = match row {
             None => format!("snap restore trace: step {step} — WHERE id < {bound} → no row"),
             Some(r) => {
-                let (d_over, m_over) = (r.deals_id > q, r.message_id > m);
-                let tag = match (d_over, m_over) {
-                    (false, false) => "accept",
-                    (true, true) => "reject: deals & message over anchor",
-                    (true, false) => "reject: deals over anchor_Q",
-                    (false, true) => "reject: message over anchor_M",
+                let (deal_pushed, settle_pushed) =
+                    snapshot_output_within_pushed(r, q, pushed_settle_message_ids);
+                let tag = match (deal_pushed, settle_pushed) {
+                    (true, true) => "accept",
+                    (false, false) => "reject: deals & settle not pushed",
+                    (false, true) => "reject: deals not pushed",
+                    (true, false) => "reject: settle not pushed",
                 };
                 format!(
-                    "snap restore trace: step {step} — WHERE id < {bound} → id={} deals_id={} message_id={} | deals_over={d_over} (>{q}) msg_over={m_over} (>{m}) → {tag}",
+                    "snap restore trace: step {step} — WHERE id < {bound} → id={} deals_id={} message_id={} | deal_pushed={deal_pushed} (<= {q}) settle_pushed={settle_pushed} → {tag}",
                     r.id, r.deals_id, r.message_id
                 )
             }
@@ -152,13 +195,15 @@ impl RetentionTrace {
         for line in &self.steps {
             warn!("{}", line);
         }
-        warn!("snap restore trace: no row satisfies deals_id <= anchor_Q AND message_id <= anchor_M from newest row; cleanup skipped");
+        warn!(
+            "snap restore trace: no row satisfies deals_id <= anchor_Q AND settle_message_ids <= pushed_settle_message_ids from newest row; cleanup skipped"
+        );
     }
 }
 
 pub(crate) struct CorrectRestoreSnap {
-    pub(crate) quote_deals_id: u64,
-    pub(crate) settle_message_ids: [u64; USER_SETTLE_GROUP_SIZE],
+    pub(crate) pushed_quote_deals_id: u64,
+    pub(crate) pushed_settle_message_ids: [u64; USER_SETTLE_GROUP_SIZE],
     pub(crate) chosen: Option<SnapStateForRestore>,
     pub(crate) asks: u32,
     pub(crate) bids: u32,
@@ -188,8 +233,8 @@ fn find_correct_restore_snap_impl(
     }
 
     let mut conn = pool.get_conn().unwrap();
-    let q = anchor.quote_deals_id;
-    let m = anchor.min_settle_msg;
+    let q = anchor.pushed_quote_deals_id;
+    let pushed_settle_message_ids = anchor.pushed_settle_message_ids;
     let mut last_bound = anchor.first_bound;
     let mut asks = 0u32;
     let mut bids = 0u32;
@@ -204,32 +249,46 @@ fn find_correct_restore_snap_impl(
                 if verbose {
                     info!(
                         "found snap id:{} time:{} oper_id:{} order_id:{} deals_id:{} message_id:{} input_offset:{} input_sequence_id:{} asks:{} bids:{}",
-                        row.id, row.time, row.oper_id, row.order_id, row.deals_id, row.message_id,
-                        row.input_offset, row.input_sequence_id, row.asks, row.bids
+                        row.id,
+                        row.time,
+                        row.oper_id,
+                        row.order_id,
+                        row.deals_id,
+                        row.message_id,
+                        row.input_offset,
+                        row.input_sequence_id,
+                        row.asks,
+                        row.bids
                     );
                 }
                 asks = row.asks;
                 bids = row.bids;
-                let deals_over = row.deals_id > q;
-                let msg_over = row.message_id > m;
+                let (deal_pushed, settle_pushed) =
+                    snapshot_output_within_pushed(&row, q, &pushed_settle_message_ids);
                 if let Some(t) = trace.as_mut() {
-                    t.push_scan_step(step, bound, q, m, Some(&row));
+                    t.push_scan_step(step, bound, q, &pushed_settle_message_ids, Some(&row));
                 }
                 if verbose {
-                    if deals_over {
+                    if !deal_pushed {
                         info!("deals_id not meet condition {} {}", row.deals_id, q);
                     }
-                    if msg_over {
-                        info!("message_id not meet condition {} {}", row.message_id, m);
+                    if !settle_pushed {
+                        info!(
+                            "settle_message_ids not meet condition {:?}",
+                            row.settle_message_ids
+                        );
                     }
                 }
-                if deals_over || msg_over {
+                if !deal_pushed || !settle_pushed {
                     last_bound = row.id;
                     continue;
                 }
                 if verbose {
                     info!("deals_id meet condition {} {}", row.deals_id, q);
-                    info!("message_id meet condition {} {}", row.message_id, m);
+                    info!(
+                        "settle_message_ids meet condition {:?}",
+                        row.settle_message_ids
+                    );
                 }
                 chosen = Some(row);
                 break;
@@ -239,7 +298,7 @@ fn find_correct_restore_snap_impl(
                     info!("not found snap");
                 }
                 if let Some(t) = trace.as_mut() {
-                    t.push_scan_step(step, bound, q, m, None);
+                    t.push_scan_step(step, bound, q, &pushed_settle_message_ids, None);
                 }
                 break;
             }
@@ -247,8 +306,8 @@ fn find_correct_restore_snap_impl(
     }
 
     Some(CorrectRestoreSnap {
-        quote_deals_id: anchor.quote_deals_id,
-        settle_message_ids: anchor.settle_message_ids,
+        pushed_quote_deals_id: anchor.pushed_quote_deals_id,
+        pushed_settle_message_ids: anchor.pushed_settle_message_ids,
         chosen,
         asks,
         bids,
@@ -266,4 +325,62 @@ pub(crate) fn correct_restore_snap_row_id(pool: &Pool) -> Option<u64> {
         t.log();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap_with_outputs(
+        deals_id: u64,
+        settle_message_ids: [u64; USER_SETTLE_GROUP_SIZE],
+    ) -> SnapStateForRestore {
+        SnapStateForRestore {
+            id: 1,
+            time: 0,
+            oper_id: 0,
+            order_id: 0,
+            deals_id,
+            message_id: 0,
+            input_offset: 0,
+            input_sequence_id: 0,
+            asks: 0,
+            bids: 0,
+            settle_message_ids,
+        }
+    }
+
+    #[test]
+    fn settle_ids_are_within_pushed_when_all_snapshot_ids_are_not_greater() {
+        let mut snapshot_ids = [3; USER_SETTLE_GROUP_SIZE];
+        let pushed_ids = [3; USER_SETTLE_GROUP_SIZE];
+        assert!(settle_ids_within_pushed(&snapshot_ids, &pushed_ids));
+
+        snapshot_ids[7] = 4;
+        assert!(!settle_ids_within_pushed(&snapshot_ids, &pushed_ids));
+    }
+
+    #[test]
+    fn snapshot_output_within_pushed_checks_quote_and_settle_ids() {
+        let pushed_settle_message_ids = [8; USER_SETTLE_GROUP_SIZE];
+        let row = snap_with_outputs(5, [8; USER_SETTLE_GROUP_SIZE]);
+        assert_eq!(
+            snapshot_output_within_pushed(&row, 5, &pushed_settle_message_ids),
+            (true, true)
+        );
+
+        let row = snap_with_outputs(6, [8; USER_SETTLE_GROUP_SIZE]);
+        assert_eq!(
+            snapshot_output_within_pushed(&row, 5, &pushed_settle_message_ids),
+            (false, true)
+        );
+
+        let mut settle_message_ids = [8; USER_SETTLE_GROUP_SIZE];
+        settle_message_ids[13] = 9;
+        let row = snap_with_outputs(5, settle_message_ids);
+        assert_eq!(
+            snapshot_output_within_pushed(&row, 5, &pushed_settle_message_ids),
+            (true, false)
+        );
+    }
 }

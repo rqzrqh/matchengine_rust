@@ -1,5 +1,6 @@
 import { getDb } from "../db.js";
 import { OfferDispatchState, OfferOrder } from "../db/entities.js";
+import { unixSecondsNow } from "../time.js";
 
 const BATCH_SIZE = Math.min(
   500,
@@ -12,7 +13,8 @@ const TICK_MS = Math.min(
 
 /**
  * Assigns monotonic `sequence_id` to rows where it is still null, ordered by `offer_orders.id`.
- * Uses only `offer_dispatch_state.last_sequence_id`: next assigned id is `last_sequence_id + 1`, then +2, …
+ * Advances `offer_dispatch_state.last_sequence_id` in the same transaction so concurrent/frequent
+ * order inserts cannot reuse an already assigned sequence id.
  */
 export class OfferSequenceService {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -40,6 +42,14 @@ export class OfferSequenceService {
       for (const row of pending) {
         await em.update(OfferOrder, { id: row.id }, { sequenceId: next });
         next += 1;
+      }
+
+      if (next > base + 1) {
+        await em.update(
+          OfferDispatchState,
+          { id: 1 },
+          { lastSequenceId: next - 1, updatedAt: unixSecondsNow() },
+        );
       }
     });
   }

@@ -1,22 +1,22 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::cell::Cell;
 
 use json::*;
+use rust_decimal::prelude::*;
 use skiplist::OrderedSkipList;
 use std::cmp::Ordering;
-use rust_decimal::prelude::*;
 
-pub static MARKET_ORDER_TYPE_LIMIT:u32 = 1;
-pub static MARKET_ORDER_TYPE_MARKET:u32 = 2;
+pub static MARKET_ORDER_TYPE_LIMIT: u32 = 1;
+pub static MARKET_ORDER_TYPE_MARKET: u32 = 2;
 
-pub static MARKET_ORDER_SIDE_ASK:u32 = 1;
-pub static MARKET_ORDER_SIDE_BID:u32 = 2;
+pub static MARKET_ORDER_SIDE_ASK: u32 = 1;
+pub static MARKET_ORDER_SIDE_BID: u32 = 2;
 
-pub static MARKET_ROLE_MAKER:u32 = 1;
-pub static MARKET_ROLE_TAKER:u32 = 2;
+pub static MARKET_ROLE_MAKER: u32 = 1;
+pub static MARKET_ROLE_TAKER: u32 = 2;
 
-pub static USER_SETTLE_GROUP_SIZE:usize = 64;
+pub static USER_SETTLE_GROUP_SIZE: usize = 64;
 
 pub struct Order {
     pub id: u64,
@@ -62,7 +62,6 @@ impl Order {
 
 impl PartialOrd for Order {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-
         if self.id == other.id {
             Some(Ordering::Equal)
         } else {
@@ -83,14 +82,13 @@ impl PartialOrd for Order {
     }
 }
 
-impl PartialEq for Order { 
+impl PartialEq for Order {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
 pub struct Market {
-
     pub name: String,
     pub stock_prec: u32,
     pub money_prec: u32,
@@ -110,14 +108,15 @@ pub struct Market {
     pub order_id: u64,
     pub deals_id: u64,
     pub message_id: u64,
+    pub settle_message_ids: [u64; USER_SETTLE_GROUP_SIZE],
 
     // state
     pub asks: OrderedSkipList<Rc<Order>>,
     pub bids: OrderedSkipList<Rc<Order>>,
 
     // output state
-    pub quote_deals_id: u64,
-    pub settle_message_ids: [u64;USER_SETTLE_GROUP_SIZE],
+    pub pushed_quote_deals_id: u64,
+    pub pushed_settle_message_ids: [u64; USER_SETTLE_GROUP_SIZE],
 }
 
 impl Market {
@@ -127,7 +126,23 @@ impl Market {
         self.money_prec - self.stock_prec
     }
 
-    pub fn new(name:&String, stock_prec: u32, money_prec: u32, fee_rate: u32, min_amount: &Decimal) -> Market {
+    pub fn settle_group_id(user_id: u32) -> usize {
+        user_id as usize % USER_SETTLE_GROUP_SIZE
+    }
+
+    pub fn next_settle_message_id(&mut self, user_id: u32) -> u64 {
+        let group_id = Self::settle_group_id(user_id);
+        self.settle_message_ids[group_id] += 1;
+        self.settle_message_ids[group_id]
+    }
+
+    pub fn new(
+        name: &String,
+        stock_prec: u32,
+        money_prec: u32,
+        fee_rate: u32,
+        min_amount: &Decimal,
+    ) -> Market {
         Market {
             oper_id: 0,
             order_id: 0,
@@ -135,7 +150,7 @@ impl Market {
             message_id: 0,
             input_offset: -1,
             input_sequence_id: 0,
-            name : name.clone(),
+            name: name.clone(),
             stock_prec: stock_prec,
             money_prec: money_prec,
             fee_rate_prec: fee_rate,
@@ -148,8 +163,9 @@ impl Market {
             stock_amount: Decimal::ZERO,
             money_amount: Decimal::ZERO,
 
-            quote_deals_id: 0,
+            pushed_quote_deals_id: 0,
             settle_message_ids: [0; USER_SETTLE_GROUP_SIZE],
+            pushed_settle_message_ids: [0; USER_SETTLE_GROUP_SIZE],
         }
     }
 
@@ -175,11 +191,14 @@ impl Market {
         if order.side == MARKET_ORDER_SIDE_ASK {
             self.stock_amount = self.stock_amount + order.left.get();
         } else {
-            self.money_amount = self.money_amount + (order.price*order.left.get());
+            self.money_amount = self.money_amount + (order.price * order.left.get());
         }
 
         self.orders.insert(order.id, order.clone());
-        self.users.entry(order.user_id).or_insert_with(|| OrderedSkipList::new()).insert(order.clone());
+        self.users
+            .entry(order.user_id)
+            .or_insert_with(|| OrderedSkipList::new())
+            .insert(order.clone());
 
         if order.side == MARKET_ORDER_SIDE_ASK {
             self.asks.insert(order);
@@ -190,7 +209,6 @@ impl Market {
     }
 
     pub fn order_finish(&mut self, order: &Rc<Order>) {
-
         let side = order.side;
 
         if side == MARKET_ORDER_SIDE_ASK {

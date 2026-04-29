@@ -1,13 +1,19 @@
-use crate::correct_snap::{find_correct_restore_snap, SnapStateForRestore};
+use crate::correct_snap::{SnapStateForRestore, find_correct_restore_snap};
 use crate::decimal_util::parse_decimal_with_max_scale;
 use crate::market::*;
-use mysql::*;
-use mysql::prelude::*;
 use core::panic;
-use std::rc::Rc;
+use mysql::prelude::*;
+use mysql::*;
 use std::cell::Cell;
+use std::rc::Rc;
 
-fn restore_decimal_or_panic(raw: &str, prec: u32, field: &str, table: &str, order_id: u64) -> rust_decimal::Decimal {
+fn restore_decimal_or_panic(
+    raw: &str,
+    prec: u32,
+    field: &str,
+    table: &str,
+    order_id: u64,
+) -> rust_decimal::Decimal {
     parse_decimal_with_max_scale(raw, prec, field).unwrap_or_else(|e| {
         panic!(
             "restore failed: table={} order_id={} field={} error={}",
@@ -24,15 +30,34 @@ fn load_order(m: &mut Market, conn: &mut PooledConn, timestamp: i64) {
     info!("restore loading orders: table={}", table);
 
     loop {
-        let sql1 = format!("SELECT `id`, `t`, `side`, `create_time`, `update_time`, `user_id`,
+        let sql1 = format!(
+            "SELECT `id`, `t`, `side`, `create_time`, `update_time`, `user_id`,
             `price`, `amount`, `taker_fee_rate`, `maker_fee_rate`, `left`, `deal_stock` FROM `{}` 
-            WHERE `id` > {} ORDER BY `id` LIMIT {}", table, last_id, limit);
+            WHERE `id` > {} ORDER BY `id` LIMIT {}",
+            table, last_id, limit
+        );
 
-        let sql2 = format!("SELECT `id`, `deal_money`, `deal_fee` FROM `{}` 
-            WHERE `id` > {} ORDER BY `id` LIMIT {}", table, last_id, limit);
+        let sql2 = format!(
+            "SELECT `id`, `deal_money`, `deal_fee` FROM `{}` 
+            WHERE `id` > {} ORDER BY `id` LIMIT {}",
+            table, last_id, limit
+        );
 
-        let res_part1:Vec<(u64, u32, u32, i64, i64, u32, String, String, String, String, String, String)> = conn.query(&sql1).unwrap();
-        let res_part2:Vec<(u64, String, String)> = conn.query(&sql2).unwrap();
+        let res_part1: Vec<(
+            u64,
+            u32,
+            u32,
+            i64,
+            i64,
+            u32,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )> = conn.query(&sql1).unwrap();
+        let res_part2: Vec<(u64, String, String)> = conn.query(&sql2).unwrap();
         if res_part1.len() != res_part2.len() {
             panic!(
                 "restore failed: table={} snapshot row count mismatch part1={} part2={}",
@@ -51,12 +76,12 @@ fn load_order(m: &mut Market, conn: &mut PooledConn, timestamp: i64) {
         let mut i = 0;
         while i < count {
             let order_id = res_part1[i].0;
-            let order = Rc::new(Order{
-                id : order_id,
+            let order = Rc::new(Order {
+                id: order_id,
                 order_type: res_part1[i].1,
-                side : res_part1[i].2,
-                create_time: res_part1[i].3, 
-                update_time: Cell::new(res_part1[i].4), 
+                side: res_part1[i].2,
+                create_time: res_part1[i].3,
+                update_time: Cell::new(res_part1[i].4),
                 user_id: res_part1[i].5,
                 price: {
                     let raw = &res_part1[i].6;
@@ -64,31 +89,73 @@ fn load_order(m: &mut Market, conn: &mut PooledConn, timestamp: i64) {
                 },
                 amount: {
                     let raw = &res_part1[i].7;
-                    Cell::new(restore_decimal_or_panic(raw, m.stock_prec, "amount", &table, order_id))
+                    Cell::new(restore_decimal_or_panic(
+                        raw,
+                        m.stock_prec,
+                        "amount",
+                        &table,
+                        order_id,
+                    ))
                 },
                 taker_fee_rate: {
                     let raw = &res_part1[i].8;
-                    restore_decimal_or_panic(raw, m.fee_rate_prec, "taker_fee_rate", &table, order_id)
+                    restore_decimal_or_panic(
+                        raw,
+                        m.fee_rate_prec,
+                        "taker_fee_rate",
+                        &table,
+                        order_id,
+                    )
                 },
                 maker_fee_rate: {
                     let raw = &res_part1[i].9;
-                    restore_decimal_or_panic(raw, m.fee_rate_prec, "maker_fee_rate", &table, order_id)
+                    restore_decimal_or_panic(
+                        raw,
+                        m.fee_rate_prec,
+                        "maker_fee_rate",
+                        &table,
+                        order_id,
+                    )
                 },
                 left: {
                     let raw = &res_part1[i].10;
-                    Cell::new(restore_decimal_or_panic(raw, m.stock_prec, "left", &table, order_id))
+                    Cell::new(restore_decimal_or_panic(
+                        raw,
+                        m.stock_prec,
+                        "left",
+                        &table,
+                        order_id,
+                    ))
                 },
                 deal_stock: {
                     let raw = &res_part1[i].11;
-                    Cell::new(restore_decimal_or_panic(raw, m.stock_prec, "deal_stock", &table, order_id))
+                    Cell::new(restore_decimal_or_panic(
+                        raw,
+                        m.stock_prec,
+                        "deal_stock",
+                        &table,
+                        order_id,
+                    ))
                 },
                 deal_money: {
                     let raw = &res_part2[i].1;
-                    Cell::new(restore_decimal_or_panic(raw, m.money_prec, "deal_money", &table, order_id))
+                    Cell::new(restore_decimal_or_panic(
+                        raw,
+                        m.money_prec,
+                        "deal_money",
+                        &table,
+                        order_id,
+                    ))
                 },
                 deal_fee: {
                     let raw = &res_part2[i].2;
-                    Cell::new(restore_decimal_or_panic(raw, m.money_prec, "deal_fee", &table, order_id))
+                    Cell::new(restore_decimal_or_panic(
+                        raw,
+                        m.money_prec,
+                        "deal_fee",
+                        &table,
+                        order_id,
+                    ))
                 },
             });
 
@@ -125,12 +192,12 @@ fn load_order(m: &mut Market, conn: &mut PooledConn, timestamp: i64) {
 fn apply_restored_snap_to_market(
     m: &mut Market,
     conn: &mut PooledConn,
-    quote_deals_id: u64,
-    settle_message_ids: [u64; USER_SETTLE_GROUP_SIZE],
+    pushed_quote_deals_id: u64,
+    pushed_settle_message_ids: [u64; USER_SETTLE_GROUP_SIZE],
     chosen: Option<SnapStateForRestore>,
 ) {
-    m.quote_deals_id = quote_deals_id;
-    m.settle_message_ids = settle_message_ids;
+    m.pushed_quote_deals_id = pushed_quote_deals_id;
+    m.pushed_settle_message_ids = pushed_settle_message_ids;
     if let Some(row) = chosen {
         m.oper_id = row.oper_id;
         m.order_id = row.order_id;
@@ -138,12 +205,12 @@ fn apply_restored_snap_to_market(
         m.message_id = row.message_id;
         m.input_offset = row.input_offset;
         m.input_sequence_id = row.input_sequence_id;
+        m.settle_message_ids = row.settle_message_ids;
         load_order(m, conn, row.time);
     }
 }
 
 pub fn restore_state(m: &mut Market, pool: &Pool) {
-
     let mut asks = 0;
     let mut bids = 0;
 
@@ -154,23 +221,24 @@ pub fn restore_state(m: &mut Market, pool: &Pool) {
         apply_restored_snap_to_market(
             m,
             &mut conn,
-            snap.quote_deals_id,
-            snap.settle_message_ids,
+            snap.pushed_quote_deals_id,
+            snap.pushed_settle_message_ids,
             snap.chosen,
         );
     }
 
     if asks != m.asks.len() as u32 || bids != m.bids.len() as u32 {
-        panic!("order count error {} {} {} {}", asks, m.asks.len(), bids, m.bids.len());
+        panic!(
+            "order count error {} {} {} {}",
+            asks,
+            m.asks.len(),
+            bids,
+            m.bids.len()
+        );
     }
 
     info!(
         "restore state loaded: oper_id={} order_id={} deals_id={} message_id={} input_offset={} input_sequence_id={}",
-        m.oper_id,
-        m.order_id,
-        m.deals_id,
-        m.message_id,
-        m.input_offset,
-        m.input_sequence_id
+        m.oper_id, m.order_id, m.deals_id, m.message_id, m.input_offset, m.input_sequence_id
     );
 }

@@ -16,8 +16,8 @@ const TICK_MS = Math.min(
 
 /**
  * Polls `offer_orders` with `sequence_id` greater than `last_sent_sequence_id`,
- * sends JSON with `input_sequence_id` = `sequence_id`, then advances both
- * `last_sent_sequence_id` and `last_sequence_id` to the batch maximum.
+ * sends JSON with `input_sequence_id` = `sequence_id`, then advances
+ * `last_sent_sequence_id` to the batch maximum.
  */
 export class OfferDispatchService {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -112,7 +112,6 @@ export class OfferDispatchService {
             OfferDispatchState,
             { id: 1 },
             {
-              lastSequenceId: maxSentSeq,
               lastSentSequenceId: maxSentSeq,
               updatedAt: now,
             },

@@ -154,8 +154,7 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
     if m.stock_prec > m.money_prec {
         return Err(format!(
             "market.stock_prec ({}) must be <= market.money_prec ({}) to keep price rescaling simple in this engine",
-            m.stock_prec,
-            m.money_prec
+            m.stock_prec, m.money_prec
         ));
     }
 

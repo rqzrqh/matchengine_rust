@@ -9,14 +9,76 @@ import type { OfferSequenceService } from "./offerSequenceService.js";
 const INT32_MIN = -2147483648;
 const INT32_MAX = 2147483647;
 
+export class OfferValidationError extends Error {}
+
+function validationError(message: string): never {
+  throw new OfferValidationError(message);
+}
+
+function decimalStringIsPositive(whole: string, frac: string): boolean {
+  return /[1-9]/.test(whole) || /[1-9]/.test(frac);
+}
+
+function pricePrecision(): number {
+  const { stock_prec, money_prec } = getAppConfig().yaml.market;
+  return Math.max(0, money_prec - stock_prec);
+}
+
+function normalizeDecimalField(
+  raw: unknown,
+  scale: number,
+  field: string,
+  context: string,
+): string {
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    validationError(`${context} failed: ${field} is required`);
+  }
+
+  const value = String(raw).trim();
+  const m = value.match(/^(\d+)(?:\.(\d*))?$/);
+  if (!m) {
+    validationError(`${context} failed: invalid ${field}`);
+  }
+
+  const frac = m[2] ?? "";
+  if (frac.length > scale) {
+    validationError(`${context} failed: ${field} precision exceeds ${scale}`);
+  }
+
+  const whole = m[1]!.replace(/^0+(?=\d)/, "") || "0";
+  const normalizedFrac = frac.replace(/0+$/, "");
+  const normalized =
+    normalizedFrac.length > 0 ? `${whole}.${normalizedFrac}` : whole;
+  if (!decimalStringIsPositive(whole, normalizedFrac)) {
+    validationError(`${context} failed: ${field} must be > 0`);
+  }
+  return normalized;
+}
+
+function parseUserId(body: Record<string, unknown>, context: string): number {
+  const userId = Number(body.user_id);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    validationError(`${context} failed: invalid or missing user_id`);
+  }
+  return userId;
+}
+
+function parseSide(body: Record<string, unknown>, context: string): number {
+  const side = Number(body.side);
+  if (side !== 1 && side !== 2) {
+    validationError(`${context} failed: invalid side (use 1=ask, 2=bid)`);
+  }
+  return side;
+}
+
 function parseExternId(body: Record<string, unknown>): number {
   const raw = body.extern_id;
   if (raw !== undefined && raw !== null && raw !== "") {
     const n = Number(raw);
-    if (!Number.isFinite(n)) throw new Error("invalid extern_id (not a finite number)");
+    if (!Number.isFinite(n)) validationError("invalid extern_id (not a finite number)");
     const t = Math.trunc(n);
     if (t < INT32_MIN || t > INT32_MAX) {
-      throw new Error(`extern_id out of INT32 range [${INT32_MIN}, ${INT32_MAX}]`);
+      validationError(`extern_id out of INT32 range [${INT32_MIN}, ${INT32_MAX}]`);
     }
     return t;
   }
@@ -127,32 +189,35 @@ export class OfferService {
     order_id: number;
   }> {
     try {
-      const user_id = Number(body.user_id);
-      if (!Number.isFinite(user_id)) {
-        throw new Error("limit order failed: invalid or missing user_id");
-      }
-      const side = Number(body.side);
-      if (!Number.isFinite(side)) {
-        throw new Error("limit order failed: invalid or missing side");
-      }
-      if (body.amount === undefined || body.amount === null || String(body.amount).trim() === "") {
-        throw new Error("limit order failed: amount is required");
-      }
-      if (body.price === undefined || body.price === null || String(body.price).trim() === "") {
-        throw new Error("limit order failed: price is required");
-      }
+      const cfg = getAppConfig().yaml.market;
+      const user_id = parseUserId(body, "limit order");
+      const side = parseSide(body, "limit order");
+      const amount = normalizeDecimalField(body.amount, cfg.stock_prec, "amount", "limit order");
+      const price = normalizeDecimalField(body.price, pricePrecision(), "price", "limit order");
+      const takerFeeRate = normalizeDecimalField(
+        body.taker_fee_rate ?? "0.1",
+        cfg.fee_prec,
+        "taker_fee_rate",
+        "limit order",
+      );
+      const makerFeeRate = normalizeDecimalField(
+        body.maker_fee_rate ?? "0.1",
+        cfg.fee_prec,
+        "maker_fee_rate",
+        "limit order",
+      );
       const extern_id = parseExternId(body);
-      const summary = `limit user=${user_id} side=${side} price=${body.price} amount=${body.amount}`;
+      const summary = `limit user=${user_id} side=${side} price=${price} amount=${amount}`;
       const payload = {
         method: "order.put_limit",
         id: extern_id,
         params: {
           user_id,
           side,
-          amount: String(body.amount),
-          price: String(body.price),
-          taker_fee_rate: String(body.taker_fee_rate ?? "0.1"),
-          maker_fee_rate: String(body.maker_fee_rate ?? "0.1"),
+          amount,
+          price,
+          taker_fee_rate: takerFeeRate,
+          maker_fee_rate: makerFeeRate,
         },
       };
       return await this.sendOffer("limit", user_id, extern_id, summary, payload);
@@ -169,27 +234,27 @@ export class OfferService {
     order_id: number;
   }> {
     try {
-      const user_id = Number(body.user_id);
-      if (!Number.isFinite(user_id)) {
-        throw new Error("market order failed: invalid or missing user_id");
-      }
-      const side = Number(body.side);
-      if (!Number.isFinite(side)) {
-        throw new Error("market order failed: invalid or missing side");
-      }
-      if (body.amount === undefined || body.amount === null || String(body.amount).trim() === "") {
-        throw new Error("market order failed: amount is required");
-      }
+      const cfg = getAppConfig().yaml.market;
+      const user_id = parseUserId(body, "market order");
+      const side = parseSide(body, "market order");
+      const amountScale = side === 1 ? cfg.stock_prec : cfg.money_prec;
+      const amount = normalizeDecimalField(body.amount, amountScale, "amount", "market order");
+      const takerFeeRate = normalizeDecimalField(
+        body.taker_fee_rate ?? "0.1",
+        cfg.fee_prec,
+        "taker_fee_rate",
+        "market order",
+      );
       const extern_id = parseExternId(body);
-      const summary = `market user=${user_id} side=${side} amount=${body.amount}`;
+      const summary = `market user=${user_id} side=${side} amount=${amount}`;
       const payload = {
         method: "order.put_market",
         id: extern_id,
         params: {
           user_id,
           side,
-          amount: String(body.amount),
-          taker_fee_rate: String(body.taker_fee_rate ?? "0.1"),
+          amount,
+          taker_fee_rate: takerFeeRate,
         },
       };
       return await this.sendOffer("market", user_id, extern_id, summary, payload);
@@ -206,13 +271,10 @@ export class OfferService {
     order_id: number;
   }> {
     try {
-      const user_id = Number(body.user_id);
-      if (!Number.isFinite(user_id)) {
-        throw new Error("cancel failed: invalid or missing user_id");
-      }
+      const user_id = parseUserId(body, "cancel");
       const order_id_param = Number(body.order_id);
-      if (!Number.isFinite(order_id_param)) {
-        throw new Error("cancel failed: invalid or missing order_id");
+      if (!Number.isInteger(order_id_param) || order_id_param <= 0) {
+        validationError("cancel failed: invalid or missing order_id");
       }
       const extern_id = parseExternId(body);
       const summary = `cancel user=${user_id} order_id=${order_id_param}`;

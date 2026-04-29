@@ -33,11 +33,29 @@ const DEFAULT_ENGINE_HTTP = "http://127.0.0.1:8080";
 /** Minimum/initial interval used when HTTP auto refresh is enabled. */
 const MIN_HTTP_REFRESH_MS = 500;
 const DEFAULT_HTTP_REFRESH_MS = 1000;
+const AUTO_BALANCE_INTERVAL_MS = 10_000;
+const AUTO_ORDER_BOOK_DEPTH_LIMIT = 500;
+const AUTO_SIDE_IMBALANCE_THRESHOLD = 0.15;
+const AUTO_REBALANCE_THRESHOLD = 0.2;
+const MARKET_BUY_AMOUNT_BUFFER = 1.000001;
 
 let marketName = __MATCENGINE_CONFIG__.market.name;
 let engineHttpBase = DEFAULT_ENGINE_HTTP;
 let previousEngineStatus: EngineStatusNumericSnapshot | null = null;
 let lastHttpRefreshText = "Waiting for first refresh";
+
+function nonNegativeInt(v: unknown, fallback = 0): number {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 ? n : fallback;
+}
+
+const marketPrecision = {
+  stock: nonNegativeInt(__MATCENGINE_CONFIG__.market.stock_prec),
+  money: nonNegativeInt(__MATCENGINE_CONFIG__.market.money_prec),
+  fee: nonNegativeInt(__MATCENGINE_CONFIG__.market.fee_prec),
+};
+
+const pricePrecision = Math.max(0, marketPrecision.money - marketPrecision.stock);
 
 async function loadConfig(): Promise<void> {
   try {
@@ -75,8 +93,11 @@ type EngineStatusPayload = {
   order_id?: number | string | null;
   deals_id?: number | string | null;
   message_id?: number | string | null;
+  settle_message_ids?: Array<number | string | null> | null;
   input_offset?: number | string | null;
   input_sequence_id?: number | string | null;
+  pushed_quote_deals_id?: number | string | null;
+  pushed_settle_message_ids?: Array<number | string | null> | null;
   error?: string | null;
 };
 
@@ -341,17 +362,17 @@ type InputProgressPayload = {
   error?: string | null;
 };
 
-type PublishPendingPayload = {
-  quote_pending?: number | string | null;
-  settle_pending?: number | string | null;
-  total_pending?: number | string | null;
-  settle_group_pending?:
-    | Array<{ group_id?: number | string | null; pending?: number | string | null }>
-    | null;
-  error?: string | null;
+type UserOrdersPayload = {
+  orders?: Array<Record<string, unknown>>;
 };
 
-type UserOrdersPayload = {
+type MarketSummaryPayload = {
+  ask_stock_amount?: number | string | null;
+  bid_stock_amount?: number | string | null;
+};
+
+type OrderBookPayload = {
+  total?: number | string | null;
   orders?: Array<Record<string, unknown>>;
 };
 
@@ -372,6 +393,7 @@ type AutoOrderConfig = {
 const autoOrderState = {
   running: false,
   timerId: 0 as number | undefined,
+  balanceTimerId: 0 as number | undefined,
   nextUserId: 1,
 };
 let activeManualTab: ManualTabKind = "limit";
@@ -434,6 +456,79 @@ function parseBigIntOrNull(v: unknown): bigint | null {
   }
 }
 
+function parseNumberOrNull(v: unknown): number | null {
+  const s = fmtCell(v);
+  if (s === "—") return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatDecimalAtScale(value: number, scale: number, fallback = "0"): string {
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  const factor = 10 ** scale;
+  const floored = Math.floor(value * factor) / factor;
+  if (!Number.isFinite(floored) || floored <= 0) return fallback;
+  return floored.toFixed(scale).replace(/\.?0+$/, "");
+}
+
+function normalizeDecimalString(raw: string, scale: number): string {
+  const trimmed = raw.trim();
+  const m = trimmed.match(/^(\d+)(?:\.(\d*))?$/);
+  if (!m) return trimmed;
+
+  const whole = m[1]!.replace(/^0+(?=\d)/, "") || "0";
+  const frac = (m[2] ?? "").slice(0, scale);
+  return scale > 0 && frac.length > 0 ? `${whole}.${frac}` : whole;
+}
+
+function normalizePriceInput(raw: string): string {
+  return normalizeDecimalString(raw, pricePrecision);
+}
+
+function normalizeStockAmountInput(raw: string): string {
+  return normalizeDecimalString(raw, marketPrecision.stock);
+}
+
+function normalizeMarketAmountInput(side: number, raw: string): string {
+  return normalizeDecimalString(raw, side === 2 ? marketPrecision.money : marketPrecision.stock);
+}
+
+function formatPrice(value: number, fallback = "0"): string {
+  return formatDecimalAtScale(value, pricePrecision, fallback);
+}
+
+function formatStockAmount(value: number, fallback = "0"): string {
+  return formatDecimalAtScale(value, marketPrecision.stock, fallback);
+}
+
+function formatMoneyAmount(value: number, fallback = "0"): string {
+  return formatDecimalAtScale(value, marketPrecision.money, fallback);
+}
+
+function parsePositiveAmount(v: string): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function parseBigIntArray(v: unknown): bigint[] {
+  if (!Array.isArray(v)) return [];
+  return v.map((item) => parseBigIntOrNull(item) ?? 0n);
+}
+
+function formatProgress(pushed: bigint | null, current: bigint | null): string {
+  if (pushed === null && current === null) return "—";
+  return `${pushed ?? 0n}/${current ?? 0n}`;
+}
+
+function positiveDiff(current: bigint | null, pushed: bigint | null): bigint {
+  if (current === null || pushed === null || current <= pushed) return 0n;
+  return current - pushed;
+}
+
+function sumIds(ids: bigint[]): bigint {
+  return ids.reduce((acc, id) => acc + id, 0n);
+}
+
 function setStatusDelta(el: HTMLElement | null, current: bigint | null, previous: bigint | null): void {
   if (!el) return;
   if (current === null || previous === null) {
@@ -489,6 +584,10 @@ function randomDecimalString(minRaw: string, maxRaw: string): string {
   return (pickScaled / factor).toFixed(scale).replace(/\.?0+$/, "");
 }
 
+function randomDecimalStringAtScale(minRaw: string, maxRaw: string, scale: number): string {
+  return normalizeDecimalString(randomDecimalString(minRaw, maxRaw), scale);
+}
+
 function readAutoOrderConfig(): AutoOrderConfig {
   const userStart = Number((document.getElementById("auto-user-start") as HTMLInputElement).value);
   const userEnd = Number((document.getElementById("auto-user-end") as HTMLInputElement).value);
@@ -515,8 +614,8 @@ function readAutoOrderConfig(): AutoOrderConfig {
   if (actions.length === 0) {
     throw new Error("enable at least one auto action");
   }
-  void randomDecimalString(priceMin, priceMax);
-  void randomDecimalString(amountMin, amountMax);
+  void randomDecimalStringAtScale(priceMin, priceMax, pricePrecision);
+  void randomDecimalStringAtScale(amountMin, amountMax, marketPrecision.stock);
 
   return { userStart, userEnd, intervalMs, priceMin, priceMax, amountMin, amountMax, actions };
 }
@@ -535,14 +634,33 @@ function pickRandomAction(actions: AutoActionKind[]): AutoActionKind {
   return actions[Math.floor(Math.random() * actions.length)]!;
 }
 
+async function pickBalancedSide(): Promise<number> {
+  try {
+    const m = encodeURIComponent(marketName);
+    const summary = await engineApi<MarketSummaryPayload>(`/markets/${m}/summary`);
+    const askStock = parseNumberOrNull(summary.ask_stock_amount) ?? 0;
+    const bidStock = parseNumberOrNull(summary.bid_stock_amount) ?? 0;
+    const total = askStock + bidStock;
+    if (total <= 0) return Math.random() < 0.5 ? 1 : 2;
+
+    const imbalance = Math.abs(askStock - bidStock) / total;
+    if (imbalance < AUTO_SIDE_IMBALANCE_THRESHOLD) return Math.random() < 0.5 ? 1 : 2;
+
+    // More asks means the book needs more buys; more bids means it needs more sells.
+    return askStock > bidStock ? 2 : 1;
+  } catch {
+    return Math.random() < 0.5 ? 1 : 2;
+  }
+}
+
 async function submitLimitOrder(userId: number, side: number, price: string, amount: string): Promise<void> {
   await api<unknown>("/api/orders/limit", {
     method: "POST",
     body: JSON.stringify({
       user_id: userId,
       side,
-      price,
-      amount,
+      price: normalizePriceInput(price),
+      amount: normalizeStockAmountInput(amount),
     }),
   });
 }
@@ -553,7 +671,7 @@ async function submitMarketOrder(userId: number, side: number, amount: string): 
     body: JSON.stringify({
       user_id: userId,
       side,
-      amount,
+      amount: normalizeMarketAmountInput(side, amount),
     }),
   });
 }
@@ -579,6 +697,93 @@ async function fetchUserPendingOrders(userId: number): Promise<number[]> {
     .filter((id) => Number.isFinite(id) && id > 0);
 }
 
+async function fetchOrderBookSide(side: number, limit = AUTO_ORDER_BOOK_DEPTH_LIMIT): Promise<Array<Record<string, unknown>>> {
+  const market = encodeURIComponent(marketName);
+  const payload = await engineApi<OrderBookPayload>(
+    `/markets/${market}/order-book?side=${side}&offset=0&limit=${limit}`,
+  );
+  return Array.isArray(payload.orders) ? payload.orders : [];
+}
+
+function orderLeft(order: Record<string, unknown>): number {
+  return parseNumberOrNull(order.left) ?? 0;
+}
+
+function orderPrice(order: Record<string, unknown>): number {
+  return parseNumberOrNull(order.price) ?? 0;
+}
+
+function sumOrderLeft(orders: Array<Record<string, unknown>>): number {
+  return orders.reduce((acc, order) => acc + Math.max(0, orderLeft(order)), 0);
+}
+
+function costToConsumeStock(orders: Array<Record<string, unknown>>, targetStock: number): number {
+  let left = Math.max(0, targetStock);
+  let cost = 0;
+  for (const order of orders) {
+    if (left <= 0) break;
+    const amount = Math.min(left, Math.max(0, orderLeft(order)));
+    const price = orderPrice(order);
+    if (amount <= 0 || price <= 0) continue;
+    cost += amount * price;
+    left -= amount;
+  }
+  return cost;
+}
+
+async function buildMarketOrderAmount(side: number, targetStock: number): Promise<string | null> {
+  if (side === 2) {
+    const asks = await fetchOrderBookSide(1);
+    const amountMoney = costToConsumeStock(asks, targetStock) * MARKET_BUY_AMOUNT_BUFFER;
+    return amountMoney > 0 ? formatMoneyAmount(amountMoney) : null;
+  }
+
+  const bids = await fetchOrderBookSide(2);
+  const availableStock = sumOrderLeft(bids);
+  if (availableStock <= 0) return null;
+  return formatStockAmount(Math.min(targetStock, availableStock));
+}
+
+async function rebalanceOrderBook(): Promise<void> {
+  if (!autoOrderState.running) return;
+  const cfg = readAutoOrderConfig();
+  const [asks, bids] = await Promise.all([
+    fetchOrderBookSide(1),
+    fetchOrderBookSide(2),
+  ]);
+  const askStock = sumOrderLeft(asks);
+  const bidStock = sumOrderLeft(bids);
+  const total = askStock + bidStock;
+  if (total <= 0) return;
+
+  const diff = askStock - bidStock;
+  const imbalance = Math.abs(diff) / total;
+  if (imbalance < AUTO_REBALANCE_THRESHOLD) return;
+
+  const userId = nextAutoUserId(cfg);
+  const maxStockAmount = Math.max(
+    parseNumberOrNull(cfg.amountMax) ?? 0,
+    parseNumberOrNull(cfg.amountMin) ?? 0,
+  );
+  const targetStock = Math.min(Math.abs(diff) / 2, maxStockAmount > 0 ? maxStockAmount : Math.abs(diff) / 2);
+  if (targetStock <= 0) return;
+
+  if (diff > 0) {
+    const amountMoney = costToConsumeStock(asks, targetStock) * MARKET_BUY_AMOUNT_BUFFER;
+    if (amountMoney <= 0) return;
+    const amount = formatMoneyAmount(amountMoney);
+    setAutoOrderStatus(`Balancing: market buy user=${userId} amount=${amount}`);
+    await submitMarketOrder(userId, 2, amount);
+    return;
+  }
+
+  const amountStock = Math.min(targetStock, bidStock);
+  if (amountStock <= 0) return;
+  const amount = formatStockAmount(amountStock);
+  setAutoOrderStatus(`Balancing: market sell user=${userId} amount=${amount}`);
+  await submitMarketOrder(userId, 1, amount);
+}
+
 async function performAutoOrderStep(): Promise<void> {
   const cfg = readAutoOrderConfig();
   const userId = nextAutoUserId(cfg);
@@ -601,18 +806,23 @@ async function performAutoOrderStep(): Promise<void> {
     action = pickRandomAction(fallback);
   }
 
-  const side = Math.random() < 0.5 ? 1 : 2;
-  const amount = randomDecimalString(cfg.amountMin, cfg.amountMax);
+  const side = await pickBalancedSide();
+  const amount = randomDecimalStringAtScale(cfg.amountMin, cfg.amountMax, marketPrecision.stock);
 
   if (action === "limit") {
-    const price = randomDecimalString(cfg.priceMin, cfg.priceMax);
+    const price = randomDecimalStringAtScale(cfg.priceMin, cfg.priceMax, pricePrecision);
     setAutoOrderStatus(`Running: limit user=${userId} side=${side} price=${price} amount=${amount}`);
     await submitLimitOrder(userId, side, price, amount);
     return;
   }
 
-  setAutoOrderStatus(`Running: market user=${userId} side=${side} amount=${amount}`);
-  await submitMarketOrder(userId, side, amount);
+  const marketAmount = await buildMarketOrderAmount(side, parsePositiveAmount(amount));
+  if (marketAmount === null) {
+    setAutoOrderStatus(`Running: skip market side=${side}, no rival orders`);
+    return;
+  }
+  setAutoOrderStatus(`Running: market user=${userId} side=${side} amount=${marketAmount}`);
+  await submitMarketOrder(userId, side, marketAmount);
 }
 
 function clearAutoOrderTimer(): void {
@@ -622,10 +832,24 @@ function clearAutoOrderTimer(): void {
   }
 }
 
+function clearAutoOrderBalanceTimer(): void {
+  if (autoOrderState.balanceTimerId !== undefined) {
+    window.clearTimeout(autoOrderState.balanceTimerId);
+    autoOrderState.balanceTimerId = undefined;
+  }
+}
+
 function scheduleAutoOrderNextTick(delayMs: number): void {
   clearAutoOrderTimer();
   autoOrderState.timerId = window.setTimeout(() => {
     void runAutoOrderLoop();
+  }, delayMs);
+}
+
+function scheduleAutoOrderBalanceCheck(delayMs = AUTO_BALANCE_INTERVAL_MS): void {
+  clearAutoOrderBalanceTimer();
+  autoOrderState.balanceTimerId = window.setTimeout(() => {
+    void runAutoOrderBalanceLoop();
   }, delayMs);
 }
 
@@ -649,6 +873,17 @@ async function runAutoOrderLoop(): Promise<void> {
   scheduleAutoOrderNextTick(cfg.intervalMs);
 }
 
+async function runAutoOrderBalanceLoop(): Promise<void> {
+  if (!autoOrderState.running) return;
+  try {
+    await rebalanceOrderBook();
+  } catch (e) {
+    setAutoOrderStatus(`Auto balance error: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (!autoOrderState.running) return;
+  scheduleAutoOrderBalanceCheck();
+}
+
 function startAutoOrder(): void {
   const cfg = readAutoOrderConfig();
   autoOrderState.running = true;
@@ -656,11 +891,13 @@ function startAutoOrder(): void {
   updateAutoOrderButton();
   setAutoOrderStatus("Starting...");
   scheduleAutoOrderNextTick(0);
+  scheduleAutoOrderBalanceCheck();
 }
 
 function stopAutoOrder(status = "Stopped"): void {
   autoOrderState.running = false;
   clearAutoOrderTimer();
+  clearAutoOrderBalanceTimer();
   updateAutoOrderButton();
   setAutoOrderStatus(status);
 }
@@ -736,7 +973,7 @@ async function refreshPublishPending(): Promise<void> {
 
   const m = encodeURIComponent(marketName);
   try {
-    const j = await api<PublishPendingPayload>(`/api/markets/${m}/publish-pending`);
+    const j = await engineApi<EngineStatusPayload>(`/markets/${m}/status`);
     if (typeof j.error === "string" && j.error.trim() !== "") {
       setText(quoteEl, "—");
       setText(settleEl, "—");
@@ -747,31 +984,46 @@ async function refreshPublishPending(): Promise<void> {
       return;
     }
 
-    setText(quoteEl, j.quote_pending);
-    setText(settleEl, j.settle_pending);
-    setText(totalEl, j.total_pending);
+    const dealsId = parseBigIntOrNull(j.deals_id);
+    const pushedQuoteDealsId = parseBigIntOrNull(j.pushed_quote_deals_id);
+    const settleMessageIds = parseBigIntArray(j.settle_message_ids);
+    const pushedSettleMessageIds = parseBigIntArray(j.pushed_settle_message_ids);
+    const settleTotal = sumIds(settleMessageIds);
+    const pushedSettleTotal = sumIds(pushedSettleMessageIds);
+    const quoteLag = positiveDiff(dealsId, pushedQuoteDealsId);
+    const settleGroupCount = Math.max(settleMessageIds.length, pushedSettleMessageIds.length);
+    const settleLag = Array.from({ length: settleGroupCount }, (_, idx) =>
+      positiveDiff(settleMessageIds[idx] ?? 0n, pushedSettleMessageIds[idx] ?? 0n),
+    ).reduce((acc, lag) => acc + lag, 0n);
+    const totalLag = quoteLag + settleLag;
+
+    setText(quoteEl, formatProgress(pushedQuoteDealsId, dealsId));
+    setText(settleEl, `${pushedSettleTotal}/${settleTotal}`);
+    setText(totalEl, totalLag);
     setErrLine(errEl, null);
 
-    let totalPending = 0n;
-    try {
-      const totalStr = fmtCell(j.total_pending);
-      totalPending = totalStr === "—" ? 0n : BigInt(totalStr);
-    } catch {
-      totalPending = 0n;
-    }
-    if (totalPending > 0n) {
+    if (totalLag > 0n) {
       totalEl.classList.add("ip-lag--warn");
     } else {
       totalEl.classList.remove("ip-lag--warn");
     }
 
-    const groups = Array.isArray(j.settle_group_pending) ? j.settle_group_pending : [];
-    const groupItems = groups
+    const groupItems = Array.from({ length: settleGroupCount }, (_, idx) => {
+      const current = settleMessageIds[idx] ?? 0n;
+      const pushed = pushedSettleMessageIds[idx] ?? 0n;
+      return {
+        groupId: String(idx),
+        current,
+        pushed,
+        lag: positiveDiff(current, pushed),
+      };
+    })
+      .filter((item) => item.current > 0n || item.pushed > 0n)
       .map((item) => ({
-        groupId: fmtCell(item.group_id),
-        pending: fmtCell(item.pending),
+        groupId: item.groupId,
+        progress: `${item.pushed}/${item.current}`,
+        lag: String(item.lag),
       }))
-      .filter((item) => item.groupId !== "—" && item.pending !== "—");
 
     if (groupItems.length === 0) {
       groupsEl.textContent = "—";
@@ -780,8 +1032,8 @@ async function refreshPublishPending(): Promise<void> {
 
     groupsEl.innerHTML = groupItems
       .map((item) => {
-        const level = classifyPendingLevel(item.pending);
-        return `<code class="ip-group-chip ip-group-chip--${level}">settle.${escapeHtml(item.groupId)}=${escapeHtml(item.pending)}</code>`;
+        const level = classifyPendingLevel(item.lag);
+        return `<code class="ip-group-chip ip-group-chip--${level}">settle.${escapeHtml(item.groupId)}=${escapeHtml(item.progress)}</code>`;
       })
       .join("");
   } catch (e) {
