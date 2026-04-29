@@ -28,7 +28,7 @@ struct Anchor {
 fn read_anchor_from_db(pool: &Pool, verbose: bool) -> Option<Anchor> {
     let mut conn = pool.get_conn().unwrap();
     let row: Option<(u64, u64, String)> = conn
-        .query_first("SELECT `id`, `quote_deals_id`, `settle_message_ids` from `snap` ORDER BY `id` DESC LIMIT 1")
+        .query_first("SELECT `id`, `pushed_quote_deals_id`, `pushed_settle_message_ids` from `snap` ORDER BY `id` DESC LIMIT 1")
         .unwrap();
     let (id, quote_deals_id, settle_json) = match row {
         Some(r) => r,

@@ -14,8 +14,8 @@ The matching engine is a state machine: `put_order` / `cancel_order` messages ar
 
 ![image-20210813104749921](https://github.com/rqzrqh/matchengine_rust/blob/master/image/recover_process.png?raw=true)
 
-1. Read the latest snapshot and obtain `quote_deals_id` and `min_settle_message_id`.
-2. Walk snapshots by id from newest to oldest until you find one whose deal id is less than `quote_deals_id` and whose message id is less than `min_settle_message_id`.
+1. Read the latest snapshot and obtain `pushed_quote_deals_id` and `min_pushed_settle_message_id`.
+2. Walk snapshots by id from newest to oldest until you find one whose deal id is less than `pushed_quote_deals_id` and whose message id is less than `min_pushed_settle_message_id`.
 3. Apply that snapshot.
 
 # Correctness
