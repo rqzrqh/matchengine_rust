@@ -33,10 +33,12 @@ const DEFAULT_ENGINE_HTTP = "http://127.0.0.1:8080";
 /** Minimum/initial interval used when HTTP auto refresh is enabled. */
 const MIN_HTTP_REFRESH_MS = 500;
 const DEFAULT_HTTP_REFRESH_MS = 1000;
-const AUTO_BALANCE_INTERVAL_MS = 10_000;
 const AUTO_ORDER_BOOK_DEPTH_LIMIT = 500;
 const AUTO_SIDE_IMBALANCE_THRESHOLD = 0.15;
-const AUTO_REBALANCE_THRESHOLD = 0.2;
+const AUTO_CORRECTION_INTERVAL_MIN_MS = 3_000;
+const AUTO_CORRECTION_INTERVAL_MAX_MS = 5_000;
+const AUTO_CORRECTION_RATIO = 0.05;
+const AUTO_MAX_CONCURRENCY = 16;
 const MARKET_BUY_AMOUNT_BUFFER = 1.000001;
 
 let marketName = __MATCENGINE_CONFIG__.market.name;
@@ -383,18 +385,26 @@ type AutoOrderConfig = {
   userStart: number;
   userEnd: number;
   intervalMs: number;
+  concurrency: number;
   priceMin: string;
   priceMax: string;
   amountMin: string;
   amountMax: string;
+  restingDepth: string;
   actions: AutoActionKind[];
+};
+
+type AutoOrderWorkerState = {
+  workerIndex: number;
+  timerId: number | undefined;
+  correctionTimerId: number | undefined;
+  nextUserId: number | null;
 };
 
 const autoOrderState = {
   running: false,
-  timerId: 0 as number | undefined,
-  balanceTimerId: 0 as number | undefined,
-  nextUserId: 1,
+  workerCount: 0,
+  workers: [] as AutoOrderWorkerState[],
 };
 let activeManualTab: ManualTabKind = "limit";
 const httpRefreshState = {
@@ -510,6 +520,82 @@ function parsePositiveAmount(v: string): number {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
+function validatePositiveDecimalInput(raw: string, scale: number, field: string): string {
+  const trimmed = raw.trim();
+  const m = trimmed.match(/^(\d+)(?:\.(\d*))?$/);
+  if (!m) throw new Error(`${field} must be a positive number`);
+  if ((m[2] ?? "").length > scale) {
+    throw new Error(`${field} precision exceeds ${scale}`);
+  }
+  const normalized = normalizeDecimalString(trimmed, scale);
+  if (parsePositiveAmount(normalized) <= 0) {
+    throw new Error(`${field} must be > 0`);
+  }
+  return normalized;
+}
+
+function priceTick(): number {
+  return 1 / 10 ** pricePrecision;
+}
+
+function autoAmountBounds(cfg: AutoOrderConfig): { minAmount: number; maxAmount: number } {
+  const a = parsePositiveAmount(cfg.amountMin);
+  const b = parsePositiveAmount(cfg.amountMax);
+  const minAmount = Math.min(a || b || 0, b || a || 0);
+  const maxAmount = Math.max(a, b);
+  return { minAmount, maxAmount };
+}
+
+function autoRestingDepthTarget(cfg: AutoOrderConfig): number {
+  const { minAmount } = autoAmountBounds(cfg);
+  return Math.max(parsePositiveAmount(cfg.restingDepth), minAmount, 1);
+}
+
+function bestBookPrice(orders: Array<Record<string, unknown>>, side: number): number | null {
+  const prices = orders
+    .map((order) => orderPrice(order))
+    .filter((price) => Number.isFinite(price) && price > 0);
+  if (prices.length === 0) return null;
+  return side === 1 ? Math.min(...prices) : Math.max(...prices);
+}
+
+function pickRestingLimitPrice(
+  side: number,
+  asks: Array<Record<string, unknown>>,
+  bids: Array<Record<string, unknown>>,
+  cfg: AutoOrderConfig,
+): string | null {
+  const tick = priceTick();
+  const cfgMin = parsePositiveAmount(cfg.priceMin);
+  const cfgMax = parsePositiveAmount(cfg.priceMax);
+  const fallbackMin = cfgMin > 0 ? cfgMin : tick;
+  const fallbackMax = cfgMax > 0 ? cfgMax : fallbackMin;
+  const bestAsk = bestBookPrice(asks, 1);
+  const bestBid = bestBookPrice(bids, 2);
+
+  if (side === 1) {
+    let lo = Math.max(fallbackMin, bestBid !== null ? bestBid + tick : fallbackMin);
+    let hi = fallbackMax;
+    if (bestAsk !== null && bestAsk >= lo) hi = Math.min(hi, bestAsk);
+    if (hi < lo) hi = lo;
+    return formatPrice(lo === hi ? lo : lo + Math.random() * (hi - lo));
+  }
+
+  let hi = Math.min(fallbackMax, bestAsk !== null ? Math.max(bestAsk - tick, tick) : fallbackMax);
+  if (hi <= 0) return null;
+  let lo = Math.max(Math.min(fallbackMin, hi), bestBid ?? Math.min(fallbackMin, hi));
+  if (lo > hi) lo = hi;
+  return formatPrice(lo === hi ? lo : lo + Math.random() * (hi - lo));
+}
+
+function replenishAmount(cfg: AutoOrderConfig, missingStock: number): string | null {
+  const { minAmount, maxAmount } = autoAmountBounds(cfg);
+  const fallback = maxAmount > 0 ? maxAmount : minAmount;
+  const target = Math.max(minAmount || fallback || 0, missingStock);
+  const capped = maxAmount > 0 ? Math.min(target, maxAmount) : target;
+  return capped > 0 ? formatStockAmount(capped) : null;
+}
+
 function parseBigIntArray(v: unknown): bigint[] {
   if (!Array.isArray(v)) return [];
   return v.map((item) => parseBigIntOrNull(item) ?? 0n);
@@ -592,10 +678,12 @@ function readAutoOrderConfig(): AutoOrderConfig {
   const userStart = Number((document.getElementById("auto-user-start") as HTMLInputElement).value);
   const userEnd = Number((document.getElementById("auto-user-end") as HTMLInputElement).value);
   const intervalMs = Number((document.getElementById("auto-interval-ms") as HTMLInputElement).value);
+  const concurrency = Number((document.getElementById("auto-concurrency") as HTMLInputElement).value);
   const priceMin = (document.getElementById("auto-price-min") as HTMLInputElement).value.trim();
   const priceMax = (document.getElementById("auto-price-max") as HTMLInputElement).value.trim();
   const amountMin = (document.getElementById("auto-amount-min") as HTMLInputElement).value.trim();
   const amountMax = (document.getElementById("auto-amount-max") as HTMLInputElement).value.trim();
+  const restingDepth = (document.getElementById("auto-resting-depth") as HTMLInputElement).value.trim();
 
   const actions: AutoActionKind[] = [];
   if ((document.getElementById("auto-enable-limit") as HTMLInputElement).checked) actions.push("limit");
@@ -611,23 +699,90 @@ function readAutoOrderConfig(): AutoOrderConfig {
   if (!Number.isFinite(intervalMs) || intervalMs < 10) {
     throw new Error("interval ms must be >= 10");
   }
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > AUTO_MAX_CONCURRENCY) {
+    throw new Error(`concurrency must be an integer in [1, ${AUTO_MAX_CONCURRENCY}]`);
+  }
+  const userCount = userEnd - userStart + 1;
+  if (userCount <= concurrency) {
+    throw new Error("user_id range size must be greater than concurrency");
+  }
   if (actions.length === 0) {
     throw new Error("enable at least one auto action");
   }
   void randomDecimalStringAtScale(priceMin, priceMax, pricePrecision);
   void randomDecimalStringAtScale(amountMin, amountMax, marketPrecision.stock);
+  const normalizedRestingDepth = validatePositiveDecimalInput(
+    restingDepth,
+    marketPrecision.stock,
+    "resting depth",
+  );
 
-  return { userStart, userEnd, intervalMs, priceMin, priceMax, amountMin, amountMax, actions };
+  return {
+    userStart,
+    userEnd,
+    intervalMs,
+    concurrency,
+    priceMin,
+    priceMax,
+    amountMin,
+    amountMax,
+    restingDepth: normalizedRestingDepth,
+    actions,
+  };
 }
 
-function nextAutoUserId(cfg: AutoOrderConfig): number {
-  if (autoOrderState.nextUserId < cfg.userStart || autoOrderState.nextUserId > cfg.userEnd) {
-    autoOrderState.nextUserId = cfg.userStart;
+function firstWorkerUserId(
+  cfg: AutoOrderConfig,
+  workerIndex: number,
+  workerCount = autoOrderState.workerCount || 1,
+): number | null {
+  void workerCount;
+  const userId = cfg.userStart + workerIndex;
+  return userId <= cfg.userEnd ? userId : null;
+}
+
+function nextAutoUserId(cfg: AutoOrderConfig, worker: AutoOrderWorkerState): number | null {
+  const workerCount = Math.max(1, autoOrderState.workerCount);
+  const firstUserId = firstWorkerUserId(cfg, worker.workerIndex, workerCount);
+  if (firstUserId === null) {
+    worker.nextUserId = null;
+    return null;
   }
-  const userId = autoOrderState.nextUserId;
-  autoOrderState.nextUserId =
-    userId >= cfg.userEnd ? cfg.userStart : userId + 1;
+
+  if (
+    worker.nextUserId === null ||
+    worker.nextUserId < cfg.userStart ||
+    worker.nextUserId > cfg.userEnd
+  ) {
+    worker.nextUserId = firstUserId;
+  }
+
+  const userId = worker.nextUserId;
+  const nextUserId = userId + workerCount;
+  worker.nextUserId = nextUserId <= cfg.userEnd ? nextUserId : firstUserId;
   return userId;
+}
+
+function workerLabel(worker: AutoOrderWorkerState): string {
+  return `worker=${worker.workerIndex + 1}/${Math.max(1, autoOrderState.workerCount)}`;
+}
+
+function createAutoOrderWorkers(cfg: AutoOrderConfig): AutoOrderWorkerState[] {
+  return Array.from({ length: cfg.concurrency }, (_, workerIndex) => ({
+    workerIndex,
+    timerId: undefined,
+    correctionTimerId: undefined,
+    nextUserId: firstWorkerUserId(cfg, workerIndex, cfg.concurrency),
+  }));
+}
+
+function randomCorrectionDelayMs(): number {
+  return (
+    AUTO_CORRECTION_INTERVAL_MIN_MS +
+    Math.floor(
+      Math.random() * (AUTO_CORRECTION_INTERVAL_MAX_MS - AUTO_CORRECTION_INTERVAL_MIN_MS + 1),
+    )
+  );
 }
 
 function pickRandomAction(actions: AutoActionKind[]): AutoActionKind {
@@ -731,76 +886,76 @@ function costToConsumeStock(orders: Array<Record<string, unknown>>, targetStock:
   return cost;
 }
 
-async function buildMarketOrderAmount(side: number, targetStock: number): Promise<string | null> {
+async function buildMarketOrderAmount(
+  side: number,
+  targetStock: number,
+  cfg: AutoOrderConfig,
+): Promise<string | null> {
+  const reserveStock = autoRestingDepthTarget(cfg);
   if (side === 2) {
     const asks = await fetchOrderBookSide(1);
-    const amountMoney = costToConsumeStock(asks, targetStock) * MARKET_BUY_AMOUNT_BUFFER;
-    return amountMoney > 0 ? formatMoneyAmount(amountMoney) : null;
+    const availableStock = Math.max(0, sumOrderLeft(asks) - reserveStock);
+    if (availableStock <= 0) return null;
+    const amountMoney =
+      costToConsumeStock(asks, Math.min(targetStock, availableStock)) * MARKET_BUY_AMOUNT_BUFFER;
+    const formatted = amountMoney > 0 ? formatMoneyAmount(amountMoney) : null;
+    return formatted !== null && parsePositiveAmount(formatted) > 0 ? formatted : null;
   }
 
   const bids = await fetchOrderBookSide(2);
-  const availableStock = sumOrderLeft(bids);
+  const availableStock = Math.max(0, sumOrderLeft(bids) - reserveStock);
   if (availableStock <= 0) return null;
-  return formatStockAmount(Math.min(targetStock, availableStock));
+  const formatted = formatStockAmount(Math.min(targetStock, availableStock));
+  return parsePositiveAmount(formatted) > 0 ? formatted : null;
 }
 
-async function rebalanceOrderBook(): Promise<void> {
+async function rebalanceOrderBook(worker: AutoOrderWorkerState): Promise<void> {
   if (!autoOrderState.running) return;
   const cfg = readAutoOrderConfig();
-  const [asks, bids] = await Promise.all([
-    fetchOrderBookSide(1),
-    fetchOrderBookSide(2),
-  ]);
+  const userId = nextAutoUserId(cfg, worker);
+  if (userId === null) return;
+
+  const [asks, bids] = await Promise.all([fetchOrderBookSide(1), fetchOrderBookSide(2)]);
   const askStock = sumOrderLeft(asks);
   const bidStock = sumOrderLeft(bids);
-  const total = askStock + bidStock;
-  if (total <= 0) return;
-
   const diff = askStock - bidStock;
-  const imbalance = Math.abs(diff) / total;
-  if (imbalance < AUTO_REBALANCE_THRESHOLD) return;
-
-  const userId = nextAutoUserId(cfg);
-  const maxStockAmount = Math.max(
-    parseNumberOrNull(cfg.amountMax) ?? 0,
-    parseNumberOrNull(cfg.amountMin) ?? 0,
-  );
-  const targetStock = Math.min(Math.abs(diff) / 2, maxStockAmount > 0 ? maxStockAmount : Math.abs(diff) / 2);
+  const targetStock = Math.abs(diff) * AUTO_CORRECTION_RATIO;
   if (targetStock <= 0) return;
 
-  if (diff > 0) {
-    const amountMoney = costToConsumeStock(asks, targetStock) * MARKET_BUY_AMOUNT_BUFFER;
-    if (amountMoney <= 0) return;
-    const amount = formatMoneyAmount(amountMoney);
-    setAutoOrderStatus(`Balancing: market buy user=${userId} amount=${amount}`);
-    await submitMarketOrder(userId, 2, amount);
+  const side = diff > 0 ? 2 : 1;
+  const amount = await buildMarketOrderAmount(side, targetStock, cfg);
+  if (amount === null) {
+    setAutoOrderStatus(`Correction: ${workerLabel(worker)} skip side=${side}, rival book too thin`);
     return;
   }
 
-  const amountStock = Math.min(targetStock, bidStock);
-  if (amountStock <= 0) return;
-  const amount = formatStockAmount(amountStock);
-  setAutoOrderStatus(`Balancing: market sell user=${userId} amount=${amount}`);
-  await submitMarketOrder(userId, 1, amount);
+  setAutoOrderStatus(
+    `Correction: ${workerLabel(worker)} market user=${userId} side=${side} amount=${amount}`,
+  );
+  await submitMarketOrder(userId, side, amount);
 }
 
-async function performAutoOrderStep(): Promise<void> {
+async function performAutoOrderStep(worker: AutoOrderWorkerState): Promise<void> {
   const cfg = readAutoOrderConfig();
-  const userId = nextAutoUserId(cfg);
+  const userId = nextAutoUserId(cfg, worker);
+  if (userId === null) {
+    setAutoOrderStatus(`Running: ${workerLabel(worker)} has no assigned user_id`);
+    return;
+  }
   let action = pickRandomAction(cfg.actions);
 
   if (action === "cancel") {
     const orderIds = await fetchUserPendingOrders(userId);
     if (orderIds.length > 0) {
       const orderId = orderIds[Math.floor(Math.random() * orderIds.length)]!;
-      setAutoOrderStatus(`Running: cancel user=${userId} order=${orderId}`);
+      setAutoOrderStatus(`Running: ${workerLabel(worker)} cancel user=${userId} order=${orderId}`);
       await submitCancelOrder(userId, orderId);
       return;
     }
 
     const fallback = cfg.actions.filter((item) => item !== "cancel");
     if (fallback.length === 0) {
-      setAutoOrderStatus(`Running: no pending orders to cancel for user=${userId}`);
+      setAutoOrderStatus(`Running: ${workerLabel(worker)} no pending orders to cancel for user=${userId}`);
       return;
     }
     action = pickRandomAction(fallback);
@@ -811,49 +966,63 @@ async function performAutoOrderStep(): Promise<void> {
 
   if (action === "limit") {
     const price = randomDecimalStringAtScale(cfg.priceMin, cfg.priceMax, pricePrecision);
-    setAutoOrderStatus(`Running: limit user=${userId} side=${side} price=${price} amount=${amount}`);
+    setAutoOrderStatus(
+      `Running: ${workerLabel(worker)} limit user=${userId} side=${side} price=${price} amount=${amount}`,
+    );
     await submitLimitOrder(userId, side, price, amount);
     return;
   }
 
-  const marketAmount = await buildMarketOrderAmount(side, parsePositiveAmount(amount));
+  const marketAmount = await buildMarketOrderAmount(side, parsePositiveAmount(amount), cfg);
   if (marketAmount === null) {
-    setAutoOrderStatus(`Running: skip market side=${side}, no rival orders`);
+    setAutoOrderStatus(`Running: ${workerLabel(worker)} skip market side=${side}, rival book too thin`);
     return;
   }
-  setAutoOrderStatus(`Running: market user=${userId} side=${side} amount=${marketAmount}`);
+  setAutoOrderStatus(
+    `Running: ${workerLabel(worker)} market user=${userId} side=${side} amount=${marketAmount}`,
+  );
   await submitMarketOrder(userId, side, marketAmount);
 }
 
-function clearAutoOrderTimer(): void {
-  if (autoOrderState.timerId !== undefined) {
-    window.clearTimeout(autoOrderState.timerId);
-    autoOrderState.timerId = undefined;
+function clearAutoOrderTimer(worker: AutoOrderWorkerState): void {
+  if (worker.timerId !== undefined) {
+    window.clearTimeout(worker.timerId);
+    worker.timerId = undefined;
   }
 }
 
-function clearAutoOrderBalanceTimer(): void {
-  if (autoOrderState.balanceTimerId !== undefined) {
-    window.clearTimeout(autoOrderState.balanceTimerId);
-    autoOrderState.balanceTimerId = undefined;
+function clearAutoOrderBalanceTimer(worker: AutoOrderWorkerState): void {
+  if (worker.correctionTimerId !== undefined) {
+    window.clearTimeout(worker.correctionTimerId);
+    worker.correctionTimerId = undefined;
   }
 }
 
-function scheduleAutoOrderNextTick(delayMs: number): void {
-  clearAutoOrderTimer();
-  autoOrderState.timerId = window.setTimeout(() => {
-    void runAutoOrderLoop();
+function clearAllAutoOrderTimers(): void {
+  for (const worker of autoOrderState.workers) {
+    clearAutoOrderTimer(worker);
+    clearAutoOrderBalanceTimer(worker);
+  }
+}
+
+function scheduleAutoOrderNextTick(worker: AutoOrderWorkerState, delayMs: number): void {
+  clearAutoOrderTimer(worker);
+  worker.timerId = window.setTimeout(() => {
+    void runAutoOrderLoop(worker);
   }, delayMs);
 }
 
-function scheduleAutoOrderBalanceCheck(delayMs = AUTO_BALANCE_INTERVAL_MS): void {
-  clearAutoOrderBalanceTimer();
-  autoOrderState.balanceTimerId = window.setTimeout(() => {
-    void runAutoOrderBalanceLoop();
+function scheduleAutoOrderBalanceCheck(
+  worker: AutoOrderWorkerState,
+  delayMs = randomCorrectionDelayMs(),
+): void {
+  clearAutoOrderBalanceTimer(worker);
+  worker.correctionTimerId = window.setTimeout(() => {
+    void runAutoOrderBalanceLoop(worker);
   }, delayMs);
 }
 
-async function runAutoOrderLoop(): Promise<void> {
+async function runAutoOrderLoop(worker: AutoOrderWorkerState): Promise<void> {
   if (!autoOrderState.running) return;
   let cfg: AutoOrderConfig;
   try {
@@ -864,40 +1033,48 @@ async function runAutoOrderLoop(): Promise<void> {
   }
 
   try {
-    await performAutoOrderStep();
+    await performAutoOrderStep(worker);
   } catch (e) {
-    setAutoOrderStatus(`Auto order error: ${e instanceof Error ? e.message : String(e)}`);
+    setAutoOrderStatus(
+      `Auto order error: ${workerLabel(worker)} ${e instanceof Error ? e.message : String(e)}`,
+    );
   }
 
   if (!autoOrderState.running) return;
-  scheduleAutoOrderNextTick(cfg.intervalMs);
+  scheduleAutoOrderNextTick(worker, cfg.intervalMs);
 }
 
-async function runAutoOrderBalanceLoop(): Promise<void> {
+async function runAutoOrderBalanceLoop(worker: AutoOrderWorkerState): Promise<void> {
   if (!autoOrderState.running) return;
   try {
-    await rebalanceOrderBook();
+    await rebalanceOrderBook(worker);
   } catch (e) {
-    setAutoOrderStatus(`Auto balance error: ${e instanceof Error ? e.message : String(e)}`);
+    setAutoOrderStatus(
+      `Auto correction error: ${workerLabel(worker)} ${e instanceof Error ? e.message : String(e)}`,
+    );
   }
   if (!autoOrderState.running) return;
-  scheduleAutoOrderBalanceCheck();
+  scheduleAutoOrderBalanceCheck(worker);
 }
 
 function startAutoOrder(): void {
   const cfg = readAutoOrderConfig();
   autoOrderState.running = true;
-  autoOrderState.nextUserId = cfg.userStart;
+  autoOrderState.workerCount = cfg.concurrency;
+  autoOrderState.workers = createAutoOrderWorkers(cfg);
   updateAutoOrderButton();
-  setAutoOrderStatus("Starting...");
-  scheduleAutoOrderNextTick(0);
-  scheduleAutoOrderBalanceCheck();
+  setAutoOrderStatus(`Starting ${autoOrderState.workerCount} workers...`);
+  for (const worker of autoOrderState.workers) {
+    scheduleAutoOrderNextTick(worker, 0);
+    scheduleAutoOrderBalanceCheck(worker);
+  }
 }
 
 function stopAutoOrder(status = "Stopped"): void {
   autoOrderState.running = false;
-  clearAutoOrderTimer();
-  clearAutoOrderBalanceTimer();
+  clearAllAutoOrderTimers();
+  autoOrderState.workerCount = 0;
+  autoOrderState.workers = [];
   updateAutoOrderButton();
   setAutoOrderStatus(status);
 }

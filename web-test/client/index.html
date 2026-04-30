@@ -99,25 +99,82 @@
                       <div class="row auto-order__row auto-order__checks" role="group" aria-label="Auto order actions">
                         <label><input id="auto-enable-limit" type="checkbox" checked /> limit</label>
                         <label><input id="auto-enable-market" type="checkbox" checked /> market</label>
-                        <label><input id="auto-enable-cancel" type="checkbox" checked /> cancel</label>
+                        <label><input id="auto-enable-cancel" type="checkbox" /> cancel</label>
+                      </div>
+                    </div>
+                    <div class="row auto-order__row auto-order__range-row">
+                      <span class="auto-order__range-name">user_id range</span>
+                      <div class="auto-order__range-fields">
+                        <input
+                          id="auto-user-start"
+                          type="number"
+                          value="1"
+                          min="1"
+                          title="First user_id included in the auto order rotation."
+                          aria-label="user_id start"
+                        />
+                        <span class="auto-order__range-sep">-</span>
+                        <input
+                          id="auto-user-end"
+                          type="number"
+                          value="1000"
+                          min="1"
+                          title="Last user_id included in the auto order rotation."
+                          aria-label="user_id end"
+                        />
+                      </div>
+                    </div>
+                    <div class="row auto-order__row auto-order__range-row">
+                      <span class="auto-order__range-name">limit price range</span>
+                      <div class="auto-order__range-fields">
+                        <input
+                          id="auto-price-min"
+                          value="90"
+                          title="Lower bound for randomly generated limit prices."
+                          aria-label="limit price min"
+                        />
+                        <span class="auto-order__range-sep">-</span>
+                        <input
+                          id="auto-price-max"
+                          value="110"
+                          title="Upper bound for randomly generated limit prices."
+                          aria-label="limit price max"
+                        />
+                      </div>
+                    </div>
+                    <div class="row auto-order__row auto-order__range-row">
+                      <span class="auto-order__range-name">per-order amount range</span>
+                      <div class="auto-order__range-fields">
+                        <input
+                          id="auto-amount-min"
+                          value="1"
+                          title="Lower bound for the amount of each generated order."
+                          aria-label="order amount min"
+                        />
+                        <span class="auto-order__range-sep">-</span>
+                        <input
+                          id="auto-amount-max"
+                          value="10"
+                          title="Upper bound for the amount of each generated order."
+                          aria-label="order amount max"
+                        />
                       </div>
                     </div>
                     <div class="row auto-order__row auto-order__row--pair">
-                      <label>user_id start <input id="auto-user-start" type="number" value="1" min="1" /></label>
-                      <label>user_id end <input id="auto-user-end" type="number" value="20" min="1" /></label>
+                      <label title="Minimum order-book size to keep on each side. Auto order will avoid consuming liquidity below this depth.">
+                        min resting depth
+                        <input id="auto-resting-depth" value="50" />
+                      </label>
+                      <label title="Delay between auto order steps in milliseconds.">
+                        step interval (ms)
+                        <input id="auto-interval-ms" type="number" value="200" min="10" step="10" />
+                      </label>
                     </div>
-                    <div class="row auto-order__row auto-order__row--pair">
-                      <label>price min <input id="auto-price-min" value="90" /></label>
-                      <label>price max <input id="auto-price-max" value="110" /></label>
-                    </div>
-                    <div class="row auto-order__row auto-order__row--pair">
-                      <label>amount min <input id="auto-amount-min" value="1" /></label>
-                      <label>amount max <input id="auto-amount-max" value="10" /></label>
-                    </div>
-                    <div class="row auto-order__row">
-                      <label>interval ms <input id="auto-interval-ms" type="number" value="400" min="10" step="10" /></label>
-                    </div>
-                    <div class="row auto-order__row">
+                    <div class="row auto-order__row auto-order__action-row">
+                      <label title="Number of concurrent auto-order workers. Each worker uses a separate user_id partition.">
+                        concurrency
+                        <input id="auto-concurrency" type="number" value="1" min="1" max="16" step="1" />
+                      </label>
                       <button type="button" id="btn-auto-order" class="state-toggle-btn">Start</button>
                     </div>
                   </section>
