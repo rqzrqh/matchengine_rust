@@ -1,0 +1,9 @@
+---
+description: Reply language for AI assistant in this project
+alwaysApply: true
+---
+
+# Communication language
+
+- **Assistant replies**: Use **English** for all user-facing responses (explanations, commit messages you draft, comments you add only if the codebase is English, etc.).
+- **Code and docs**: Match the language of the surrounding file; default for new prose in this repo is English unless the file is already in another language.

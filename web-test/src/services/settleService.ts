@@ -10,7 +10,9 @@ const SETTLE_TOPIC = "settle";
 
 /**
  * Consumes Kafka topic `settle` (N partitions, default 64); `settle_group_id` = message partition index.
- * Seeks each partition on startup. When `msgid` moves forward, appends the raw payload to `settle_messages` and updates state; otherwise only the offset advances.
+ * Seeks each partition on startup. For each partition, a message is accepted only
+ * when `settle_message_id == db_last_settle_message_id + 1`; stale/duplicate ids
+ * only advance the offset, and gaps raise an error.
  */
 export class SettleService {
   private consumer: Consumer | null = null;
@@ -85,11 +87,21 @@ export class SettleService {
         }
 
         const market = String(payload.market ?? marketName);
-        const rootMsgid = numOrNull(payload.msgid);
+        const settleMessageId = u64OrNull(payload.settle_message_id);
 
-        await this.handleSettleMessage(getDb(), topic, settleGroup, market, offset, raw, rootMsgid);
+        const inserted = await this.handleSettleMessage(
+          getDb(),
+          topic,
+          settleGroup,
+          market,
+          offset,
+          raw,
+          settleMessageId,
+        );
 
-        this.hub.broadcast("settle", { topic, ...payload });
+        if (inserted) {
+          this.hub.broadcast("settle", { topic, ...payload });
+        }
 
         await this.safeCommit(topic, partition, offset);
       },
@@ -113,10 +125,12 @@ export class SettleService {
     const row = await mgr.findOne(SettleConsumerState, {
       where: { settleGroupId: settleGroup, market },
     });
-    await this.upsertOffsetOnly(ds, settleGroup, market, offset, row?.lastMsgid ?? null);
+    await this.upsertOffsetOnly(ds, settleGroup, market, offset, row?.lastSettleMessageId ?? null);
   }
 
-  /** Appends raw Kafka value to `settle_messages` when `msgid` advances. */
+  /**
+   * @returns whether a new `settle_messages` row was inserted (triggers WebSocket push)
+   */
   private async handleSettleMessage(
     ds: AppDb,
     topic: string,
@@ -124,28 +138,37 @@ export class SettleService {
     market: string,
     offset: bigint,
     raw: string,
-    rootMsgid: number | null,
-  ): Promise<void> {
+    settleMessageId: bigint | null,
+  ): Promise<boolean> {
     const mgr = ds.manager;
     const row = await mgr.findOne(SettleConsumerState, {
       where: { settleGroupId: settleGroup, market },
     });
 
-    const lastMsgid = row?.lastMsgid ?? null;
+    const lastSettleMessageId = parseStoredU64(row?.lastSettleMessageId);
 
-    if (rootMsgid === null) {
-      await this.upsertOffsetOnly(ds, settleGroup, market, offset, lastMsgid);
-      return;
+    if (settleMessageId === null) {
+      throw new Error(
+        `[settle] invalid settle_message_id topic=${topic} partition=${settleGroup} offset=${offset} market=${market}`,
+      );
     }
 
-    if (lastMsgid !== null && rootMsgid < lastMsgid) {
-      await this.upsertOffsetOnly(ds, settleGroup, market, offset, lastMsgid);
-      return;
+    if (settleMessageId <= lastSettleMessageId) {
+      await this.upsertOffsetOnly(
+        ds,
+        settleGroup,
+        market,
+        offset,
+        row?.lastSettleMessageId ?? lastSettleMessageId.toString(),
+      );
+      return false;
     }
 
-    if (lastMsgid !== null && rootMsgid === lastMsgid) {
-      await this.upsertOffsetOnly(ds, settleGroup, market, offset, lastMsgid);
-      return;
+    const expected = lastSettleMessageId + 1n;
+    if (settleMessageId !== expected) {
+      throw new Error(
+        `[settle] settle_message_id gap topic=${topic} partition=${settleGroup} offset=${offset} market=${market} message=${settleMessageId} expected=${expected} current=${lastSettleMessageId}`,
+      );
     }
 
     const now = unixSecondsNow();
@@ -156,7 +179,8 @@ export class SettleService {
       rawJson: raw,
     });
 
-    await this.upsertWithMsgid(ds, settleGroup, market, offset, rootMsgid, now);
+    await this.upsertWithSettleMessageId(ds, settleGroup, market, offset, settleMessageId, now);
+    return true;
   }
 
   private async upsertOffsetOnly(
@@ -164,7 +188,7 @@ export class SettleService {
     settleGroup: number,
     market: string,
     offset: bigint,
-    keepMsgid: number | null,
+    keepSettleMessageId: string | null,
   ): Promise<void> {
     const mgr = ds.manager;
     const now = unixSecondsNow();
@@ -183,18 +207,18 @@ export class SettleService {
         settleGroupId: settleGroup,
         market,
         lastOffset: offset.toString(),
-        lastMsgid: keepMsgid,
+        lastSettleMessageId: keepSettleMessageId,
         updatedAt: now,
       });
     }
   }
 
-  private async upsertWithMsgid(
+  private async upsertWithSettleMessageId(
     ds: AppDb,
     settleGroup: number,
     market: string,
     offset: bigint,
-    msgid: number,
+    settleMessageId: bigint,
     now: number,
   ): Promise<void> {
     const mgr = ds.manager;
@@ -206,14 +230,18 @@ export class SettleService {
       await mgr.update(
         SettleConsumerState,
         { id: r.id },
-        { lastOffset: offset.toString(), lastMsgid: msgid, updatedAt: now },
+        {
+          lastOffset: offset.toString(),
+          lastSettleMessageId: settleMessageId.toString(),
+          updatedAt: now,
+        },
       );
     } else {
       await mgr.insert(SettleConsumerState, {
         settleGroupId: settleGroup,
         market,
         lastOffset: offset.toString(),
-        lastMsgid: msgid,
+        lastSettleMessageId: settleMessageId.toString(),
         updatedAt: now,
       });
     }
@@ -227,10 +255,22 @@ export class SettleService {
   }
 }
 
-function numOrNull(v: unknown): number | null {
+function parseStoredU64(v: string | null | undefined): bigint {
+  if (!v) return 0n;
+  return BigInt(v);
+}
+
+function u64OrNull(v: unknown): bigint | null {
   if (v === undefined || v === null) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.trunc(n) : null;
+  if (typeof v === "bigint") return v >= 0n ? v : null;
+  if (typeof v === "number") {
+    if (!Number.isSafeInteger(v) || v < 0) return null;
+    return BigInt(v);
+  }
+  if (typeof v === "string" && /^[0-9]+$/.test(v)) {
+    return BigInt(v);
+  }
+  return null;
 }
 
 export function serializeSettleMessage(r: SettleMessage): Record<string, unknown> {

@@ -22,7 +22,12 @@ fn update_time(taker: &Rc<Order>, maker: &Rc<Order>) -> i64 {
     tm
 }
 
-fn execute_limit_ask_order(publisher: &Publish, m: &mut Market, extern_id: u64, taker: &Rc<Order>) {
+fn execute_limit_ask_order<P: MatchPublisher + ?Sized>(
+    publisher: &P,
+    m: &mut Market,
+    extern_id: u64,
+    taker: &Rc<Order>,
+) {
     while !m.bids.is_empty() && taker.left.get() > Decimal::ZERO {
         let maker_ref = m.bids.front().unwrap();
         let maker = maker_ref.clone();
@@ -96,7 +101,12 @@ fn execute_limit_ask_order(publisher: &Publish, m: &mut Market, extern_id: u64, 
     }
 }
 
-fn execute_limit_bid_order(publisher: &Publish, m: &mut Market, extern_id: u64, taker: &Rc<Order>) {
+fn execute_limit_bid_order<P: MatchPublisher + ?Sized>(
+    publisher: &P,
+    m: &mut Market,
+    extern_id: u64,
+    taker: &Rc<Order>,
+) {
     while !m.asks.is_empty() && taker.left.get() > Decimal::ZERO {
         let maker_ref = m.asks.front().unwrap();
         let maker = maker_ref.clone();
@@ -170,8 +180,8 @@ fn execute_limit_bid_order(publisher: &Publish, m: &mut Market, extern_id: u64, 
     }
 }
 
-fn execute_market_ask_order(
-    publisher: &Publish,
+fn execute_market_ask_order<P: MatchPublisher + ?Sized>(
+    publisher: &P,
     m: &mut Market,
     extern_id: u64,
     taker: &Rc<Order>,
@@ -244,8 +254,8 @@ fn execute_market_ask_order(
     }
 }
 
-fn execute_market_bid_order(
-    publisher: &Publish,
+fn execute_market_bid_order<P: MatchPublisher + ?Sized>(
+    publisher: &P,
     m: &mut Market,
     extern_id: u64,
     taker: &Rc<Order>,
@@ -335,8 +345,8 @@ fn execute_market_bid_order(
     }
 }
 
-pub fn market_put_limit_order(
-    publisher: &Publish,
+pub fn market_put_limit_order<P: MatchPublisher + ?Sized>(
+    publisher: &P,
     m: &mut Market,
     extern_id: u64,
     user_id: u32,
@@ -391,8 +401,8 @@ pub fn market_put_limit_order(
 }
 
 // amount is stock or money
-pub fn market_put_market_order(
-    publisher: &Publish,
+pub fn market_put_market_order<P: MatchPublisher + ?Sized>(
+    publisher: &P,
     m: &mut Market,
     extern_id: u64,
     user_id: u32,

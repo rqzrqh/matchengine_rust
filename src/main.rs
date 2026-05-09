@@ -28,13 +28,15 @@ mod publish;
 mod snap_cleanup;
 mod task;
 
-// Runtime layout (one OS process, one market):
+// Runtime layout (one OS process, one market). Profiler-visible thread prefixes: matcher main (unnamed OS main),
+// `snap-cleanup`, `snap-timer`, `http-driver` + `http-worker`, `kafka-consumer`, `quote-publish` + `quote-pub-io`,
+// `settle-publish` + `settle-pub-io` (Tokio appends `-N` suffixes).
 // - Main thread: blocking loop on `main_routine_receiver`; owns `Market`, handles Kafka input, REST replies,
 //   snapshot dumps, and publish progress updates.
-// - HTTP thread: nested Tokio runtime running Axum; forwards `HttpRequest` tasks to the main channel.
-// - Kafka consumer: Tokio runtime (single worker) on `offer.<market>`; sends `MqTask` to the main channel.
-// - Timer thread: periodic `DumpTask` to fork snapshot writers.
-// - Snapshot cleanup thread: periodic `prune_snapshots` against MySQL.
+// - HTTP (`http-driver` + nested Tokio `http-worker*`): Axum; forwards `HttpRequest` tasks to the main channel.
+// - Kafka consumer: Tokio `kafka-consumer*` (single worker) on `offer.<market>`; sends `MqTask` to the main channel.
+// - Timer `snap-timer`: periodic `DumpTask` to fork snapshot writers.
+// - Snapshot cleanup `snap-cleanup`: periodic `prune_snapshots` against MySQL.
 
 async fn start_httpserver(main_routine_sender: mpsc::Sender<task::Task>, addr: SocketAddr) {
     http::serve_engine_http(
@@ -114,7 +116,7 @@ fn main() {
     let cfg_path = args.get(1).map(|s| s.as_str()).unwrap_or("config.yaml");
 
     let cfg = config::load_config(cfg_path).unwrap_or_else(|e| {
-        error!("config load failed: {}", e);
+        error!("config load failed: {} {}", cfg_path, e);
         process::exit(1);
     });
 
@@ -184,18 +186,21 @@ fn main() {
 
     let pool_snap_cleanup = pool.clone();
     let snap_cleanup_cfg = cfg.snap_cleanup.clone();
-    let _snap_cleanup_thread = thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(
-                snap_cleanup_cfg.cleanup_interval_secs.max(1),
-            ));
-            snap_cleanup::prune_snapshots(
-                &pool_snap_cleanup,
-                snap_cleanup_cfg.max_age_secs,
-                snap_cleanup_cfg.max_snapshots,
-            );
-        }
-    });
+    let _snap_cleanup_thread = thread::Builder::new()
+        .name("snap-cleanup".to_owned())
+        .spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(
+                    snap_cleanup_cfg.cleanup_interval_secs.max(1),
+                ));
+                snap_cleanup::prune_snapshots(
+                    &pool_snap_cleanup,
+                    snap_cleanup_cfg.max_age_secs,
+                    snap_cleanup_cfg.max_snapshots,
+                );
+            }
+        })
+        .expect("spawn snap-cleanup thread");
 
     let (main_routine_sender, main_routine_receiver) = mpsc::channel();
 
@@ -209,10 +214,17 @@ fn main() {
     );
 
     let main_routine_sender_http_clone = main_routine_sender.clone();
-    let http_thread = thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        rt.block_on(start_httpserver(main_routine_sender_http_clone, http_addr));
-    });
+    let http_thread = thread::Builder::new()
+        .name("http-driver".to_owned())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("http-worker")
+                .build()
+                .expect("http tokio runtime");
+            rt.block_on(start_httpserver(main_routine_sender_http_clone, http_addr));
+        })
+        .expect("spawn http thread");
 
     let main_routine_sender_mq_clone = main_routine_sender.clone();
     let brokers_clone2 = brokers.clone();
@@ -220,6 +232,8 @@ fn main() {
 
     let consumer_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1) // consumer loop only
+        // Stable name for profilers (Instruments / sample): distinguishes this from HTTP `tokio-runtime-worker`.
+        .thread_name("kafka-consumer")
         .enable_all()
         .build()
         .unwrap();
@@ -276,18 +290,21 @@ fn main() {
 
     let dump_every_secs = cfg.snap_dump.dump_interval_secs.max(1);
     let main_routine_sender_timer_clone = main_routine_sender.clone();
-    let timer_thread = thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(dump_every_secs));
-            let now = Utc::now();
-            let task = task::SqlDumpTask {
-                tm: now.timestamp(),
-            };
-            main_routine_sender_timer_clone
-                .send(task::Task::DumpTask(task))
-                .expect("send dumptask failed");
-        }
-    });
+    let timer_thread = thread::Builder::new()
+        .name("snap-timer".to_owned())
+        .spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(dump_every_secs));
+                let now = Utc::now();
+                let task = task::SqlDumpTask {
+                    tm: now.timestamp(),
+                };
+                main_routine_sender_timer_clone
+                    .send(task::Task::DumpTask(task))
+                    .expect("send dumptask failed");
+            }
+        })
+        .expect("spawn snap dump timer thread");
 
     loop {
         let task = main_routine_receiver.recv().unwrap();

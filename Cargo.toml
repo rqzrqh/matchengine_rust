@@ -24,3 +24,10 @@ env_logger = "0.11"
 process_lock = "0.1.0"
 rdkafka = "0.38.0"
 uuid = { version = "*", features = ["v4"] }
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name = "matching_engine"
+harness = false

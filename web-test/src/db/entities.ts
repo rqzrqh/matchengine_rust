@@ -96,8 +96,8 @@ export class SettleConsumerState {
   @Column({ name: "last_offset", type: "bigint" })
   lastOffset!: string;
 
-  @Column({ name: "last_msgid", type: "int", nullable: true })
-  lastMsgid!: number | null;
+  @Column({ name: "last_settle_message_id", type: "bigint", nullable: true })
+  lastSettleMessageId!: string | null;
 
   @Column({ name: "updated_at", type: "int" })
   updatedAt!: number;

@@ -9,7 +9,7 @@ More detail: [design.md](https://github.com/rqzrqh/matchengine_rust/blob/master/
 
 ![Test architecture diagram](https://raw.githubusercontent.com/rqzrqh/matchengine_rust/refs/heads/master/image/test_architecture.png)
 
-For OS threads and Tokio runtimes inside the engine binary, see the comment block at the top of **`src/main.rs`**; for messaging protocol notes see **`doc/design.md`**.
+For OS threads and Tokio runtimes inside the engine binary, see **`doc/thread-model.md`**; for messaging protocol notes see **`doc/design.md`**.
 
 ### Deployment
 
@@ -99,6 +99,22 @@ cargo test
 
 The crate may ship with **no** `#[test]` cases yet (`running 0 tests` is normal); the command still verifies that the project **builds** under the test profile.
 
+#### Matching core benchmark
+
+The bundled Criterion benchmark measures only the in-memory matching core with a no-op publisher. It is useful for comparing code changes, but it is not the real engine TPS because it excludes Kafka consume/produce, JSON serialization, channel handoff, OS scheduling, and database snapshot work:
+
+```bash
+cargo bench --bench matching_engine
+```
+
+Read Criterion's `thrpt` / `elem/s` output as a core upper-bound metric:
+
+- `cross_limit_order_core_throughput`: in-memory limit-order crossing throughput; each submitted bid crosses one resting ask.
+- `market_order_sweep_core_deal_throughput`: in-memory deal throughput when one market order sweeps many resting asks.
+- `resting_limit_order_core_throughput`: in-memory order-book insert throughput for non-crossing limit orders.
+
+To know deployable TPS, run the engine against Kafka/MySQL and drive `offer.<market>` with the same message shape as production, then measure accepted input rate together with `quote_deals.<market>`, `settle.*`, publish backlog, and engine latency.
+
 #### Matching engine HTTP
 
 With the engine running and `market.name` (e.g. `eth_btc`):
@@ -116,7 +132,7 @@ With **`npm run dev`** in **`web-test/`**, open the printed URL (typically **`ht
 
 #### Load / integration
 
-There is no bundled load-test binary in this repo. For integration testing, run the engine against a dev Kafka/MySQL stack, publish orders to **`offer.<market>`** as your upstream does, and observe **`quote_deals.<market>`** / **`settle.*`** plus engine HTTP and DB state.
+For end-to-end integration testing, run the engine against a dev Kafka/MySQL stack, publish orders to **`offer.<market>`** as your upstream does, and observe **`quote_deals.<market>`** / **`settle.*`** plus engine HTTP and DB state.
 
 ### Project layout
 

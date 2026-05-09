@@ -2,3 +2,9 @@
 target/*
 Cargo.lock
 .DS_Store
+instruments*
+profiling/
+*-xctrace*
+# Track Cursor skill at this path despite *-xctrace* matching the directory name
+!.cursor/skills/matchengine-xctrace-profile/
+!.cursor/skills/matchengine-xctrace-profile/**

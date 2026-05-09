@@ -1,160 +1,163 @@
-# 撮合引擎 HTTP 协议
+# Matching engine HTTP API
 
-本文档描述进程内只读查询接口。每个引擎进程只服务一个市场（`config.yaml` 中的 `market.name`），请求路径里的 `:market` 必须与该市场名一致，否则返回 **404** 及 `{"error":"unknown market"}`。
+Read-only, in-process query endpoints. Each engine process serves **one** market (`market.name` in `config.yaml`). The `:market` path segment must match that name; otherwise the server returns **404** with `{"error":"unknown market"}`.
 
-**说明**：单进程、单市场；监听地址在 `src/main.rs` 中写死为 `127.0.0.1:8080`（可据此推断基础 URL；若你本地改过源码，以实际运行为准）。
+**Note**: single process, single market; the bind address is hard-coded in `src/main.rs` as `127.0.0.1:8080` (infer the base URL from that; if you change the source locally, use your actual run).
 
-## 通用约定
+## General conventions
 
-| 项 | 说明 |
-|----|------|
-| 方法 | 仅 **GET**；其它方法对未定义路径返回 **405**（纯文本 `method not allowed`） |
-| 内容类型 | 成功时响应体为 **JSON**，`Content-Type: application/json` |
-| CORS | 使用宽松策略（`CorsLayer::permissive`），成功响应与部分错误会带 `Access-Control-Allow-Origin: *` |
-| 未匹配 GET | **404**（纯文本 `not found`） |
-| 市场不存在 | **404**，JSON：`{"error":"unknown market"}` |
-| 业务错误体 | 形如 `{"error":"..."} ` |
+| Item | Behavior |
+|------|----------|
+| Method | **GET** only; other methods on undefined routes return **405** with plain text `method not allowed` |
+| Content-Type | Successful bodies are **JSON** with `Content-Type: application/json` |
+| CORS | Permissive (`CorsLayer::permissive`); success and some errors include `Access-Control-Allow-Origin: *` |
+| Unmatched GET | **404** with plain text `not found` |
+| Unknown market | **404**, JSON: `{"error":"unknown market"}` |
+| Business errors | Shape `{"error":"..."}` |
 
-请求由 Axum 转发到主线程的撮合状态上执行，为同步阻塞查询。
+Axum forwards each request to the main matcher thread; execution is a synchronous blocking read of matcher state.
 
 ---
 
-## 1. 市场汇总
+## 1. Market summary
 
 `GET /markets/{market}/summary`
 
-| HTTP 状态 | 含义 |
-|-----------|------|
-| 200 | 成功 |
-| 404 | 市场名不匹配 |
+| HTTP status | Meaning |
+|-------------|---------|
+| 200 | OK |
+| 404 | Market name mismatch |
 
-**成功响应字段**
+**Successful response fields**
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `name` | string | 市场名 |
-| `ask_count` | number | 卖单（asks）条数 |
-| `bid_count` | number | 买单（bids）条数 |
-| `ask_stock_amount` | string | 总卖 stock 的量，即所有卖单 `left` 之和 |
-| `ask_money_amount` | string | 总卖 token 量乘以价格的总金额，即所有卖单 `price * left` 之和 |
-| `bid_stock_amount` | string | 总买 stock 的量，即所有买单 `left` 之和 |
-| `bid_money_amount` | string | 总买 stock 的量乘以价格的总金额，即所有买单 `price * left` 之和 |
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Market name |
+| `ask_count` | number | Number of ask orders |
+| `bid_count` | number | Number of bid orders |
+| `ask_stock_amount` | string | Sum of `left` across asks |
+| `ask_money_amount` | string | Sum of `price * left` across asks |
+| `bid_stock_amount` | string | Sum of `left` across bids |
+| `bid_money_amount` | string | Sum of `price * left` across bids |
 
 ---
 
-## 2. 市场内部状态/游标
+## 2. Market internal status / cursors
 
 `GET /markets/{market}/status`
 
-| HTTP 状态 | 含义 |
-|-----------|------|
-| 200 | 成功 |
-| 404 | 市场名不匹配 |
+| HTTP status | Meaning |
+|-------------|---------|
+| 200 | OK |
+| 404 | Market name mismatch |
 
-**成功响应字段**
+**Successful response fields**
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `oper_id` | number | 操作 id |
-| `order_id` | number | 当前订单 id 游标相关 |
-| `deals_id` | number | 成交 id 相关 |
-| `message_id` | number | 消息 id 相关 |
-| `input_offset` | number | 输入游标（Kafka 等） |
-| `input_sequence_id` | number | 输入序列 id |
+| Field | Type | Description |
+|-------|------|-------------|
+| `oper_id` | number | Operation id |
+| `order_id` | number | Order id cursor |
+| `deals_id` | number | Deal id cursor |
+| `message_id` | number | Message id cursor |
+| `settle_message_ids` | array | Per settle-group message ids |
+| `input_offset` | number | Input cursor (e.g. Kafka) |
+| `input_sequence_id` | number | Input sequence id |
+| `pushed_quote_deals_id` | number | Last quote deal id confirmed published |
+| `pushed_settle_message_ids` | array | Per-group ids confirmed published to settle |
 
 ---
 
-## 3. 订单详情
+## 3. Order detail
 
 `GET /markets/{market}/orders/{order_id}`
 
-路径参数 `order_id` 为无符号 64 位整数。
+Path `order_id` is an unsigned 64-bit integer.
 
-| HTTP 状态 | 含义 |
-|-----------|------|
-| 200 | 找到订单 |
-| 404 | 市场不存在，或 `order not found` |
+| HTTP status | Meaning |
+|-------------|---------|
+| 200 | Order found |
+| 404 | Unknown market or `order not found` |
 
-**订单对象**（`200` 时根对象即为单条订单，字段均来自 `Order::to_json`）
+**Order object** (root JSON on 200; fields from `Order::to_json`)
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | number | 订单 id |
-| `type` | number | 订单类型：`1` 限价、`2` 市价（与 `market` 中常量一致） |
-| `side` | number | `1` 卖（ask）、`2` 买（bid） |
-| `create_time` | number | 创建时间 |
-| `update_time` | number | 更新时间 |
-| `user_id` | number | 用户 id |
-| `price` | string | 价格（定标到该市场的报价小数位） |
-| `amount` | string | 数量（`stock_prec`） |
-| `taker_fee_rate` | string | Taker 费率（`fee_rate_prec`） |
-| `maker_fee_rate` | string | Maker 费率（`fee_rate_prec`） |
-| `left` | string | 剩余量；市价买单按 **金额** 精度（`money_prec`），否则为 `stock_prec` |
-| `deal_stock` | string | 已成交数量（`stock_prec`） |
-| `deal_money` | string | 已成交金额（`money_prec`） |
-| `deal_fee` | string | 已付手续费（`money_prec`） |
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | number | Order id |
+| `type` | number | `1` limit, `2` market (same constants as `market`) |
+| `side` | number | `1` ask, `2` bid |
+| `create_time` | number | Created at |
+| `update_time` | number | Updated at |
+| `user_id` | number | User id |
+| `price` | string | Price (market price scale) |
+| `amount` | string | Amount (`stock_prec`) |
+| `taker_fee_rate` | string | Taker fee rate (`fee_rate_prec`) |
+| `maker_fee_rate` | string | Maker fee rate (`fee_rate_prec`) |
+| `left` | string | Remaining size; market **buy** uses **money** precision (`money_prec`), else `stock_prec` |
+| `deal_stock` | string | Filled stock (`stock_prec`) |
+| `deal_money` | string | Filled notional (`money_prec`) |
+| `deal_fee` | string | Fee paid (`money_prec`) |
 
 ---
 
-## 4. 订单簿（深度）
+## 4. Order book (depth)
 
 `GET /markets/{market}/order-book?side={side}&offset={offset}&limit={limit}`
 
-| 参数 | 必填 | 默认 | 限制 | 说明 |
-|------|------|------|------|------|
-| `side` | 是 | — | 必须为 `1` 或 `2` | `1` = 卖盘（asks），`2` = 买盘（bids） |
-| `offset` | 否 | `0` | — | 跳过的档位数（从 0 起算） |
-| `limit` | 否 | `12` | 服务端夹紧到 **1～500** | 本页条数 |
+| Param | Required | Default | Limits | Description |
+|-------|----------|---------|--------|-------------|
+| `side` | yes | — | must be `1` or `2` | `1` = asks, `2` = bids |
+| `offset` | no | `0` | — | Skip this many levels from the start |
+| `limit` | no | `12` | clamped **1–500** | Page size |
 
-| HTTP 状态 | 含义 |
-|-----------|------|
-| 200 | 成功（含 `side` 非法时不会到这里） |
-| 400 | `side` 不是 1/2，JSON：`{"error":"invalid side (use 1=ask, 2=bid)"}` |
-| 404 | 市场名不匹配 |
+| HTTP status | Meaning |
+|-------------|---------|
+| 200 | OK (invalid `side` never returns 200 here) |
+| 400 | `side` not 1/2: `{"error":"invalid side (use 1=ask, 2=bid)"}` |
+| 404 | Market name mismatch |
 
-**成功响应**
+**Successful response**
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `limit` | number | 本请求的 limit（夹紧后） |
-| `offset` | number | 本请求的 offset |
-| `total` | number | 该侧订单总数 |
-| `orders` | array | 订单对象列表，元素结构同 [§3 订单对象](#3-订单详情) |
-| `stock_amount` | string | 仅当 `side=1`（卖）：市场侧累计数量相关（`stock_prec`） |
-| `money_amount` | string | 仅当 `side=2`（买）：市场侧累计金额相关（`money_prec`） |
+| Field | Type | Description |
+|-------|------|-------------|
+| `limit` | number | Requested limit after clamping |
+| `offset` | number | Requested offset |
+| `total` | number | Order count on that side |
+| `orders` | array | Orders; same shape as [§3 Order detail](#3-order-detail) |
+| `stock_amount` | string | Present when `side=1` (asks): market aggregate in `stock_prec` |
+| `money_amount` | string | Present when `side=2` (bids): market aggregate in `money_prec` |
 
-卖盘、买盘在实现中按各自顺序取 `offset` 起的 `limit` 条（卖/买簿内的排序与撮合树一致，价格/时间等见引擎实现，此处不展开）。
+Asks and bids are sliced from their respective books with the engine’s ordering (price/time per implementation).
 
 ---
 
-## 5. 用户未完结订单
+## 5. User open orders
 
 `GET /markets/{market}/users/{user_id}/orders?offset={offset}&limit={limit}`
 
-| 参数 | 必填 | 默认 | 限制 |
-|------|------|------|------|
-| `offset` | 否 | `0` | — |
-| `limit` | 否 | `50` | 夹紧到 **1～500** |
+| Param | Required | Default | Limits |
+|-------|----------|---------|--------|
+| `offset` | no | `0` | — |
+| `limit` | no | `50` | clamped **1–500** |
 
-| HTTP 状态 | 含义 |
-|-----------|------|
-| 200 | 成功（用户无订单时 `total=0`，`orders=[]`） |
-| 404 | 市场名不匹配 |
+| HTTP status | Meaning |
+|-------------|---------|
+| 200 | OK (`total=0`, `orders=[]` if user has no orders) |
+| 404 | Market name mismatch |
 
-**成功响应**
+**Successful response**
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `limit` | number | 本请求的 limit（夹紧后） |
-| `offset` | number | 本请求的 offset |
-| `total` | number | 该用户未完结订单总数 |
-| `orders` | array | 订单对象列表，结构同 [§3](#3-订单详情) |
+| Field | Type | Description |
+|-------|------|-------------|
+| `limit` | number | Limit after clamping |
+| `offset` | number | Offset |
+| `total` | number | Count of open orders for the user |
+| `orders` | array | Same shape as [§3](#3-order-detail) |
 
 ---
 
-## 示例
+## Examples
 
-基础路径（以默认端口为例）：
+Default base URL:
 
 ```http
 GET http://127.0.0.1:8080/markets/BTCUSDT/summary
@@ -164,15 +167,15 @@ GET http://127.0.0.1:8080/markets/BTCUSDT/order-book?side=1&offset=0&limit=20
 GET http://127.0.0.1:8080/markets/BTCUSDT/users/42/orders?offset=0&limit=50
 ```
 
-将 `BTCUSDT` 换成你 `config.yaml` 里实际的市场名。
+Replace `BTCUSDT` with the market name from your `config.yaml`.
 
 ---
 
-## 与源码的对应关系
+## Source map
 
-| 文档章节 | 实现位置 |
-|----------|----------|
-| 路由与 query 默认/夹紧 | `src/http/server.rs` |
-| 状态码与 JSON 体 | `src/http/handlers.rs`（`handle_http_request`） |
-| 订单 JSON 各字段定标 | `src/market.rs` 中 `Order::to_json` |
-| 查询枚举 | `src/task.rs` 中 `HttpOp` |
+| Doc section | Code |
+|-------------|------|
+| Routes, query defaults, clamps | `src/http/server.rs` |
+| Status codes and JSON bodies | `src/http/handlers.rs` (`handle_http_request`) |
+| Order JSON field scaling | `src/market.rs` (`Order::to_json`) |
+| Operation enum | `src/task.rs` (`HttpOp`) |
