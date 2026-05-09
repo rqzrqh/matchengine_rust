@@ -1,8 +1,10 @@
 use tokio::sync::oneshot;
 
+/// Kafka payload parsed and envelope-validated on the `kafka-consumer` thread; main thread
+/// applies `input_sequence_id` checks and matcher updates.
 pub struct KafkaMqTask {
     pub offset: i64,
-    pub data: String,
+    pub payload: Result<json::JsonValue, String>,
 }
 
 #[derive(Debug)]

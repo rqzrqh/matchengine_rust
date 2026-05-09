@@ -208,10 +208,18 @@ def _thread_bucket(tf: str) -> str:
         return "Main thread (matcher loop)"
     if "kafka-consumer" in tl:
         return "kafka-consumer (ingress)"
+    if "quote-publish" in tl:
+        return "quote-publish (Kafka out)"
+    if "settle-publish" in tl:
+        return "settle-publish (Kafka out)"
+    if "http-worker" in tl or "http-driver" in tl:
+        return "HTTP (http-driver / http-worker)"
+    if "producer polling" in tl:
+        return "librdkafka producer polling"
     if "rdk:" in tl or "rdkafka" in tl:
         return "librdkafka broker threads"
     if "tokio" in tl or "runtime-worker" in tl:
-        return "Tokio / HTTP workers"
+        return "Tokio / unnamed worker"
     return "Other / helper threads"
 
 

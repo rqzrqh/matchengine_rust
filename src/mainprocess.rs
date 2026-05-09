@@ -3,39 +3,49 @@ use crate::engine::*;
 use crate::error::*;
 use crate::market::*;
 use crate::publish::*;
+use crate::task::KafkaMqTask;
 use json::JsonValue;
 
-pub fn handle_mq_message(publisher: &Publish, m: &mut Market, offset: i64, data: &String) {
-    m.oper_id += 1;
-    m.input_offset = offset;
-
-    let parsed = json::parse(data).unwrap();
+/// JSON-RPC–style envelope validation and `json::parse` — intended to run on the Kafka consumer thread.
+pub fn parse_mq_payload(data: &str) -> Result<JsonValue, String> {
+    let parsed = json::parse(data).map_err(|e| format!("json parse failed: {}", e))?;
     debug!("{}", parsed);
 
     if !parsed.is_object() {
-        error!("mq msg not object {}", parsed);
-        return;
+        return Err(format!("mq msg not object {}", parsed));
     }
 
     if !parsed.has_key("method") || !parsed["method"].is_string() {
-        error!("method parse failed {}", parsed);
-        return;
+        return Err(format!("method parse failed {}", parsed));
     }
 
     if !parsed.has_key("id") || !parsed["id"].is_number() {
-        error!("id parse failed {}", parsed);
-        return;
+        return Err(format!("id parse failed {}", parsed));
     }
 
     if !parsed.has_key("params") || !parsed["params"].is_object() {
-        error!("params parse failed {}", parsed);
-        return;
+        return Err(format!("params parse failed {}", parsed));
     }
 
     if !parsed.has_key("input_sequence_id") || !parsed["input_sequence_id"].is_number() {
-        error!("input_sequence_id parse failed {}", parsed);
-        return;
+        return Err(format!("input_sequence_id parse failed {}", parsed));
     }
+
+    Ok(parsed)
+}
+
+pub fn handle_mq_message(publisher: &Publish, m: &mut Market, mq: KafkaMqTask) {
+    let KafkaMqTask { offset, payload } = mq;
+    m.oper_id += 1;
+    m.input_offset = offset;
+
+    let parsed = match payload {
+        Ok(p) => p,
+        Err(e) => {
+            error!("mq payload error at offset {}: {}", offset, e);
+            return;
+        }
+    };
 
     let msg_seq = parsed["input_sequence_id"].as_u64().unwrap();
     let Some(expected_seq) = m.input_sequence_id.checked_add(1) else {

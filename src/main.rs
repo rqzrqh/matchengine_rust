@@ -34,7 +34,8 @@ mod task;
 // - Main thread: blocking loop on `main_routine_receiver`; owns `Market`, handles Kafka input, REST replies,
 //   snapshot dumps, and publish progress updates.
 // - HTTP (`http-driver` + nested Tokio `http-worker*`): Axum; forwards `HttpRequest` tasks to the main channel.
-// - Kafka consumer: Tokio `kafka-consumer*` (single worker) on `offer.<market>`; sends `MqTask` to the main channel.
+// - Kafka consumer: Tokio `kafka-consumer*` (single worker) on `offer.<market>`; runs `json::parse` + RPC
+//   envelope checks via `parse_mq_payload`, then sends `MqTask` to the main channel (matcher + sequence checks stay main-thread).
 // - Timer `snap-timer`: periodic `DumpTask` to fork snapshot writers.
 // - Snapshot cleanup `snap-cleanup`: periodic `prune_snapshots` against MySQL.
 
@@ -270,12 +271,14 @@ fn main() {
                             .map(|p| String::from_utf8_lossy(p).into_owned())
                     );
 
+                    let data = message
+                        .payload()
+                        .map(|p| String::from_utf8_lossy(p).to_string())
+                        .unwrap();
+                    let payload = mainprocess::parse_mq_payload(&data);
                     let task = task::KafkaMqTask {
                         offset: message.offset(),
-                        data: message
-                            .payload()
-                            .map(|p| String::from_utf8_lossy(p).to_string())
-                            .unwrap(),
+                        payload,
                     };
                     main_routine_sender_mq_clone
                         .send(task::Task::MqTask(task))
@@ -311,7 +314,7 @@ fn main() {
 
         match task {
             task::Task::MqTask(t) => {
-                mainprocess::handle_mq_message(&publisher, &mut mk, t.offset, &t.data);
+                mainprocess::handle_mq_message(&publisher, &mut mk, t);
             }
             task::Task::HttpRequest(a) => {
                 let res = http::handle_http_request(&mk, a.op);
