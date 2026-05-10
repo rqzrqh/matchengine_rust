@@ -35,6 +35,6 @@ snap_cleanup:
 # --- Downstream Kafka publish batching ---
 output_publish:
   # Max publish tasks to enqueue to Kafka in one batch.
-  batch_size: 256
+  batch_size: 1024
   # Let the Kafka producer wait briefly so adjacent messages can coalesce into one batch.
-  linger_ms: 5
+  linger_ms: 10

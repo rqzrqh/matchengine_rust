@@ -27,7 +27,7 @@ Edit repo root **`config.yaml`** so that:
 - **`market.name`** is the MySQL database name and the Kafka topic suffix (e.g. `eth_btc` → DB `eth_btc`, topics `offer.eth_btc`, `quote_deals.eth_btc`).
 - **`brokers`** matches your Kafka bootstrap servers.
 - **`db.addr` / `db.user` / `db.passwd`** match MySQL.
-- Optional: tune **`output_publish.batch_size`** and **`output_publish.linger_ms`** to control downstream Kafka batching for **`settle.*`** and **`quote_deals.<market>`**.
+- **`output_publish`** must define **`quote`** (`quote_deals.<market>`) and **`settle`** (`settle` topic) separately. Each has **`batch_size`**, **`linger_ms`**, **`max_in_flight_requests_per_connection`**; settle also requires **`enable_idempotence`** (when `true`, keep `max_in_flight_requests_per_connection` ≤ 5). See root **`config.yaml`** for an example.
 
 The engine reads this file (default path `./config.yaml` relative to the process working directory, or pass another path as the first CLI argument). **web-test** also resolves `config.yaml` from the repo root or from `web-test/../`.
 
@@ -133,6 +133,25 @@ With **`npm run dev`** in **`web-test/`**, open the printed URL (typically **`ht
 #### Load / integration
 
 For end-to-end integration testing, run the engine against a dev Kafka/MySQL stack, publish orders to **`offer.<market>`** as your upstream does, and observe **`quote_deals.<market>`** / **`settle.*`** plus engine HTTP and DB state.
+
+### Profiling
+
+#### Time Profiler + HTTP state (Cursor skill)
+
+The repo bundles a profiling skill at **`.cursor/skills/matchengine-xctrace-profile/`**. See **`SKILL.md`** there for full detail. In short:
+
+- It records **`xcrun xctrace`** with Apple’s **Time Profiler** template, optionally stops an existing release binary (**`--stop-existing`**), and in parallel polls **`GET /markets/{market}/summary`** and **`GET /markets/{market}/status`** so CPU samples line up with matcher-visible backlog and book state.
+- Default artifacts live under **`profiling/`** (override with **`--output-dir`**), including **`matchengine.trace`**, NDJSON/state logs, **`metadata.json`**, and **`PROFILE_REPORT.md`** tables that consume **`xctrace export`** where applicable.
+
+Typical bundled run from the **repository root**:
+
+```bash
+SCRIPT_SKILL=".cursor/skills/matchengine-xctrace-profile/scripts"
+"$SCRIPT_SKILL/profile_with_xctrace.sh" --stop-existing
+# Optional: ./config.yaml, --time-limit 1m, --output-dir profiling/my-run
+```
+
+Open **`matchengine.trace`** in **Instruments** for interactive timeline and call-tree views; correlate timestamps with **`PROFILE_REPORT.md`** and **`doc/thread-model.md`**.
 
 ### Project layout
 

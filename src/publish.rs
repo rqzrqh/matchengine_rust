@@ -1,10 +1,11 @@
 use crate::market::*;
+use crate::payload_encoding::encode_msgpack_named;
 use crate::task::*;
-use json::*;
+use json::JsonValue;
 use rust_decimal::prelude::*;
+use serde::Serialize;
 use std::rc::Rc;
 use std::{
-    str,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -13,6 +14,7 @@ use std::{
     thread,
 };
 
+use futures::future::join_all;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord};
 
@@ -83,16 +85,129 @@ impl PublishBacklog {
     }
 }
 
+/// Matches `Order::to_json`: decimal fields are JSON strings from `Decimal::to_string()`.
+#[derive(Debug, Serialize)]
+struct KafkaOrderPayload {
+    id: u64,
+    #[serde(rename = "type")]
+    order_type: u32,
+    side: u32,
+    create_time: i64,
+    update_time: i64,
+    user_id: u32,
+    price: String,
+    amount: String,
+    taker_fee_rate: String,
+    maker_fee_rate: String,
+    left: String,
+    deal_stock: String,
+    deal_money: String,
+    deal_fee: String,
+}
+
+fn kafka_order_payload(order: &Order) -> KafkaOrderPayload {
+    KafkaOrderPayload {
+        id: order.id,
+        order_type: order.order_type,
+        side: order.side,
+        create_time: order.create_time,
+        update_time: order.update_time.get(),
+        user_id: order.user_id,
+        price: order.price.to_string(),
+        amount: order.amount.get().to_string(),
+        taker_fee_rate: order.taker_fee_rate.to_string(),
+        maker_fee_rate: order.maker_fee_rate.to_string(),
+        left: order.left.get().to_string(),
+        deal_stock: order.deal_stock.get().to_string(),
+        deal_money: order.deal_money.get().to_string(),
+        deal_fee: order.deal_fee.get().to_string(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DealsNested {
+    time: i64,
+    user_id: u32,
+    rival_user_id: u32,
+    order_id: u64,
+    deal_id: u64,
+    role: u32,
+    price: String,
+    amount: String,
+    deal: String,
+    fee: String,
+    rival_fee: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum SettlePublishBody {
+    #[serde(rename = "put_order")]
+    PutOrder {
+        market: String,
+        msgid: u64,
+        settle_message_id: u64,
+        txid: u64,
+        order: KafkaOrderPayload,
+    },
+    #[serde(rename = "cancel_order")]
+    CancelOrder {
+        market: String,
+        msgid: u64,
+        settle_message_id: u64,
+        txid: u64,
+        order: KafkaOrderPayload,
+    },
+    #[serde(rename = "error")]
+    Error {
+        market: String,
+        msgid: u64,
+        settle_message_id: u64,
+        txid: u64,
+        params: serde_json::Value,
+        code: u32,
+    },
+    #[serde(rename = "deals")]
+    Deals {
+        market: String,
+        msgid: u64,
+        settle_message_id: u64,
+        txid: u64,
+        deals: DealsNested,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct QuoteDealInfoKafka {
+    time: i64,
+    side: u32,
+    deal_id: u64,
+    price: String,
+    amount: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QuoteDealsKafkaMsg {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    market: String,
+    info: QuoteDealInfoKafka,
+}
+
 struct QuotePublishTaskInfo {
     deals_id: u64,
     topic: String,
-    data: JsonValue,
+    body: QuoteDealsKafkaMsg,
 }
 
 struct SettlePublishTaskInfo {
     group_id: u32,
     settle_message_id: u64,
-    data: JsonValue,
+    body: SettlePublishBody,
+}
+
+fn json_params_to_serde(params: &JsonValue) -> serde_json::Value {
+    serde_json::from_str(&params.dump()).expect("rpc params must convert to serde_json::Value")
 }
 
 fn collect_publish_batch<T>(receiver: &mpsc::Receiver<T>, batch_size: usize) -> Vec<T> {
@@ -110,9 +225,13 @@ fn collect_publish_batch<T>(receiver: &mpsc::Receiver<T>, batch_size: usize) -> 
     batch
 }
 
-fn enqueue_publish(producer: &FutureProducer, topic: &str, data: &JsonValue) -> DeliveryFuture {
-    let payload = data.to_string();
-    let record = FutureRecord::to(topic).payload(payload.as_bytes());
+fn enqueue_publish(
+    producer: &FutureProducer,
+    topic: &str,
+    body: &QuoteDealsKafkaMsg,
+) -> DeliveryFuture {
+    let payload = encode_msgpack_named(body);
+    let record = FutureRecord::to(topic).payload(&payload);
     producer
         .send_result::<Vec<u8>, _>(record)
         .unwrap_or_else(|(e, _)| panic!("publish enqueue failed topic={} error={}", topic, e))
@@ -121,12 +240,12 @@ fn enqueue_publish(producer: &FutureProducer, topic: &str, data: &JsonValue) -> 
 fn enqueue_settle_publish(
     producer: &FutureProducer,
     partition: i32,
-    data: &JsonValue,
+    body: &SettlePublishBody,
 ) -> DeliveryFuture {
-    let payload = data.to_string();
+    let payload = encode_msgpack_named(body);
     let record = FutureRecord::to("settle")
         .partition(partition)
-        .payload(payload.as_bytes());
+        .payload(&payload);
     producer
         .send_result::<Vec<u8>, _>(record)
         .unwrap_or_else(|(e, _)| {
@@ -186,7 +305,7 @@ fn spawn_quote_publish_thread(
                         if task.deals_id > next_pushed_quote_deals_id {
                             pending.push((
                                 task.deals_id,
-                                enqueue_publish(&producer, &task.topic, &task.data),
+                                enqueue_publish(&producer, &task.topic, &task.body),
                             ));
                             next_pushed_quote_deals_id = task.deals_id;
                         } else {
@@ -237,8 +356,12 @@ fn spawn_settle_publish_thread(
     thread::Builder::new()
         .name("settle-publish".to_owned())
         .spawn(move || {
+            let settle_io_workers = std::thread::available_parallelism()
+                .map(|n| n.get().clamp(2, 8))
+                .unwrap_or(4);
+
             let producer_rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
+                .worker_threads(settle_io_workers)
                 .thread_name("settle-pub-io")
                 .enable_all()
                 .build()
@@ -260,7 +383,7 @@ fn spawn_settle_publish_thread(
                             pending.push((
                                 group_id,
                                 task.settle_message_id,
-                                enqueue_settle_publish(&producer, task.group_id as i32, &task.data),
+                                enqueue_settle_publish(&producer, task.group_id as i32, &task.body),
                             ));
                             next_pushed_settle_message_ids[group_id] = task.settle_message_id;
                         } else {
@@ -277,8 +400,18 @@ fn spawn_settle_publish_thread(
                         );
                     }
 
-                    for (group_id, settle_message_id, delivery) in pending {
-                        match delivery.await {
+                    // Await all partition deliveries concurrently so 64-way settle traffic is not
+                    // serialized on this task (sequential `.await` would only drain one flight at a time).
+                    let pending_outcomes = join_all(pending.into_iter().map(
+                        |(group_id, settle_message_id, delivery)| async move {
+                            let r = delivery.await;
+                            (group_id, settle_message_id, r)
+                        },
+                    ))
+                    .await;
+
+                    for (group_id, settle_message_id, r) in pending_outcomes {
+                        match r {
                             Ok(Ok(_)) => {}
                             Ok(Err((e, _))) => panic!("settle publish delivery failed: {}", e),
                             Err(e) => panic!("settle publish delivery canceled: {}", e),
@@ -341,23 +474,26 @@ impl Publish {
     }
 
     pub fn publish_cancel_order(&self, m: &mut Market, extern_id: u64, order: &Rc<Order>) {
-        let mut object = JsonValue::new_object();
-        object["type"] = "cancel_order".into();
-        object["market"] = m.name.clone().into();
-        object["msgid"] = m.message_id.into();
         let settle_message_id = m.next_settle_message_id(order.user_id);
-        object["settle_message_id"] = settle_message_id.into();
-        object["txid"] = extern_id.into();
-        object["order"] = order.to_json(m);
+        let body = SettlePublishBody::CancelOrder {
+            market: m.name.clone(),
+            msgid: m.message_id,
+            settle_message_id,
+            txid: extern_id,
+            order: kafka_order_payload(order),
+        };
 
         let group_id = Market::settle_group_id(order.user_id) as u32;
 
-        debug!("settle partition={} {}", group_id, object);
+        debug!(
+            "settle partition={} {:?}",
+            group_id, body
+        );
 
         let message = SettlePublishTaskInfo {
-            group_id: group_id,
+            group_id,
             settle_message_id,
-            data: object,
+            body,
         };
 
         self.backlog.inc_settle(group_id as usize);
@@ -381,24 +517,27 @@ impl Publish {
     ) {
         m.message_id += 1;
 
-        let mut object = JsonValue::new_object();
-        object["type"] = "error".into();
-        object["market"] = m.name.clone().into();
-        object["msgid"] = m.message_id.into();
         let settle_message_id = m.next_settle_message_id(user_id);
-        object["settle_message_id"] = settle_message_id.into();
-        object["txid"] = extern_id.into();
-        object["params"] = params.clone();
-        object["code"] = code.into();
+        let body = SettlePublishBody::Error {
+            market: m.name.clone(),
+            msgid: m.message_id,
+            settle_message_id,
+            txid: extern_id,
+            params: json_params_to_serde(params),
+            code,
+        };
 
         let group_id = Market::settle_group_id(user_id) as u32;
 
-        debug!("settle partition={} {}", group_id, object);
+        debug!(
+            "settle partition={} {:?}",
+            group_id, body
+        );
 
         let message = SettlePublishTaskInfo {
-            group_id: group_id,
+            group_id,
             settle_message_id,
-            data: object,
+            body,
         };
 
         self.backlog.inc_settle(group_id as usize);
@@ -415,23 +554,26 @@ impl Publish {
 
 impl MatchPublisher for Publish {
     fn publish_put_order(&self, m: &mut Market, extern_id: u64, order: &Rc<Order>) {
-        let mut object = JsonValue::new_object();
-        object["type"] = "put_order".into();
-        object["market"] = m.name.clone().into();
-        object["msgid"] = m.message_id.into();
         let settle_message_id = m.next_settle_message_id(order.user_id);
-        object["settle_message_id"] = settle_message_id.into();
-        object["txid"] = extern_id.into();
-        object["order"] = order.to_json(m);
+        let body = SettlePublishBody::PutOrder {
+            market: m.name.clone(),
+            msgid: m.message_id,
+            settle_message_id,
+            txid: extern_id,
+            order: kafka_order_payload(order),
+        };
 
         let group_id = Market::settle_group_id(order.user_id) as u32;
 
-        debug!("settle partition={} {}", group_id, object);
+        debug!(
+            "settle partition={} {:?}",
+            group_id, body
+        );
 
         let message = SettlePublishTaskInfo {
-            group_id: group_id,
+            group_id,
             settle_message_id,
-            data: object,
+            body,
         };
 
         self.backlog.inc_settle(group_id as usize);
@@ -460,38 +602,38 @@ impl MatchPublisher for Publish {
         fee: &Decimal,
         rival_fee: &Decimal,
     ) {
-        let mut object = JsonValue::new_object();
-        object["type"] = "deals".into();
-        object["market"] = m.name.clone().into();
-        object["msgid"] = m.message_id.into();
         let settle_message_id = m.next_settle_message_id(user_id);
-        object["settle_message_id"] = settle_message_id.into();
-        object["txid"] = extern_id.into();
-
-        let mut deals = JsonValue::new_object();
-        deals["time"] = tm.into();
-        deals["user_id"] = user_id.into();
-        deals["rival_user_id"] = rival_user_id.into();
-        deals["order_id"] = order_id.into();
-        deals["deal_id"] = m.deals_id.into();
-        deals["role"] = role.into();
-
-        deals["price"] = price.to_string().into();
-        deals["amount"] = amount.to_string().into();
-        deals["deal"] = deal.to_string().into();
-        deals["fee"] = fee.to_string().into();
-        deals["rival_fee"] = rival_fee.to_string().into();
-
-        object["deals"] = deals;
+        let body = SettlePublishBody::Deals {
+            market: m.name.clone(),
+            msgid: m.message_id,
+            settle_message_id,
+            txid: extern_id,
+            deals: DealsNested {
+                time: tm,
+                user_id,
+                rival_user_id,
+                order_id,
+                deal_id: m.deals_id,
+                role,
+                price: price.to_string(),
+                amount: amount.to_string(),
+                deal: deal.to_string(),
+                fee: fee.to_string(),
+                rival_fee: rival_fee.to_string(),
+            },
+        };
 
         let group_id = Market::settle_group_id(user_id) as u32;
 
-        debug!("settle partition={} {}", group_id, object);
+        debug!(
+            "settle partition={} {:?}",
+            group_id, body
+        );
 
         let message = SettlePublishTaskInfo {
-            group_id: group_id,
+            group_id,
             settle_message_id,
-            data: object,
+            body,
         };
 
         self.backlog.inc_settle(group_id as usize);
@@ -513,29 +655,26 @@ impl MatchPublisher for Publish {
         amount: &Decimal,
         side: u32,
     ) {
-        let mut object = JsonValue::new_object();
-
-        object["type"] = "quote_deals".into();
-        object["market"] = m.name.clone().into();
-
-        let mut info = JsonValue::new_object();
-        info["time"] = tm.into();
-        info["side"] = side.into();
-        info["deal_id"] = m.deals_id.into();
-
-        info["price"] = price.to_string().into();
-        info["amount"] = amount.to_string().into();
-
-        object["info"] = info;
+        let body = QuoteDealsKafkaMsg {
+            message_type: "quote_deals",
+            market: m.name.clone(),
+            info: QuoteDealInfoKafka {
+                time: tm,
+                side,
+                deal_id: m.deals_id,
+                price: price.to_string(),
+                amount: amount.to_string(),
+            },
+        };
 
         let topic = format!("quote_deals.{}", m.name);
 
-        debug!("{} {}", topic, object);
+        debug!("{} {:?}", topic, body);
 
         let message = QuotePublishTaskInfo {
             deals_id: m.deals_id,
-            topic: topic,
-            data: object,
+            topic,
+            body,
         };
 
         self.backlog.inc_quote();

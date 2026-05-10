@@ -14,7 +14,6 @@ extern crate log;
 extern crate process_lock;
 use process_lock::*;
 
-mod config;
 mod correct_snap;
 mod decimal_util;
 mod dump;
@@ -24,9 +23,12 @@ mod http;
 mod load;
 mod mainprocess;
 mod market;
+mod payload_encoding;
 mod publish;
 mod snap_cleanup;
 mod task;
+
+mod config;
 
 // Runtime layout (one OS process, one market). Profiler-visible thread prefixes: matcher main (unnamed OS main),
 // `snap-cleanup`, `snap-timer`, `http-driver` + `http-worker`, `kafka-consumer`, `quote-publish` + `quote-pub-io`,
