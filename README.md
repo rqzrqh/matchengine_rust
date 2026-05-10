@@ -28,7 +28,7 @@ Edit repo root **`config.yaml`** so that:
 - Internal Kafka I/O uses MessagePack on both sides: input `offer.<market>` messages are unpacked as MessagePack, and output `quote_deals.<market>` / `settle` messages are published as MessagePack.
 - **`brokers`** matches your Kafka bootstrap servers.
 - **`db.addr` / `db.user` / `db.passwd`** match MySQL.
-- **`output_publish`** must define **`quote`** (`quote_deals.<market>`) and **`settle`** (`settle` topic) separately. Each has **`batch_size`**, **`linger_ms`**, **`max_in_flight_requests_per_connection`**. Settle publishing always uses Kafka idempotence with `acks=all`, so keep its `max_in_flight_requests_per_connection` ≤ 5. See root **`config.yaml`** for an example.
+- **`output_publish`** must define **`quote`** (`quote_deals.<market>`) and **`settle`** (`settle` topic) separately. Each has Kafka producer settings such as **`batch_size`**, **`linger_ms`**, and **`max_in_flight_requests_per_connection`**; settle also has application pipeline settings **`drain_batch_size`** and **`max_outstanding`**. Settle publishing always uses Kafka idempotence with `acks=all`, so keep its `max_in_flight_requests_per_connection` ≤ 5. See root **`config.yaml`** for an example.
 
 The engine reads this file (default path `./config.yaml` relative to the process working directory, or pass another path as the first CLI argument). **web-test** also resolves `config.yaml` from the repo root or from `web-test/../`.
 

@@ -35,6 +35,8 @@ export interface MatchengineYaml {
     };
     settle: {
       batch_size: number;
+      drain_batch_size: number;
+      max_outstanding: number;
       linger_ms: number;
       max_in_flight_requests_per_connection: number;
       thread_count: number;

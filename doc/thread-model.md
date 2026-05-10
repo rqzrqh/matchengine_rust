@@ -22,7 +22,7 @@ This section maps **thread titles exactly as Instruments lists them** for a **Ti
 | **`http-worker`** (multiple TIDs possible) | HTTP Tokio pool: **[`thread_name("http-worker")`](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html)** on **[`new_multi_thread()`](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html)** ([`src/main.rs`](../src/main.rs)); Axum/Hyper I/O and handler **`await`** points — **`Market`** access still happens **only** after a task reaches the main thread. |
 | **`kafka-consumer`** | Dedicated consumer runtime: **`worker_threads(1)`** + **`thread_name("kafka-consumer")`** ([`consumer_rt` in `src/main.rs`](../src/main.rs)); **`StreamConsumer::recv().await`** → [`Task::MqTask`](../src/task.rs). |
 | **`quote-publish`** | Quote publish OS thread: **`thread::Builder::name("quote-publish")`** ([`spawn_quote_publish_thread` in `src/publish.rs`](../src/publish.rs)); nested Tokio runtime runs **`block_on`** batch send / **`DeliveryFuture`** awaits. |
-| **`settle-publish-*`** | Configured settle publish OS threads ([`output_publish.settle.thread_count`](../config.yaml), [`spawn_settle_publish_thread`](../src/publish.rs)); each thread owns a fixed range of settle groups, blocks directly on delivery futures, and reports progress back to the main thread. |
+| **`settle-publish-*`** | Configured settle publish OS threads ([`output_publish.settle.thread_count`](../config.yaml), [`spawn_settle_publish_thread`](../src/publish.rs)); each thread owns a fixed range of settle groups, keeps a bounded delivery pipeline, and reports progress back to the main thread after delivery confirmation. |
 | **`producer polling thread`** (may repeat with different IDs) | **librdkafka-created** polling threads tied to `FutureProducer` handles — **not** named in Rust `thread::Builder`; visible when Kafka producers are active beside **`quote-publish`** / **`settle-publish-*`**. These threads drive producer callbacks / delivery result polling, so profile CPU here belongs to Kafka output plumbing, not matcher logic. |
 | **`rdk:main`**, **`rdk:broker1`**, **`rdk:broker-1`**, … | Other **librdkafka** native threads for **each** client handle (broker sockets, protocol). Hyphen vs digit spelling (**`broker-1`** vs **`broker1`**) varies by version/topology. |
 
@@ -85,7 +85,7 @@ flowchart TB
     end
     subgraph settle_pr["Settle FutureProducer"]
       direction TB
-      APP_SP["settle-publish-* threads<br/>configured workers await deliveries"]
+      APP_SP["settle-publish-* threads<br/>configured workers pipeline deliveries"]
       RDK_SP["librdkafka native threads<br/>rdk broker IO + producer polling thread"]
       APP_SP --> RDK_SP
     end
@@ -251,9 +251,9 @@ owns the same number of settle groups. Each thread is an **application send
 driver** for a shared `FutureProducer`; the **librdkafka send / broker I/O
 threads** for that producer are separate (see [Kafka receive and send
 threads](#kafka-receive-and-send-threads-application-vs-librdkafka)). Tasks are
-batched per config; delivery futures are still awaited in pending order.
-Producers set `max.in.flight.requests.per.connection = 1` to reduce reordering
-risk.
+drained per config into a bounded pending window; delivery futures are still
+awaited in enqueue order. The settle producer keeps
+`max.in.flight.requests.per.connection <= 5` because idempotence is enabled.
 
 Publish threads hold only data needed to send plus `Arc<PublishBacklog>`. Backlog uses atomic counters for quote/settle/per-group pending counts—mostly accounting and debug underflow checks; the main thread does not use backlog for flow control today.
 
@@ -325,7 +325,7 @@ Quote and settle publish on separate threads:
 
 - One quote publisher to `quote_deals.<market>` using MessagePack payloads.
 - Configured settle publishers writing MessagePack payloads to partitions of `settle` by `user_id % 64`; each `group_id` is always routed to the same `settle-publish-*` worker.
-- Each producer uses `max.in.flight.requests.per.connection = 1` and reports progress only after delivery ack.
+- Each producer reports progress only after delivery ack; settle uses a bounded pending window but still reports acks in enqueue order.
 
 There is no single global settle ordering; ordering is per group/partition, matching `settle_message_ids[group_id]`.
 

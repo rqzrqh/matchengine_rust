@@ -40,18 +40,19 @@ Settle publishing now runs a configured number of OS workers
 (`output_publish.settle.thread_count`). The main thread sends each
 `SettlePublishTaskInfo` directly to the worker responsible for that `group_id`.
 Each worker owns an equal-sized contiguous range of settle groups, shares the
-same Kafka `FutureProducer` handle, processes its queue sequentially, and blocks
-on delivery futures on the same OS thread.
+same Kafka `FutureProducer` handle, and keeps a bounded set of delivery futures
+in flight on the same OS thread.
 
-Each settle worker processes its queue sequentially:
+Each settle worker processes its queue as a delivery pipeline:
 
 1. Drop already-pushed messages whose `settle_message_id` is not greater than
   the worker's local pushed cursor for that `group_id`.
-2. Enqueue the message to Kafka using the worker's partition id.
-3. Block until the delivery future resolves.
-4. Decrement publish backlog.
-5. Send `Task::SettleProgressUpdateTask` back to the main thread.
-6. Advance the worker's local pushed cursor.
+2. Enqueue messages to Kafka until the local outstanding window is full.
+3. Await delivery futures in enqueue order.
+4. Decrement publish backlog and send `Task::SettleProgressUpdateTask` back to
+  the main thread after each delivery confirmation.
+5. Advance the worker's local enqueued cursor so duplicate queued messages are
+  skipped before they enter Kafka.
 
 Different workers run independently as plain OS threads, so one slow group range
 does not block groups assigned to other settle publish workers.
@@ -79,8 +80,8 @@ Ordering is guaranteed at the application layer by the group-to-worker mapping:
 
 - Each `group_id` is always sent to the same worker queue.
 - The main thread sends messages for a `group_id` in settle id order.
-- A worker awaits the Kafka delivery result before it sends progress for that
-  message and before it processes the next queued message.
+- A worker may enqueue later messages before earlier ones are acknowledged, but
+  it awaits delivery futures in enqueue order before reporting progress.
 - `pushed_settle_message_ids[group_id]` is updated only by the main thread after
   receiving `Task::SettleProgressUpdateTask`.
 
@@ -104,10 +105,12 @@ output_publish:
     linger_ms: 10
     max_in_flight_requests_per_connection: 1
   settle:
-    batch_size: 256
-    linger_ms: 50
+    batch_size: 4096
+    drain_batch_size: 4096
+    max_outstanding: 16384
+    linger_ms: 5
     max_in_flight_requests_per_connection: 5
-    thread_count: 8
+    thread_count: 1
 ```
 
 Settle publishing always enables Kafka idempotence and `acks=all` in code. There
@@ -120,14 +123,18 @@ Configuration meanings:
 
 | Field | Scope | Effect |
 | --- | --- | --- |
-| `batch_size` | Application batch collection and librdkafka `batch.num.messages` | Caps how many publish tasks the dispatcher drains per loop and how many messages librdkafka may place in one broker batch. |
+| `batch_size` | librdkafka `batch.num.messages` | Caps how many messages librdkafka may place in one broker batch. |
+| `drain_batch_size` | Application queue drain | Caps how many publish tasks a settle worker tries to drain from its `mpsc` queue per loop while filling the outstanding window. |
+| `max_outstanding` | Application delivery pipeline | Caps how many settle delivery futures one worker may keep in flight before waiting for the oldest delivery confirmation. |
 | `linger_ms` | Kafka producer batching | Lets librdkafka wait briefly for nearby records before sending a broker batch. Lower values reduce latency; higher values may improve throughput. |
 | `max_in_flight_requests_per_connection` | Kafka producer connection | Limits unacknowledged produce requests per broker connection. Settle must stay `<= 5` because idempotence is always enabled. |
 | `thread_count` | Application settle publish workers | Controls how many OS threads drive settle publishing. Each worker owns `USER_SETTLE_GROUP_SIZE / thread_count` settle groups. |
 
-Because settle workers serialize each partition at the application layer,
-`max_in_flight_requests_per_connection` mainly controls cross-partition and
-broker-level concurrency, not per-partition reordering.
+Settle workers keep a bounded delivery pipeline: they continue draining queued
+tasks into Kafka until `max_outstanding` is reached, then await delivery futures
+in enqueue order and report progress back to the main thread. This keeps the
+persisted cursor model simple while avoiding the old "enqueue one batch, wait for
+the whole batch, then enqueue the next batch" throughput cliff.
 
 ## Thread model impact
 
@@ -144,11 +151,15 @@ for the broader process thread model.
 Start with the current safe defaults:
 
 - `settle.max_in_flight_requests_per_connection: 5`
-- `settle.linger_ms: 50`
-- `settle.batch_size: 256`
-- `settle.thread_count: 8`
+- `settle.linger_ms: 5`
+- `settle.batch_size: 4096`
+- `settle.drain_batch_size: 4096`
+- `settle.max_outstanding: 16384`
+- `settle.thread_count: 1`
 
-For lower latency, reduce `settle.linger_ms` first, for example to `10` or `5`.
+For lower latency, reduce `settle.linger_ms` first. If settle publishing falls
+behind, increase `settle.max_outstanding` before increasing application thread
+count; the shared settle `FutureProducer` is usually the limiting path.
 For a conservative ordering experiment, set
 `settle.max_in_flight_requests_per_connection: 1`; this may reduce throughput
 but also reduces broker connection concurrency.

@@ -236,6 +236,8 @@ fn main() {
                 .quote
                 .max_in_flight_requests_per_connection,
             settle_batch_size: output_publish_cfg.settle.batch_size,
+            settle_drain_batch_size: output_publish_cfg.settle.drain_batch_size,
+            settle_max_outstanding: output_publish_cfg.settle.max_outstanding,
             settle_linger_ms: output_publish_cfg.settle.linger_ms,
             settle_max_in_flight_requests_per_connection: output_publish_cfg
                 .settle

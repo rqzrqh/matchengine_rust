@@ -3,6 +3,7 @@ use crate::payload_encoding::encode_msgpack_named;
 use crate::task::*;
 use rust_decimal::prelude::*;
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::{
     sync::{
@@ -27,6 +28,8 @@ pub struct PublishDriverCfg {
     pub quote_linger_ms: u64,
     pub quote_max_in_flight_requests_per_connection: u32,
     pub settle_batch_size: usize,
+    pub settle_drain_batch_size: usize,
+    pub settle_max_outstanding: usize,
     pub settle_linger_ms: u64,
     pub settle_max_in_flight_requests_per_connection: u32,
     pub settle_thread_count: usize,
@@ -236,6 +239,12 @@ struct SettlePublishTaskInfo {
     body: SettlePublishBody,
 }
 
+struct PendingSettleDelivery {
+    group_id: usize,
+    settle_message_id: u64,
+    delivery: DeliveryFuture,
+}
+
 fn collect_publish_batch<T>(receiver: &mpsc::Receiver<T>, batch_size: usize) -> Vec<T> {
     let mut batch = Vec::with_capacity(batch_size);
     batch.push(receiver.recv().unwrap());
@@ -249,6 +258,65 @@ fn collect_publish_batch<T>(receiver: &mpsc::Receiver<T>, batch_size: usize) -> 
     }
 
     batch
+}
+
+fn enqueue_settle_task(
+    producer: &FutureProducer,
+    pending: &mut VecDeque<PendingSettleDelivery>,
+    pushed_settle_message_ids: &mut [u64],
+    backlog: &PublishBacklog,
+    task: SettlePublishTaskInfo,
+) {
+    let group_id = task.group_id;
+    if task.settle_message_id <= pushed_settle_message_ids[group_id] {
+        backlog.dec_settle(group_id);
+        return;
+    }
+
+    let settle_message_id = task.settle_message_id;
+    let delivery = enqueue_settle_publish(producer, group_id as i32, &task.body);
+    pending.push_back(PendingSettleDelivery {
+        group_id,
+        settle_message_id,
+        delivery,
+    });
+    pushed_settle_message_ids[group_id] = settle_message_id;
+}
+
+async fn await_settle_delivery(
+    pending: &mut VecDeque<PendingSettleDelivery>,
+    main_routine_sender: &mpsc::Sender<Task>,
+    backlog: &PublishBacklog,
+) {
+    let Some(PendingSettleDelivery {
+        group_id,
+        settle_message_id,
+        delivery,
+    }) = pending.pop_front()
+    else {
+        return;
+    };
+
+    match delivery.await {
+        Ok(Ok(_)) => {}
+        Ok(Err((e, _))) => panic!(
+            "settle publish delivery failed partition={}: {}",
+            group_id, e
+        ),
+        Err(e) => panic!(
+            "settle publish delivery canceled partition={}: {}",
+            group_id, e
+        ),
+    }
+
+    backlog.dec_settle(group_id);
+    let task = SettlePublishProgressTask {
+        group_id,
+        pushed_settle_message_id: settle_message_id,
+    };
+    main_routine_sender
+        .send(Task::SettleProgressUpdateTask(task))
+        .expect("send settle progress update task failed");
 }
 
 fn enqueue_publish(
@@ -416,7 +484,8 @@ fn spawn_settle_publish_thread(
     main_routine_sender: mpsc::Sender<Task>,
     worker_id: usize,
     pushed_settle_message_ids: Vec<u64>,
-    batch_size: usize,
+    drain_batch_size: usize,
+    max_outstanding: usize,
     linger_ms: u64,
     receiver: mpsc::Receiver<SettlePublishTaskInfo>,
     backlog: Arc<PublishBacklog>,
@@ -431,60 +500,62 @@ fn spawn_settle_publish_thread(
 
             producer_rt.block_on(async move {
                 let mut pushed_settle_message_ids = pushed_settle_message_ids;
+                let mut pending = VecDeque::with_capacity(max_outstanding);
 
                 loop {
-                    let batch = collect_publish_batch(&receiver, batch_size);
-                    let batch_len = batch.len();
-                    let mut pending = Vec::with_capacity(batch_len);
-
-                    for task in batch {
-                        let group_id = task.group_id;
-                        if task.settle_message_id <= pushed_settle_message_ids[group_id] {
-                            backlog.dec_settle(group_id);
-                            continue;
-                        }
-
-                        let settle_message_id = task.settle_message_id;
-                        pending.push((
-                            group_id,
-                            settle_message_id,
-                            enqueue_settle_publish(&producer, group_id as i32, &task.body),
-                        ));
-                        pushed_settle_message_ids[group_id] = settle_message_id;
+                    if pending.is_empty() {
+                        let task = receiver.recv().unwrap();
+                        enqueue_settle_task(
+                            &producer,
+                            &mut pending,
+                            &mut pushed_settle_message_ids,
+                            backlog.as_ref(),
+                            task,
+                        );
                     }
 
-                    if pending.len() > 1 {
+                    let pending_before = pending.len();
+                    let space = max_outstanding.saturating_sub(pending.len());
+                    let drain_limit = drain_batch_size.min(space);
+                    for _ in 0..drain_limit {
+                        match receiver.try_recv() {
+                            Ok(task) => enqueue_settle_task(
+                                &producer,
+                                &mut pending,
+                                &mut pushed_settle_message_ids,
+                                backlog.as_ref(),
+                                task,
+                            ),
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                panic!("publish task channel disconnected")
+                            }
+                        }
+                    }
+
+                    let queued = pending.len().saturating_sub(pending_before);
+                    if queued > 1 {
                         info!(
-                            "settle batch flush: worker={} queued={} delivered_after_ack={} linger_ms={}",
+                            "settle pipeline fill: worker={} queued={} outstanding={} max_outstanding={} linger_ms={}",
                             worker_id,
-                            batch_len,
+                            queued,
                             pending.len(),
+                            max_outstanding,
                             linger_ms
                         );
                     }
 
-                    for (group_id, settle_message_id, delivery) in pending {
-                        match delivery.await {
-                            Ok(Ok(_)) => {}
-                            Ok(Err((e, _))) => panic!(
-                                "settle publish delivery failed partition={}: {}",
-                                group_id, e
-                            ),
-                            Err(e) => panic!(
-                                "settle publish delivery canceled partition={}: {}",
-                                group_id, e
-                            ),
-                        }
-
-                        backlog.dec_settle(group_id);
-                        let task = SettlePublishProgressTask {
-                            group_id,
-                            pushed_settle_message_id: settle_message_id,
-                        };
-                        main_routine_sender
-                            .send(Task::SettleProgressUpdateTask(task))
-                            .expect("send settle progress update task failed");
+                    while pending.len() >= max_outstanding {
+                        await_settle_delivery(
+                            &mut pending,
+                            &main_routine_sender,
+                            backlog.as_ref(),
+                        )
+                        .await;
                     }
+
+                    await_settle_delivery(&mut pending, &main_routine_sender, backlog.as_ref())
+                        .await;
                 }
             });
         })
@@ -505,6 +576,8 @@ impl Publish {
             quote_linger_ms,
             quote_max_in_flight_requests_per_connection,
             settle_batch_size,
+            settle_drain_batch_size,
+            settle_max_outstanding,
             settle_linger_ms,
             settle_max_in_flight_requests_per_connection,
             settle_thread_count,
@@ -553,7 +626,8 @@ impl Publish {
                 main_routine_sender.clone(),
                 worker_id,
                 pushed_settle_message_ids.clone(),
-                settle_batch_size,
+                settle_drain_batch_size,
+                settle_max_outstanding,
                 settle_linger_ms,
                 settle_receiver,
                 backlog.clone(),

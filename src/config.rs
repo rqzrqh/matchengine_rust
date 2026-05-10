@@ -62,6 +62,8 @@ pub struct QuotePublishCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SettlePublishCfg {
     pub batch_size: usize,
+    pub drain_batch_size: usize,
+    pub max_outstanding: usize,
     pub linger_ms: u64,
     pub max_in_flight_requests_per_connection: u32,
     pub thread_count: usize,
@@ -132,6 +134,12 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
     let s = &cfg.output_publish.settle;
     if s.batch_size == 0 {
         return Err("output_publish.settle.batch_size must be > 0".into());
+    }
+    if s.drain_batch_size == 0 {
+        return Err("output_publish.settle.drain_batch_size must be > 0".into());
+    }
+    if s.max_outstanding == 0 {
+        return Err("output_publish.settle.max_outstanding must be > 0".into());
     }
     if s.max_in_flight_requests_per_connection < 1 {
         return Err(
