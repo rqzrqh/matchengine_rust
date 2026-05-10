@@ -27,7 +27,7 @@ Edit repo root **`config.yaml`** so that:
 - **`market.name`** is the MySQL database name and the Kafka topic suffix (e.g. `eth_btc` → DB `eth_btc`, topics `offer.eth_btc`, `quote_deals.eth_btc`).
 - **`brokers`** matches your Kafka bootstrap servers.
 - **`db.addr` / `db.user` / `db.passwd`** match MySQL.
-- **`output_publish`** must define **`quote`** (`quote_deals.<market>`) and **`settle`** (`settle` topic) separately. Each has **`batch_size`**, **`linger_ms`**, **`max_in_flight_requests_per_connection`**; settle also requires **`enable_idempotence`** (when `true`, keep `max_in_flight_requests_per_connection` ≤ 5). See root **`config.yaml`** for an example.
+- **`output_publish`** must define **`quote`** (`quote_deals.<market>`) and **`settle`** (`settle` topic) separately. Each has **`batch_size`**, **`linger_ms`**, **`max_in_flight_requests_per_connection`**. Settle publishing always uses Kafka idempotence with `acks=all`, so keep its `max_in_flight_requests_per_connection` ≤ 5. See root **`config.yaml`** for an example.
 
 The engine reads this file (default path `./config.yaml` relative to the process working directory, or pass another path as the first CLI argument). **web-test** also resolves `config.yaml` from the repo root or from `web-test/../`.
 

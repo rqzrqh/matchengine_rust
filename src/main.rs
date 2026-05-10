@@ -1,6 +1,6 @@
 use rdkafka::config::RDKafkaLogLevel;
-use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::consumer::StreamConsumer;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::util::Timeout;
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use std::{env, net::SocketAddr, process, str, sync::mpsc, thread, time::Duration};
@@ -212,8 +212,18 @@ fn main() {
         main_routine_sender.clone(),
         mk.pushed_quote_deals_id,
         mk.pushed_settle_message_ids.to_vec(),
-        output_publish_cfg.batch_size,
-        output_publish_cfg.linger_ms,
+        publish::PublishDriverCfg {
+            quote_batch_size: output_publish_cfg.quote.batch_size,
+            quote_linger_ms: output_publish_cfg.quote.linger_ms,
+            quote_max_in_flight_requests_per_connection: output_publish_cfg
+                .quote
+                .max_in_flight_requests_per_connection,
+            settle_batch_size: output_publish_cfg.settle.batch_size,
+            settle_linger_ms: output_publish_cfg.settle.linger_ms,
+            settle_max_in_flight_requests_per_connection: output_publish_cfg
+                .settle
+                .max_in_flight_requests_per_connection,
+        },
     );
 
     let main_routine_sender_http_clone = main_routine_sender.clone();

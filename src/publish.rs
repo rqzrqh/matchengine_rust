@@ -14,9 +14,21 @@ use std::{
     thread,
 };
 
-use futures::future::join_all;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord};
+use tokio::sync::mpsc as tokio_mpsc;
+
+/// Kafka publish tuning: quote vs settle each have batching and producer options
+/// (`output_publish.quote` / `output_publish.settle` in YAML).
+#[derive(Debug, Clone)]
+pub struct PublishDriverCfg {
+    pub quote_batch_size: usize,
+    pub quote_linger_ms: u64,
+    pub quote_max_in_flight_requests_per_connection: u32,
+    pub settle_batch_size: usize,
+    pub settle_linger_ms: u64,
+    pub settle_max_in_flight_requests_per_connection: u32,
+}
 
 pub struct Publish {
     quote_sender: mpsc::Sender<QuotePublishTaskInfo>,
@@ -256,20 +268,30 @@ fn enqueue_settle_publish(
         })
 }
 
-fn build_kafka_producer(brokers: &str, batch_size: usize, linger_ms: u64) -> FutureProducer {
+fn build_kafka_producer(
+    brokers: &str,
+    batch_size: usize,
+    linger_ms: u64,
+    max_in_flight_requests_per_connection: u32,
+    use_idempotence: bool,
+) -> FutureProducer {
     let linger_ms_str = linger_ms.to_string();
     let batch_size_str = batch_size.to_string();
+    let in_flight_str = max_in_flight_requests_per_connection.to_string();
 
-    ClientConfig::new()
-        .set("bootstrap.servers", brokers)
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", brokers)
         .set("message.timeout.ms", "5000")
-        // Allow duplicates, but keep strict per-topic ordering by sending at most one
-        // in-flight request per connection.
-        .set("max.in.flight.requests.per.connection", "1")
+        .set(
+            "max.in.flight.requests.per.connection",
+            in_flight_str.as_str(),
+        )
         .set("linger.ms", &linger_ms_str)
-        .set("batch.num.messages", &batch_size_str)
-        .create()
-        .expect("Producer creation error")
+        .set("batch.num.messages", &batch_size_str);
+    if use_idempotence {
+        cfg.set("enable.idempotence", "true").set("acks", "all");
+    }
+    cfg.create().expect("Producer creation error")
 }
 
 fn spawn_quote_publish_thread(
@@ -278,6 +300,7 @@ fn spawn_quote_publish_thread(
     pushed_quote_deals_id: u64,
     batch_size: usize,
     linger_ms: u64,
+    max_in_flight_requests_per_connection: u32,
     receiver: mpsc::Receiver<QuotePublishTaskInfo>,
     backlog: Arc<PublishBacklog>,
 ) {
@@ -292,7 +315,13 @@ fn spawn_quote_publish_thread(
                 .unwrap();
 
             producer_rt.block_on(async move {
-                let producer = build_kafka_producer(&brokers, batch_size, linger_ms);
+                let producer = build_kafka_producer(
+                    &brokers,
+                    batch_size,
+                    linger_ms,
+                    max_in_flight_requests_per_connection,
+                    false,
+                );
                 let mut pushed_quote_deals_id = pushed_quote_deals_id;
 
                 loop {
@@ -350,6 +379,7 @@ fn spawn_settle_publish_thread(
     pushed_settle_message_ids: Vec<u64>,
     batch_size: usize,
     linger_ms: u64,
+    max_in_flight_requests_per_connection: u32,
     receiver: mpsc::Receiver<SettlePublishTaskInfo>,
     backlog: Arc<PublishBacklog>,
 ) {
@@ -368,64 +398,89 @@ fn spawn_settle_publish_thread(
                 .unwrap();
 
             producer_rt.block_on(async move {
-                let producer = build_kafka_producer(&brokers, batch_size, linger_ms);
-                let mut pushed_settle_message_ids = pushed_settle_message_ids;
+                let producer = Arc::new(build_kafka_producer(
+                    &brokers,
+                    batch_size,
+                    linger_ms,
+                    max_in_flight_requests_per_connection,
+                    true,
+                ));
+                let mut partition_senders = Vec::with_capacity(pushed_settle_message_ids.len());
+
+                for (group_id, pushed_settle_message_id) in
+                    pushed_settle_message_ids.into_iter().enumerate()
+                {
+                    let (partition_sender, mut partition_receiver) =
+                        tokio_mpsc::unbounded_channel::<SettlePublishTaskInfo>();
+                    let producer = producer.clone();
+                    let main_routine_sender = main_routine_sender.clone();
+                    let backlog = backlog.clone();
+
+                    tokio::spawn(async move {
+                        let mut pushed_settle_message_id = pushed_settle_message_id;
+
+                        while let Some(task) = partition_receiver.recv().await {
+                            if task.settle_message_id <= pushed_settle_message_id {
+                                backlog.dec_settle(group_id);
+                                continue;
+                            }
+
+                            let settle_message_id = task.settle_message_id;
+                            let delivery =
+                                enqueue_settle_publish(&producer, group_id as i32, &task.body);
+
+                            match delivery.await {
+                                Ok(Ok(_)) => {}
+                                Ok(Err((e, _))) => panic!(
+                                    "settle publish delivery failed partition={}: {}",
+                                    group_id, e
+                                ),
+                                Err(e) => panic!(
+                                    "settle publish delivery canceled partition={}: {}",
+                                    group_id, e
+                                ),
+                            }
+
+                            backlog.dec_settle(group_id);
+                            pushed_settle_message_id = settle_message_id;
+                            let task = SettlePublishProgressTask {
+                                group_id,
+                                pushed_settle_message_id: settle_message_id,
+                            };
+                            main_routine_sender
+                                .send(Task::SettleProgressUpdateTask(task))
+                                .expect("send settle progress update task failed");
+                        }
+                    });
+
+                    partition_senders.push(partition_sender);
+                }
 
                 loop {
                     let batch = collect_publish_batch(&receiver, batch_size);
                     let batch_len = batch.len();
-                    let mut pending = Vec::with_capacity(batch_len);
-                    let mut next_pushed_settle_message_ids = pushed_settle_message_ids.clone();
 
                     for task in batch {
                         let group_id = task.group_id as usize;
-                        if task.settle_message_id > next_pushed_settle_message_ids[group_id] {
-                            pending.push((
-                                group_id,
-                                task.settle_message_id,
-                                enqueue_settle_publish(&producer, task.group_id as i32, &task.body),
-                            ));
-                            next_pushed_settle_message_ids[group_id] = task.settle_message_id;
-                        } else {
+                        let Some(sender) = partition_senders.get(group_id) else {
+                            panic!("settle publish group_id out of range: {}", group_id);
+                        };
+                        if let Err(e) = sender.send(task) {
                             backlog.dec_settle(group_id);
+                            panic!(
+                                "settle partition worker stopped partition={} settle_message_id={}",
+                                group_id, e.0.settle_message_id
+                            );
                         }
                     }
 
-                    if pending.len() > 1 {
+                    if batch_len > 1 {
                         info!(
-                            "settle batch flush: queued={} delivered_after_ack={} linger_ms={}",
+                            "settle dispatch batch: queued={} partitions={} linger_ms={}",
                             batch_len,
-                            pending.len(),
+                            partition_senders.len(),
                             linger_ms
                         );
-                    }
-
-                    // Await all partition deliveries concurrently so 64-way settle traffic is not
-                    // serialized on this task (sequential `.await` would only drain one flight at a time).
-                    let pending_outcomes = join_all(pending.into_iter().map(
-                        |(group_id, settle_message_id, delivery)| async move {
-                            let r = delivery.await;
-                            (group_id, settle_message_id, r)
-                        },
-                    ))
-                    .await;
-
-                    for (group_id, settle_message_id, r) in pending_outcomes {
-                        match r {
-                            Ok(Ok(_)) => {}
-                            Ok(Err((e, _))) => panic!("settle publish delivery failed: {}", e),
-                            Err(e) => panic!("settle publish delivery canceled: {}", e),
-                        }
-
-                        backlog.dec_settle(group_id);
-                        pushed_settle_message_ids[group_id] = settle_message_id;
-                        let task = SettlePublishProgressTask {
-                            group_id,
-                            pushed_settle_message_id: settle_message_id,
-                        };
-                        main_routine_sender
-                            .send(Task::SettleProgressUpdateTask(task))
-                            .expect("send settle progress update task failed");
                     }
                 }
             });
@@ -439,9 +494,17 @@ impl Publish {
         main_routine_sender: mpsc::Sender<Task>,
         pushed_quote_deals_id: u64,
         pushed_settle_message_ids: Vec<u64>,
-        batch_size: usize,
-        linger_ms: u64,
+        output_publish: PublishDriverCfg,
     ) -> Publish {
+        let PublishDriverCfg {
+            quote_batch_size,
+            quote_linger_ms,
+            quote_max_in_flight_requests_per_connection,
+            settle_batch_size,
+            settle_linger_ms,
+            settle_max_in_flight_requests_per_connection,
+        } = output_publish;
+
         let (quote_sender, quote_receiver) = mpsc::channel();
         let (settle_sender, settle_receiver) = mpsc::channel();
         let settle_group_count = pushed_settle_message_ids.len() as u32;
@@ -451,8 +514,9 @@ impl Publish {
             brokers.clone(),
             main_routine_sender.clone(),
             pushed_quote_deals_id,
-            batch_size,
-            linger_ms,
+            quote_batch_size,
+            quote_linger_ms,
+            quote_max_in_flight_requests_per_connection,
             quote_receiver,
             backlog.clone(),
         );
@@ -460,8 +524,9 @@ impl Publish {
             brokers,
             main_routine_sender,
             pushed_settle_message_ids,
-            batch_size,
-            linger_ms,
+            settle_batch_size,
+            settle_linger_ms,
+            settle_max_in_flight_requests_per_connection,
             settle_receiver,
             backlog.clone(),
         );
@@ -485,10 +550,7 @@ impl Publish {
 
         let group_id = Market::settle_group_id(order.user_id) as u32;
 
-        debug!(
-            "settle partition={} {:?}",
-            group_id, body
-        );
+        debug!("settle partition={} {:?}", group_id, body);
 
         let message = SettlePublishTaskInfo {
             group_id,
@@ -529,10 +591,7 @@ impl Publish {
 
         let group_id = Market::settle_group_id(user_id) as u32;
 
-        debug!(
-            "settle partition={} {:?}",
-            group_id, body
-        );
+        debug!("settle partition={} {:?}", group_id, body);
 
         let message = SettlePublishTaskInfo {
             group_id,
@@ -565,10 +624,7 @@ impl MatchPublisher for Publish {
 
         let group_id = Market::settle_group_id(order.user_id) as u32;
 
-        debug!(
-            "settle partition={} {:?}",
-            group_id, body
-        );
+        debug!("settle partition={} {:?}", group_id, body);
 
         let message = SettlePublishTaskInfo {
             group_id,
@@ -625,10 +681,7 @@ impl MatchPublisher for Publish {
 
         let group_id = Market::settle_group_id(user_id) as u32;
 
-        debug!(
-            "settle partition={} {:?}",
-            group_id, body
-        );
+        debug!("settle partition={} {:?}", group_id, body);
 
         let message = SettlePublishTaskInfo {
             group_id,

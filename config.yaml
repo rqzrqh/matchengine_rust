@@ -32,9 +32,14 @@ snap_cleanup:
   # How often the cleanup job runs, in seconds.
   cleanup_interval_secs: 60
 
-# --- Downstream Kafka publish batching ---
+# --- Downstream Kafka publish (quote vs settle producers are configured separately) ---
 output_publish:
-  # Max publish tasks to enqueue to Kafka in one batch.
-  batch_size: 1024
-  # Let the Kafka producer wait briefly so adjacent messages can coalesce into one batch.
-  linger_ms: 10
+  quote:
+    # `quote_deals.<market>`
+    batch_size: 1024
+    linger_ms: 10
+    max_in_flight_requests_per_connection: 1
+  settle:
+    batch_size: 50
+    linger_ms: 10
+    max_in_flight_requests_per_connection: 1

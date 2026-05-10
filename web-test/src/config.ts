@@ -26,6 +26,19 @@ export interface MatchengineYaml {
   snap_dump?: {
     dump_interval_secs: number;
   };
+  /** Required in engine `config.yaml`; mirrored here for typing. */
+  output_publish: {
+    quote: {
+      batch_size: number;
+      linger_ms: number;
+      max_in_flight_requests_per_connection: number;
+    };
+    settle: {
+      batch_size: number;
+      linger_ms: number;
+      max_in_flight_requests_per_connection: number;
+    };
+  };
 }
 
 /** Default engine REST URL, web console public URL, and HTTP listen port. */

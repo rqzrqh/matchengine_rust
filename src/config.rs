@@ -50,31 +50,26 @@ impl Default for SnapDumpCfg {
     }
 }
 
+/// `quote_deals.<market>` producer (`output_publish.quote` in YAML).
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuotePublishCfg {
+    pub batch_size: usize,
+    pub linger_ms: u64,
+    pub max_in_flight_requests_per_connection: u32,
+}
+
+/// `settle` topic producer (`output_publish.settle` in YAML).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SettlePublishCfg {
+    pub batch_size: usize,
+    pub linger_ms: u64,
+    pub max_in_flight_requests_per_connection: u32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct OutputPublishCfg {
-    /// Max publish tasks to enqueue to Kafka in one batch.
-    #[serde(default = "default_output_publish_batch_size")]
-    pub batch_size: usize,
-    /// How long the producer may wait for more messages before flushing a batch.
-    #[serde(default = "default_output_publish_linger_ms")]
-    pub linger_ms: u64,
-}
-
-fn default_output_publish_batch_size() -> usize {
-    256
-}
-
-fn default_output_publish_linger_ms() -> u64 {
-    5
-}
-
-impl Default for OutputPublishCfg {
-    fn default() -> Self {
-        Self {
-            batch_size: default_output_publish_batch_size(),
-            linger_ms: default_output_publish_linger_ms(),
-        }
-    }
+    pub quote: QuotePublishCfg,
+    pub settle: SettlePublishCfg,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,7 +81,6 @@ pub struct Config {
     pub snap_cleanup: SnapCleanupCfg,
     #[serde(default)]
     pub snap_dump: SnapDumpCfg,
-    #[serde(default)]
     pub output_publish: OutputPublishCfg,
 }
 
@@ -125,8 +119,28 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
     if cfg.db.addr.trim().is_empty() || cfg.db.user.trim().is_empty() {
         return Err("db.addr and db.user must be non-empty".into());
     }
-    if cfg.output_publish.batch_size == 0 {
-        return Err("output_publish.batch_size must be > 0".into());
+    let q = &cfg.output_publish.quote;
+    if q.batch_size == 0 {
+        return Err("output_publish.quote.batch_size must be > 0".into());
+    }
+    if q.max_in_flight_requests_per_connection < 1 {
+        return Err(
+            "output_publish.quote.max_in_flight_requests_per_connection must be >= 1".into(),
+        );
+    }
+    let s = &cfg.output_publish.settle;
+    if s.batch_size == 0 {
+        return Err("output_publish.settle.batch_size must be > 0".into());
+    }
+    if s.max_in_flight_requests_per_connection < 1 {
+        return Err(
+            "output_publish.settle.max_in_flight_requests_per_connection must be >= 1".into(),
+        );
+    }
+    if s.max_in_flight_requests_per_connection > 5 {
+        return Err(
+            "output_publish.settle: Kafka idempotent producer allows at most max.in.flight=5; lower settle.max_in_flight_requests_per_connection".into(),
+        );
     }
 
     let m = &cfg.market;
