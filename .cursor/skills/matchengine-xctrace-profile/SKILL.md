@@ -25,7 +25,7 @@ Bundled scripts next to **`SKILL.md`** (`scripts/`) write **`state-snapshots.ndj
 
 ## Cursor agent behavior
 
-When this skill applies, **start profiling without prompting for confirmation**. For **`profile_with_xctrace.sh`**, **default to `--stop-existing`** so any running `./target/release/matchengine_rust` is terminated before **`xctrace … --launch`**: duplicate instances hit **`process_lock`** and exit immediately. Only skip **`--stop-existing`** if the user explicitly wants to keep another engine instance alive (then attach-mode / **`poll_engine_state.sh`** instead of the launch bundle). Respect user overrides such as **`--time-limit`**, **`--output-dir`**, or a **`CONFIG_PATH`** argument.
+When this skill applies, **build the release binary first**, then **start profiling without prompting for confirmation**. For **`profile_with_xctrace.sh`**, **default to `--stop-existing`** so any running `./target/release/matchengine_rust` is terminated before **`xctrace … --launch`**: duplicate instances hit **`process_lock`** and exit immediately. Only skip **`--stop-existing`** if the user explicitly wants to keep another engine instance alive (then attach-mode / **`poll_engine_state.sh`** instead of the launch bundle). Respect user overrides such as **`--time-limit`**, **`--output-dir`**, or a **`CONFIG_PATH`** argument.
 
 ---
 
@@ -35,6 +35,8 @@ When this skill applies, **start profiling without prompting for confirmation**.
 
 ```bash
 cd /path/to/matchengine_rust
+
+cargo build --release
 
 xcrun xctrace record \
   --template 'Time Profiler' \
@@ -77,6 +79,9 @@ SCRIPT_SKILL=".cursor/skills/matchengine-xctrace-profile/scripts"
 "$SCRIPT_SKILL/profile_with_xctrace.sh" --stop-existing
 # optional: --time-limit 1m --output-dir profiling/my-run [CONFIG_PATH]
 ```
+
+`profile_with_xctrace.sh` always runs `cargo build --release` before launch-mode
+profiling so the captured binary matches the current workspace.
 
 Artifacts directory (`profiling/xctrace-<timestamp>/` by default):
 

@@ -37,6 +37,7 @@ export interface MatchengineYaml {
       batch_size: number;
       linger_ms: number;
       max_in_flight_requests_per_connection: number;
+      thread_count: number;
     };
   };
 }

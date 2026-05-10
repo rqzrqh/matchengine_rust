@@ -64,6 +64,7 @@ pub struct SettlePublishCfg {
     pub batch_size: usize,
     pub linger_ms: u64,
     pub max_in_flight_requests_per_connection: u32,
+    pub thread_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,6 +142,9 @@ pub fn validate_config(cfg: &Config) -> Result<(), String> {
         return Err(
             "output_publish.settle: Kafka idempotent producer allows at most max.in.flight=5; lower settle.max_in_flight_requests_per_connection".into(),
         );
+    }
+    if s.thread_count == 0 {
+        return Err("output_publish.settle.thread_count must be > 0".into());
     }
 
     let m = &cfg.market;

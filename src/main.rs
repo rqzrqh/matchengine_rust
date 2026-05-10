@@ -31,8 +31,8 @@ mod task;
 mod config;
 
 // Runtime layout (one OS process, one market). Profiler-visible thread prefixes: matcher main (unnamed OS main),
-// `snap-cleanup`, `snap-timer`, `http-driver` + `http-worker`, `kafka-consumer`, `quote-publish` + `quote-pub-io`,
-// `settle-publish` + `settle-pub-io` (Tokio appends `-N` suffixes).
+// `snap-cleanup`, `snap-timer`, `http-driver` + `http-worker`, `kafka-consumer`, `quote-publish`,
+// configured `settle-publish-*` worker threads (Tokio appends `-N` suffixes to the HTTP/consumer runtime threads).
 // - Main thread: blocking loop on `main_routine_receiver`; owns `Market`, handles Kafka input, REST replies,
 //   snapshot dumps, and publish progress updates.
 // - HTTP (`http-driver` + nested Tokio `http-worker*`): Axum; forwards `HttpRequest` tasks to the main channel.
@@ -90,6 +90,7 @@ fn validate_kafka_topics(
     input_topic: &str,
     quote_topic: &str,
     settle_group_count: usize,
+    settle_publish_thread_count: usize,
 ) -> Result<(), String> {
     let input_partitions = kafka_partition_count(brokers, input_topic)?;
     if input_partitions == 0 {
@@ -106,6 +107,12 @@ fn validate_kafka_topics(
         return Err(format!(
             "Kafka topic settle has {} partition(s), but matcher requires at least {} because user settle group size is {}; recreate it with deploy/kafka_settle.sh",
             settle_partitions, settle_group_count, settle_group_count
+        ));
+    }
+    if settle_partitions % settle_publish_thread_count != 0 {
+        return Err(format!(
+            "Kafka topic settle has {} partition(s), which must be an integer multiple of output_publish.settle.thread_count ({})",
+            settle_partitions, settle_publish_thread_count
         ));
     }
 
@@ -153,12 +160,21 @@ fn main() {
 
     let input_topic = format!("offer.{}", market_name);
     let quote_topic = format!("quote_deals.{}", market_name);
+    if market::USER_SETTLE_GROUP_SIZE % output_publish_cfg.settle.thread_count != 0 {
+        error!(
+            "config invalid: user settle group size ({}) must be an integer multiple of output_publish.settle.thread_count ({})",
+            market::USER_SETTLE_GROUP_SIZE,
+            output_publish_cfg.settle.thread_count
+        );
+        process::exit(1);
+    }
 
     if let Err(e) = validate_kafka_topics(
         &brokers,
         &input_topic,
         &quote_topic,
         market::USER_SETTLE_GROUP_SIZE,
+        output_publish_cfg.settle.thread_count,
     ) {
         error!("Kafka topic validation failed: {}", e);
         process::exit(1);
@@ -213,6 +229,7 @@ fn main() {
         mk.pushed_quote_deals_id,
         mk.pushed_settle_message_ids.to_vec(),
         publish::PublishDriverCfg {
+            quote_topic: quote_topic.clone(),
             quote_batch_size: output_publish_cfg.quote.batch_size,
             quote_linger_ms: output_publish_cfg.quote.linger_ms,
             quote_max_in_flight_requests_per_connection: output_publish_cfg
@@ -223,6 +240,7 @@ fn main() {
             settle_max_in_flight_requests_per_connection: output_publish_cfg
                 .settle
                 .max_in_flight_requests_per_connection,
+            settle_thread_count: output_publish_cfg.settle.thread_count,
         },
     );
 

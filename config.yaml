@@ -40,6 +40,9 @@ output_publish:
     linger_ms: 10
     max_in_flight_requests_per_connection: 1
   settle:
-    batch_size: 50
-    linger_ms: 10
-    max_in_flight_requests_per_connection: 1
+    batch_size: 4096
+    linger_ms: 5
+    max_in_flight_requests_per_connection: 5
+    # Number of application settle publish workers. The settle topic partition count
+    # and USER_SETTLE_GROUP_SIZE must be integer multiples of this value.
+    thread_count: 1

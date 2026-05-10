@@ -36,34 +36,34 @@ back, including unrelated partitions.
 
 ## Current architecture
 
-The settle publish thread now acts as a dispatcher. It owns one Tokio runtime
-and one shared Kafka `FutureProducer`, creates one async worker queue per settle
-group, then forwards each `SettlePublishTaskInfo` to the worker for its
-`group_id`.
+Settle publishing now runs a configured number of OS workers
+(`output_publish.settle.thread_count`). The main thread sends each
+`SettlePublishTaskInfo` directly to the worker responsible for that `group_id`.
+Each worker owns an equal-sized contiguous range of settle groups, shares the
+same Kafka `FutureProducer` handle, processes its queue sequentially, and blocks
+on delivery futures on the same OS thread.
 
-Each partition worker processes its queue sequentially:
+Each settle worker processes its queue sequentially:
 
 1. Drop already-pushed messages whose `settle_message_id` is not greater than
-   the worker's local pushed cursor.
+  the worker's local pushed cursor for that `group_id`.
 2. Enqueue the message to Kafka using the worker's partition id.
-3. Await the delivery future.
+3. Block until the delivery future resolves.
 4. Decrement publish backlog.
 5. Send `Task::SettleProgressUpdateTask` back to the main thread.
 6. Advance the worker's local pushed cursor.
 
-Different workers run independently on the settle publish runtime, so one slow
-partition no longer blocks other partitions from sending and confirming.
+Different workers run independently as plain OS threads, so one slow group range
+does not block groups assigned to other settle publish workers.
 
 ```mermaid
 flowchart LR
-  Matcher["Main matcher thread"] --> SharedQueue["settle mpsc"]
-  SharedQueue --> Dispatcher["settle-publish dispatcher"]
-  Dispatcher --> Queue0["partition 0 queue"]
-  Dispatcher --> Queue1["partition 1 queue"]
-  Dispatcher --> QueueN["partition N queue"]
-  Queue0 --> Worker0["partition 0 ordered worker"]
-  Queue1 --> Worker1["partition 1 ordered worker"]
-  QueueN --> WorkerN["partition N ordered worker"]
+  Matcher["Main matcher thread"] --> Queue0["group range 0 queue"]
+  Matcher --> Queue1["group range 1 queue"]
+  Matcher --> QueueN["group range N queue"]
+  Queue0 --> Worker0["settle-publish-0"]
+  Queue1 --> Worker1["settle-publish-1"]
+  QueueN --> WorkerN["settle-publish-N"]
   Worker0 --> Producer["shared FutureProducer"]
   Worker1 --> Producer
   WorkerN --> Producer
@@ -75,9 +75,10 @@ flowchart LR
 
 ## Ordering model
 
-Ordering is guaranteed at the application layer by the per-partition worker:
+Ordering is guaranteed at the application layer by the group-to-worker mapping:
 
-- There is exactly one worker queue per `group_id`.
+- Each `group_id` is always sent to the same worker queue.
+- The main thread sends messages for a `group_id` in settle id order.
 - A worker awaits the Kafka delivery result before it sends progress for that
   message and before it processes the next queued message.
 - `pushed_settle_message_ids[group_id]` is updated only by the main thread after
@@ -106,10 +107,14 @@ output_publish:
     batch_size: 256
     linger_ms: 50
     max_in_flight_requests_per_connection: 5
+    thread_count: 8
 ```
 
 Settle publishing always enables Kafka idempotence and `acks=all` in code. There
 is no `settle.enable_idempotence` flag anymore.
+
+The Kafka `settle` topic partition count and `USER_SETTLE_GROUP_SIZE` must both
+be integer multiples of `output_publish.settle.thread_count`.
 
 Configuration meanings:
 
@@ -118,6 +123,7 @@ Configuration meanings:
 | `batch_size` | Application batch collection and librdkafka `batch.num.messages` | Caps how many publish tasks the dispatcher drains per loop and how many messages librdkafka may place in one broker batch. |
 | `linger_ms` | Kafka producer batching | Lets librdkafka wait briefly for nearby records before sending a broker batch. Lower values reduce latency; higher values may improve throughput. |
 | `max_in_flight_requests_per_connection` | Kafka producer connection | Limits unacknowledged produce requests per broker connection. Settle must stay `<= 5` because idempotence is always enabled. |
+| `thread_count` | Application settle publish workers | Controls how many OS threads drive settle publishing. Each worker owns `USER_SETTLE_GROUP_SIZE / thread_count` settle groups. |
 
 Because settle workers serialize each partition at the application layer,
 `max_in_flight_requests_per_connection` mainly controls cross-partition and
@@ -125,9 +131,9 @@ broker-level concurrency, not per-partition reordering.
 
 ## Thread model impact
 
-The process still has one OS thread named `settle-publish`. Inside it, the
-settle Tokio runtime uses a small worker pool and runs the dispatcher plus
-per-partition async tasks. These are not additional OS threads per partition.
+The process now has `output_publish.settle.thread_count` OS threads named
+`settle-publish-*`. Each worker blocks directly on Kafka delivery futures; there
+is no nested `settle-pub-io` Tokio pool anymore.
 
 The Kafka producer handle still owns its own librdkafka native threads for broker
 I/O, polling, and protocol work. See [`doc/thread-model.md`](thread-model.md)
@@ -140,6 +146,7 @@ Start with the current safe defaults:
 - `settle.max_in_flight_requests_per_connection: 5`
 - `settle.linger_ms: 50`
 - `settle.batch_size: 256`
+- `settle.thread_count: 8`
 
 For lower latency, reduce `settle.linger_ms` first, for example to `10` or `5`.
 For a conservative ordering experiment, set

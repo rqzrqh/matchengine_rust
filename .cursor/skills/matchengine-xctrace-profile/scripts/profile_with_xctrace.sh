@@ -78,10 +78,8 @@ POLL_DURATION=$((LIM + 25))
 
 cd "$REPO_ROOT"
 
-if [[ ! -x "$ENGINE_BIN" ]]; then
-  echo "Building release binary..."
-  cargo build --release
-fi
+echo "Building release binary..."
+cargo build --release
 
 if [[ "$STOP_EXISTING" -eq 1 ]]; then
   pids="$(pgrep -f '/target/release/matchengine_rust' || true)"

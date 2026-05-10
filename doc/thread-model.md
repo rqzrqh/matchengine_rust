@@ -22,8 +22,8 @@ This section maps **thread titles exactly as Instruments lists them** for a **Ti
 | **`http-worker`** (multiple TIDs possible) | HTTP Tokio pool: **[`thread_name("http-worker")`](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html)** on **[`new_multi_thread()`](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html)** ([`src/main.rs`](../src/main.rs)); Axum/Hyper I/O and handler **`await`** points — **`Market`** access still happens **only** after a task reaches the main thread. |
 | **`kafka-consumer`** | Dedicated consumer runtime: **`worker_threads(1)`** + **`thread_name("kafka-consumer")`** ([`consumer_rt` in `src/main.rs`](../src/main.rs)); **`StreamConsumer::recv().await`** → [`Task::MqTask`](../src/task.rs). |
 | **`quote-publish`** | Quote publish OS thread: **`thread::Builder::name("quote-publish")`** ([`spawn_quote_publish_thread` in `src/publish.rs`](../src/publish.rs)); nested Tokio runtime runs **`block_on`** batch send / **`DeliveryFuture`** awaits. |
-| **`settle-publish`** | Settle publish OS thread: **`settle-publish`** ([`spawn_settle_publish_thread`](../src/publish.rs)); same nested-runtime layout as quote. |
-| **`producer polling thread`** (may repeat with different IDs) | **librdkafka-created** polling threads tied to producer (and sometimes consumer) handles — **not** named in Rust `thread::Builder`; visible when Kafka producers are active beside **`quote-publish`** / **`settle-publish`**. |
+| **`settle-publish-*`** | Configured settle publish OS threads ([`output_publish.settle.thread_count`](../config.yaml), [`spawn_settle_publish_thread`](../src/publish.rs)); each thread owns a fixed range of settle groups, blocks directly on delivery futures, and reports progress back to the main thread. |
+| **`producer polling thread`** (may repeat with different IDs) | **librdkafka-created** polling threads tied to `FutureProducer` handles — **not** named in Rust `thread::Builder`; visible when Kafka producers are active beside **`quote-publish`** / **`settle-publish-*`**. These threads drive producer callbacks / delivery result polling, so profile CPU here belongs to Kafka output plumbing, not matcher logic. |
 | **`rdk:main`**, **`rdk:broker1`**, **`rdk:broker-1`**, … | Other **librdkafka** native threads for **each** client handle (broker sockets, protocol). Hyphen vs digit spelling (**`broker-1`** vs **`broker1`**) varies by version/topology. |
 
 #### Threads you own but may **not** show up clearly
@@ -34,9 +34,8 @@ Short Time Profiler runs bias toward threads that spend CPU time **inside** `mat
 | --- | --- | --- |
 | Snapshot dump timer | **`snap-timer`** | Mostly **`thread::sleep`** between wakes — samples often land in libc/kernel without Rust symbols. |
 | Snapshot DB pruning | **`snap-cleanup`** | Same pattern while waiting on **`cleanup_interval_secs`**. |
-| Publish Tokio workers | **`quote-pub-io`** / **`settle-pub-io`** prefixes | Nested runtimes use **`worker_threads(1)`** + **`thread_name`** ([`publish.rs`](../src/publish.rs)); CPU may still be attributed to the outer **`quote-publish`** / **`settle-publish`** pthread or dominated by **`producer polling thread`** / **`rdk:*`** stacks. |
 
-Tokio detail: **quote** and **settle** paths each wrap **`block_on`** in **`quote-publish`** / **`settle-publish`** using **[`new_multi_thread().worker_threads(1)`](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html)** plus **`thread_name("quote-pub-io")`** / **`settle-pub-io`** ([`publish.rs`](../src/publish.rs)). You may still see **`tokio-runtime-worker`** or unnamed helpers from blocking pools / older binaries — that does **not** imply multiple matcher workers.
+Tokio detail: **quote** and **settle** both drive Kafka delivery futures on their own publish OS threads with current-thread runtimes; neither creates an extra publish Tokio worker pool. You may still see **`tokio-runtime-worker`** or unnamed helpers from blocking pools / older binaries — that does **not** imply multiple matcher workers.
 
 ## Figures
 
@@ -81,13 +80,13 @@ flowchart TB
     subgraph quote_pr["Quote FutureProducer"]
       direction TB
       APP_QP["quote-publish thread<br/>Tokio batch send awaits"]
-      RDK_QP["librdkafka native threads<br/>producer handle broker IO"]
+      RDK_QP["librdkafka native threads<br/>rdk broker IO + producer polling thread"]
       APP_QP --> RDK_QP
     end
     subgraph settle_pr["Settle FutureProducer"]
       direction TB
-      APP_SP["settle-publish thread<br/>Tokio batch send awaits"]
-      RDK_SP["librdkafka native threads<br/>producer handle broker IO"]
+      APP_SP["settle-publish-* threads<br/>configured workers await deliveries"]
+      RDK_SP["librdkafka native threads<br/>rdk broker IO + producer polling thread"]
       APP_SP --> RDK_SP
     end
     CL["snap-cleanup thread"]
@@ -121,7 +120,7 @@ flowchart TB
 
 Solid arrows: recurring message paths. The dotted line is **not** the main-queue `Task` path: the main thread runs `handle_dump`, which **`fork`s** a child that talks to MySQL using a **fresh** pool.
 
-**Kafka thread styling:** Boxes with **blue styling** (**`classDef rdkNative`**) are **native threads started inside librdkafka** (`rdk:main`, `rdk:broker-*`, sometimes **`producer polling thread`**) for **that consumer or producer handle**. Neighbour boxes are **Rust** (`kafka-consumer` Tokio worker or **`quote-publish`** / **`settle-publish`** `std::thread`) that drive rdkafka APIs. Boxes are schematic; thread **counts** vary with brokers, TLS, and librdkafka version. Narrative tables in [Kafka receive and send threads](#kafka-receive-and-send-threads-application-vs-librdkafka).
+**Kafka thread styling:** Boxes with **blue styling** (**`classDef rdkNative`**) are **native threads started inside librdkafka** (`rdk:main`, `rdk:broker-*`, **`producer polling thread`**) for **that consumer or producer handle**. Neighbour boxes are **Rust** (`kafka-consumer` Tokio worker or **`quote-publish`** / **`settle-publish-*`** `std::thread`) that drive rdkafka APIs. Boxes are schematic; thread **counts** vary with brokers, TLS, and librdkafka version. Narrative tables in [Kafka receive and send threads](#kafka-receive-and-send-threads-application-vs-librdkafka).
 
 ### Figure 2 — HTTP query: two threads, one `Market` reader
 
@@ -189,9 +188,9 @@ The main thread loads config, validates Kafka topics, acquires the process lock,
 
 ### Kafka receive and send threads (application vs librdkafka)
 
-The binary uses **one** [`StreamConsumer`](https://docs.rs/rdkafka/latest/rdkafka/consumer/struct.StreamConsumer.html) for `offer.<market>` input and **two** separate [`FutureProducer`](https://docs.rs/rdkafka/latest/rdkafka/producer/struct.FutureProducer.html) instances—quote and settle each call [`build_kafka_producer`](../src/publish.rs) once inside its own publish thread ([`spawn_quote_publish_thread`](../src/publish.rs), [`spawn_settle_publish_thread`](../src/publish.rs)). **Each of those three client handles has its own librdkafka thread set**; there is no single process-wide “Kafka I/O thread pool” shared across consumer + both producers.
+The binary uses **one** [`StreamConsumer`](https://docs.rs/rdkafka/latest/rdkafka/consumer/struct.StreamConsumer.html) for `offer.<market>` input and **two** separate [`FutureProducer`](https://docs.rs/rdkafka/latest/rdkafka/producer/struct.FutureProducer.html) instances: quote builds one producer inside [`spawn_quote_publish_thread`](../src/publish.rs), and settle builds one shared producer used by all configured [`settle-publish-*`](../src/publish.rs) workers. **Each of those three client handles has its own librdkafka thread set**; there is no single process-wide “Kafka I/O thread pool” shared across consumer + both producers.
 
-**Does librdkafka create extra threads? Yes.** Aside from Rust’s **`kafka-consumer`** Tokio worker and the two **`std::thread`** publish loops, **`StreamConsumer::create`** / **`Producer::create`** (through this crate → **librdkafka**) each bring up **their own native (C-side) threads** that the application never names or spawns explicitly. Those threads handle broker sockets, timers, buffering, callbacks, protocol work, etc. Typical profiler labels include **`rdk:main`**, **`rdk:broker-<n>`**, and on macOS Instruments often lists extra **`producer polling thread`** rows (still native librdkafka-side workers, not Rust `thread::Builder` names). Counts **vary by librdkafka version, bootstrap brokers, TLS, metadata, idle vs active state** — so this document does **not** fix a numeric thread budget; it only asserts that **each handle adds its own background threads on top** of whatever Tokio/`std::thread` you allocate in Rust.
+**Does librdkafka create extra threads? Yes.** Aside from Rust’s **`kafka-consumer`** Tokio worker and the **`std::thread`** publish loops, **`StreamConsumer::create`** / **`Producer::create`** (through this crate -> **librdkafka**) each bring up **their own native (C-side) threads** that the application never names or spawns explicitly. Those threads handle broker sockets, timers, buffering, callbacks, protocol work, etc. Typical profiler labels include **`rdk:main`**, **`rdk:broker-<n>`**, and on macOS Instruments often lists extra **`producer polling thread`** rows. `producer polling thread` is expected for `FutureProducer`: it is still a librdkafka-side helper for producer queues / delivery callbacks, not an additional Rust publish worker and not an indication that `Market` is being matched concurrently. Counts **vary by librdkafka version, bootstrap brokers, TLS, metadata, idle vs active state** — so this document does **not** fix a numeric thread budget; it only asserts that **each handle adds its own background threads on top** of whatever Tokio/`std::thread` you allocate in Rust.
 
 **Receive path (offer topic → main `mpsc`):**
 
@@ -204,8 +203,8 @@ The binary uses **one** [`StreamConsumer`](https://docs.rs/rdkafka/latest/rdkafk
 
 | Layer | Quote | Settle |
 | --- | --- | --- |
-| **Application** | One dedicated **`std::thread`** loop; inside it a Tokio runtime **[`worker_threads(1)`](../src/publish.rs)** runs `producer.send_result` / awaits [`DeliveryFuture`](https://docs.rs/rdkafka/latest/rdkafka/producer/producer_arc/struct.DeliveryFuture.html)s for batches. | Same layout: **separate** `std::thread` + **another** Tokio runtime with **`worker_threads(1)`**. |
-| **librdkafka** | Background threads for **that** `FutureProducer` only (`rdk:*`, **`producer polling thread`**, … in Instruments). | **Different** `FutureProducer` instance → **its own** native thread set, not shared with quote or with the consumer. |
+| **Application** | One dedicated **`std::thread`** loop; inside it a current-thread Tokio runtime runs `producer.send_result` / awaits [`DeliveryFuture`](https://docs.rs/rdkafka/latest/rdkafka/producer/producer_arc/struct.DeliveryFuture.html)s for batches. | Configured **`settle-publish-*`** `std::thread` workers (`output_publish.settle.thread_count`), each with a current-thread Tokio runtime and a fixed range of settle groups. |
+| **librdkafka** | Background threads for **that** `FutureProducer` only: one or more **`rdk:broker*`** threads for broker socket / protocol I/O, plus possible **`producer polling thread`** rows for producer queues and delivery callbacks. | **Different** shared settle `FutureProducer` instance → **its own** native thread set with the same categories (`rdk:broker*` and possible `producer polling thread`), not shared with quote or with the consumer. |
 
 So: **“Receive”** in product terms is *broker → librdkafka fetch side → your `kafka-consumer` thread’s `recv` loop → `MqTask`*. **“Send”** is *your publish thread enqueues via `send_result` → librdkafka serializes and pushes bytes → broker*; delivery completion completes the future your thread awaits.
 
@@ -230,16 +229,31 @@ Snapshot semantics come from copy-on-write at fork: the child sees `Market` as o
 
 ### Publish threads
 
-`Publish::new` creates two unbounded mpsc channels and starts two OS threads:
+`Publish::new` starts one quote publish OS thread plus configured settle publish OS
+threads (`output_publish.settle.thread_count`):
 
 | Thread (OS name → Instruments) | Main-thread output consumed | Kafka target | Progress reported back |
 | --- | --- | --- | --- |
 | **`quote-publish`** | Matcher-built `QuotePublishTaskInfo` | `quote_deals.<market>` | `Task::QuoteProgressUpdateTask` |
-| **`settle-publish`** | Matcher-built `SettlePublishTaskInfo` | `settle` topic, chosen partition | `Task::SettleProgressUpdateTask` |
+| **`settle-publish-*`** | Matcher-built `SettlePublishTaskInfo` for assigned groups | `settle` topic, chosen partition | `Task::SettleProgressUpdateTask` |
 
-These **`std::thread`** loops take **already processed** matcher outputs from the main event loop, push them to Kafka, and after delivery confirmation use `main_routine_sender` to report progress so the main thread updates `Market` `pushed_*` fields. Each wraps a nested Tokio runtime whose worker thread prefix is **`quote-pub-io`** / **`settle-pub-io`** ([`publish.rs`](../src/publish.rs)).
+These **`std::thread`** loops take **already processed** matcher outputs from the main event loop, push them to Kafka, and after delivery confirmation use `main_routine_sender` to report progress so the main thread updates `Market` `pushed_*` fields. The async delivery futures are driven on the same publish OS threads via current-thread Tokio runtimes ([`publish.rs`](../src/publish.rs)).
 
-Each thread is the **application send driver** for its own `FutureProducer`; the **librdkafka send / broker I/O threads** for that producer are separate (see [Kafka receive and send threads](#kafka-receive-and-send-threads-application-vs-librdkafka)). Tasks are batched per config; delivery futures are still awaited in pending order. Producers set `max.in.flight.requests.per.connection = 1` to reduce reordering risk.
+In profiler output, Kafka output work therefore appears as three related thread
+classes: the Rust application publish thread (`quote-publish` or
+`settle-publish-*`), librdkafka **`producer polling thread`** rows, and
+librdkafka **`rdk:broker*`** rows. The latter two are native threads owned by the
+corresponding `FutureProducer`, not extra matcher threads.
+
+The settle topic partition count and `USER_SETTLE_GROUP_SIZE` must both be integer
+multiples of `output_publish.settle.thread_count`, so each settle publish thread
+owns the same number of settle groups. Each thread is an **application send
+driver** for a shared `FutureProducer`; the **librdkafka send / broker I/O
+threads** for that producer are separate (see [Kafka receive and send
+threads](#kafka-receive-and-send-threads-application-vs-librdkafka)). Tasks are
+batched per config; delivery futures are still awaited in pending order.
+Producers set `max.in.flight.requests.per.connection = 1` to reduce reordering
+risk.
 
 Publish threads hold only data needed to send plus `Arc<PublishBacklog>`. Backlog uses atomic counters for quote/settle/per-group pending counts—mostly accounting and debug underflow checks; the main thread does not use backlog for flow control today.
 
@@ -310,7 +324,7 @@ The consumer assigns only partition 0 of `offer.<market>` and continues from the
 Quote and settle publish on separate threads:
 
 - One quote publisher to `quote_deals.<market>` using MessagePack payloads.
-- One settle publisher writing MessagePack payloads to partitions of `settle` by `user_id % 64`.
+- Configured settle publishers writing MessagePack payloads to partitions of `settle` by `user_id % 64`; each `group_id` is always routed to the same `settle-publish-*` worker.
 - Each producer uses `max.in.flight.requests.per.connection = 1` and reports progress only after delivery ack.
 
 There is no single global settle ordering; ordering is per group/partition, matching `settle_message_ids[group_id]`.
