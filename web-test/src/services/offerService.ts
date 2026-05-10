@@ -1,13 +1,14 @@
-import { Mutex } from "async-mutex";
 import { getAppConfig } from "../config.js";
 import { getDb } from "../db.js";
-import { OfferOrder } from "../db/entities.js";
+import { OfferDispatchState, OfferOrder } from "../db/entities.js";
 import { unixSecondsNow } from "../time.js";
-import type { OfferSequenceService } from "./offerSequenceService.js";
 
 /** Matches `extern_id` / Kafka message `id`; MySQL signed INT */
 const INT32_MIN = -2147483648;
 const INT32_MAX = 2147483647;
+const MQ_METHOD_ORDER_PUT_LIMIT = 1;
+const MQ_METHOD_ORDER_PUT_MARKET = 2;
+const MQ_METHOD_ORDER_CANCEL = 3;
 
 export class OfferValidationError extends Error {}
 
@@ -99,6 +100,13 @@ export type OfferOrderApiRow = {
   error?: string;
 };
 
+type OfferSubmitResult = {
+  ok: boolean;
+  input_sequence_id: number | null;
+  topic: string;
+  order_id: number;
+};
+
 function toApiRow(r: OfferOrder): OfferOrderApiRow {
   return {
     id: r.id,
@@ -114,14 +122,11 @@ function toApiRow(r: OfferOrder): OfferOrderApiRow {
 }
 
 /**
- * Offer service: table `id` is unique row id; `input_sequence_id` in Kafka comes from `sequence_id`
- * (assigned by {@link OfferSequenceService}). Kafka send is done by {@link OfferDispatchService}.
+ * Offer service only persists accepted order requests. `OfferSequenceService`
+ * assigns `sequence_id` in batches, and `OfferDispatchService` pushes sequenced
+ * requests to Kafka.
  */
 export class OfferService {
-  private readonly seqMutex = new Mutex();
-
-  constructor(private readonly sequence: OfferSequenceService) {}
-
   async listOrders(): Promise<OfferOrderApiRow[]> {
     const mgr = getDb().manager;
     const rows = await mgr.find(OfferOrder, {
@@ -137,19 +142,30 @@ export class OfferService {
     externId: number,
     summary: string,
     payload: Record<string, unknown>,
-  ): Promise<{ ok: boolean; input_sequence_id: number; topic: string; order_id: number }> {
-    return this.seqMutex.runExclusive(async () => {
-      const mgr = getDb().manager;
-      const raw = await mgr
+  ): Promise<OfferSubmitResult> {
+    const mgr = getDb().manager;
+    const payloadJson = JSON.stringify(payload);
+    const createdAt = unixSecondsNow();
+
+    const id = await mgr.transaction(async (em) => {
+      const state = await em
+        .createQueryBuilder(OfferDispatchState, "s")
+        .setLock("pessimistic_write")
+        .where("s.id = :id", { id: 1 })
+        .getOne();
+
+      if (!state) {
+        throw new Error("offer_dispatch_state row missing; run database migrations");
+      }
+
+      const raw = await em
         .createQueryBuilder(OfferOrder, "o")
         .select("MAX(o.id)", "max")
         .getRawOne<{ max: string | number | null }>();
       const maxId = raw?.max != null ? Number(raw.max) : 0;
       const id = maxId + 1;
-      const payloadJson = JSON.stringify(payload);
-      const createdAt = unixSecondsNow();
 
-      await mgr.insert(OfferOrder, {
+      await em.insert(OfferOrder, {
         id,
         sequenceId: null,
         createdAt,
@@ -162,19 +178,11 @@ export class OfferService {
         payloadJson,
       });
 
-      await this.sequence.assignPending();
-
-      const row = await mgr.findOne(OfferOrder, { where: { id } });
-      if (row?.sequenceId == null) {
-        throw new Error(
-          "order row inserted but sequence_id was not assigned (sequencing failed); check DB and offer_sequence worker",
-        );
-      }
-      const seq = row.sequenceId;
-
-      const offerTopic = `offer.${getAppConfig().marketName}`;
-      return { ok: true, input_sequence_id: seq, topic: offerTopic, order_id: id };
+      return id;
     });
+
+    const offerTopic = `offer.${getAppConfig().marketName}`;
+    return { ok: true, input_sequence_id: null, topic: offerTopic, order_id: id };
   }
 
   private logOfferFailure(kindLabel: string, e: unknown): void {
@@ -182,12 +190,7 @@ export class OfferService {
     console.warn(`[offer] cannot place order (${kindLabel}): ${msg}`);
   }
 
-  async placeLimit(body: Record<string, unknown>): Promise<{
-    ok: boolean;
-    input_sequence_id: number;
-    topic: string;
-    order_id: number;
-  }> {
+  async placeLimit(body: Record<string, unknown>): Promise<OfferSubmitResult> {
     try {
       const cfg = getAppConfig().yaml.market;
       const user_id = parseUserId(body, "limit order");
@@ -209,7 +212,7 @@ export class OfferService {
       const extern_id = parseExternId(body);
       const summary = `limit user=${user_id} side=${side} price=${price} amount=${amount}`;
       const payload = {
-        method: "order.put_limit",
+        method: MQ_METHOD_ORDER_PUT_LIMIT,
         id: extern_id,
         params: {
           user_id,
@@ -227,12 +230,7 @@ export class OfferService {
     }
   }
 
-  async placeMarket(body: Record<string, unknown>): Promise<{
-    ok: boolean;
-    input_sequence_id: number;
-    topic: string;
-    order_id: number;
-  }> {
+  async placeMarket(body: Record<string, unknown>): Promise<OfferSubmitResult> {
     try {
       const cfg = getAppConfig().yaml.market;
       const user_id = parseUserId(body, "market order");
@@ -248,7 +246,7 @@ export class OfferService {
       const extern_id = parseExternId(body);
       const summary = `market user=${user_id} side=${side} amount=${amount}`;
       const payload = {
-        method: "order.put_market",
+        method: MQ_METHOD_ORDER_PUT_MARKET,
         id: extern_id,
         params: {
           user_id,
@@ -264,12 +262,7 @@ export class OfferService {
     }
   }
 
-  async cancel(body: Record<string, unknown>): Promise<{
-    ok: boolean;
-    input_sequence_id: number;
-    topic: string;
-    order_id: number;
-  }> {
+  async cancel(body: Record<string, unknown>): Promise<OfferSubmitResult> {
     try {
       const user_id = parseUserId(body, "cancel");
       const order_id_param = Number(body.order_id);
@@ -279,7 +272,7 @@ export class OfferService {
       const extern_id = parseExternId(body);
       const summary = `cancel user=${user_id} order_id=${order_id_param}`;
       const payload = {
-        method: "order.cancel",
+        method: MQ_METHOD_ORDER_CANCEL,
         id: extern_id,
         params: { user_id, order_id: order_id_param },
       };

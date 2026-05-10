@@ -40,6 +40,7 @@ const AUTO_CORRECTION_INTERVAL_MAX_MS = 5_000;
 const AUTO_CORRECTION_RATIO = 0.05;
 const AUTO_MAX_CONCURRENCY = 16;
 const MARKET_BUY_AMOUNT_BUFFER = 1.000001;
+const AUTO_LIMIT_PRICE_BAND_RATIO = 0.02;
 
 let marketName = __MATCENGINE_CONFIG__.market.name;
 let engineHttpBase = DEFAULT_ENGINE_HTTP;
@@ -577,6 +578,9 @@ function pickRestingLimitPrice(
     let lo = Math.max(fallbackMin, bestBid !== null ? bestBid + tick : fallbackMin);
     let hi = fallbackMax;
     if (bestAsk !== null && bestAsk >= lo) hi = Math.min(hi, bestAsk);
+    if (bestAsk === null && bestBid !== null) {
+      hi = Math.min(hi, Math.max(lo, bestBid * (1 + AUTO_LIMIT_PRICE_BAND_RATIO)));
+    }
     if (hi < lo) hi = lo;
     return formatPrice(lo === hi ? lo : lo + Math.random() * (hi - lo));
   }
@@ -584,6 +588,12 @@ function pickRestingLimitPrice(
   let hi = Math.min(fallbackMax, bestAsk !== null ? Math.max(bestAsk - tick, tick) : fallbackMax);
   if (hi <= 0) return null;
   let lo = Math.max(Math.min(fallbackMin, hi), bestBid ?? Math.min(fallbackMin, hi));
+  if (bestBid === null && bestAsk !== null) {
+    lo = Math.max(lo, hi * (1 - AUTO_LIMIT_PRICE_BAND_RATIO));
+  }
+  if (bestAsk === null && bestBid !== null) {
+    hi = Math.min(hi, Math.max(lo, bestBid * (1 + AUTO_LIMIT_PRICE_BAND_RATIO)));
+  }
   if (lo > hi) lo = hi;
   return formatPrice(lo === hi ? lo : lo + Math.random() * (hi - lo));
 }
@@ -965,7 +975,12 @@ async function performAutoOrderStep(worker: AutoOrderWorkerState): Promise<void>
   const amount = randomDecimalStringAtScale(cfg.amountMin, cfg.amountMax, marketPrecision.stock);
 
   if (action === "limit") {
-    const price = randomDecimalStringAtScale(cfg.priceMin, cfg.priceMax, pricePrecision);
+    const [asks, bids] = await Promise.all([fetchOrderBookSide(1), fetchOrderBookSide(2)]);
+    const price = pickRestingLimitPrice(side, asks, bids, cfg);
+    if (price === null) {
+      setAutoOrderStatus(`Running: ${workerLabel(worker)} skip limit side=${side}, no valid price`);
+      return;
+    }
     setAutoOrderStatus(
       `Running: ${workerLabel(worker)} limit user=${userId} side=${side} price=${price} amount=${amount}`,
     );
@@ -1210,7 +1225,7 @@ async function refreshPublishPending(): Promise<void> {
     groupsEl.innerHTML = groupItems
       .map((item) => {
         const level = classifyPendingLevel(item.lag);
-        return `<code class="ip-group-chip ip-group-chip--${level}">settle.${escapeHtml(item.groupId)}=${escapeHtml(item.progress)}</code>`;
+        return `<code class="ip-group-chip ip-group-chip--${level}">${escapeHtml(item.groupId)}:${escapeHtml(item.progress)}</code>`;
       })
       .join("");
   } catch (e) {

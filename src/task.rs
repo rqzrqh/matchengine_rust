@@ -1,10 +1,64 @@
 use tokio::sync::oneshot;
 
-/// Kafka payload parsed and envelope-validated on the `kafka-consumer` thread; main thread
+pub const MQ_METHOD_ORDER_PUT_LIMIT: u32 = 1;
+pub const MQ_METHOD_ORDER_PUT_MARKET: u32 = 2;
+pub const MQ_METHOD_ORDER_CANCEL: u32 = 3;
+
+pub const QUOTE_MSG_TYPE_DEAL: u32 = 1;
+
+pub const SETTLE_MSG_TYPE_PUT_ORDER: u32 = 1;
+pub const SETTLE_MSG_TYPE_CANCEL_ORDER: u32 = 2;
+pub const SETTLE_MSG_TYPE_ERROR: u32 = 3;
+pub const SETTLE_MSG_TYPE_DEALS: u32 = 4;
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum MqParams {
+    PutLimit(PutLimitParams),
+    PutMarket(PutMarketParams),
+    Cancel(CancelParams),
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutLimitParams {
+    pub user_id: u32,
+    pub side: u32,
+    pub amount: String,
+    pub price: String,
+    pub taker_fee_rate: String,
+    pub maker_fee_rate: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutMarketParams {
+    pub user_id: u32,
+    pub side: u32,
+    pub amount: String,
+    pub taker_fee_rate: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelParams {
+    pub user_id: u32,
+    pub order_id: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MqPayload {
+    pub method: u32,
+    pub id: u64,
+    pub params: MqParams,
+    pub input_sequence_id: u64,
+}
+
+/// Kafka MessagePack payload unpacked and envelope-validated on the `kafka-consumer` thread; main thread
 /// applies `input_sequence_id` checks and matcher updates.
 pub struct KafkaMqTask {
     pub offset: i64,
-    pub payload: Result<json::JsonValue, String>,
+    pub payload: Result<MqPayload, String>,
 }
 
 #[derive(Debug)]

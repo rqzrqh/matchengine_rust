@@ -1,3 +1,4 @@
+import { encode } from "@msgpack/msgpack";
 import type { Producer } from "kafkajs";
 import { In } from "typeorm";
 import { getAppConfig } from "../config.js";
@@ -16,7 +17,7 @@ const TICK_MS = Math.min(
 
 /**
  * Polls `offer_orders` with `sequence_id` greater than `last_sent_sequence_id`,
- * sends JSON with `input_sequence_id` = `sequence_id`, then advances
+ * sends MessagePack with `input_sequence_id` = `sequence_id`, then advances
  * `last_sent_sequence_id` to the batch maximum.
  */
 export class OfferDispatchService {
@@ -27,6 +28,9 @@ export class OfferDispatchService {
 
   start(): void {
     if (this.timer) return;
+    void this.tick().catch((e) =>
+      console.error("[offer-dispatch] tick failed:", e instanceof Error ? e.message : e),
+    );
     this.timer = setInterval(() => {
       void this.tick().catch((e) =>
         console.error("[offer-dispatch] tick failed:", e instanceof Error ? e.message : e),
@@ -48,85 +52,93 @@ export class OfferDispatchService {
     if (this.inFlight) return;
     this.inFlight = true;
     try {
-      const mgr = getDb().manager;
-
-      const state = await mgr.findOne(OfferDispatchState, { where: { id: 1 } });
-      if (!state) {
-        console.error(
-          "[offer-dispatch] cannot dispatch: missing offer_dispatch_state row id=1; run database migrations.",
-        );
-        throw new Error("offer_dispatch_state row missing; run migrations");
-      }
-
-      const lastSent = state.lastSentSequenceId;
-      const filtered = await mgr
-        .createQueryBuilder(OfferOrder, "o")
-        .where("o.sequenceId IS NOT NULL")
-        .andWhere("o.sequenceId > :last", { last: lastSent })
-        .orderBy("o.sequenceId", "ASC")
-        .take(BATCH_SIZE)
-        .getMany();
-
-      if (filtered.length === 0) return;
-
-      const topic = `offer.${getAppConfig().marketName}`;
-
-      const kafkaMessages: { value: string }[] = [];
-      for (const row of filtered) {
-        const seq = row.sequenceId!;
-        let base: Record<string, unknown>;
-        try {
-          base = JSON.parse(row.payloadJson) as Record<string, unknown>;
-        } catch (e) {
-          const detail = e instanceof Error ? e.message : String(e);
-          console.error(
-            `[offer-dispatch] cannot dispatch: invalid JSON in payload_json for order_id=${row.id} sequence_id=${seq}: ${detail}`,
-          );
-          return;
-        }
-        const body = { ...base, input_sequence_id: seq };
-        kafkaMessages.push({ value: JSON.stringify(body) });
-      }
-
-      try {
-        await this.producer.send({
-          topic,
-          messages: kafkaMessages,
-        });
-      } catch (e) {
-        const detail = e instanceof Error ? e.message : String(e);
-        console.error(
-          `[offer-dispatch] cannot write to Kafka: topic=${topic} batch_size=${filtered.length}: ${detail}`,
-        );
-        throw e;
-      }
-
-      const lastRow = filtered[filtered.length - 1]!;
-      const maxSentSeq = lastRow.sequenceId!;
-      const ids = filtered.map((r) => r.id);
-      const now = unixSecondsNow();
-
-      try {
-        await mgr.transaction(async (em) => {
-          await em.update(
-            OfferDispatchState,
-            { id: 1 },
-            {
-              lastSentSequenceId: maxSentSeq,
-              updatedAt: now,
-            },
-          );
-          await em.update(OfferOrder, { id: In(ids) }, { status: "sent" });
-        });
-      } catch (e) {
-        const detail = e instanceof Error ? e.message : String(e);
-        console.error(
-          `[offer-dispatch] Kafka send succeeded but DB update failed (possible inconsistency): topic=${topic} max_sequence=${maxSentSeq}: ${detail}`,
-        );
-        throw e;
+      while (await this.flushBatch()) {
+        // Drain current backlog without waiting for the next timer tick.
       }
     } finally {
       this.inFlight = false;
     }
+  }
+
+  private async flushBatch(): Promise<boolean> {
+    const mgr = getDb().manager;
+
+    const state = await mgr.findOne(OfferDispatchState, { where: { id: 1 } });
+    if (!state) {
+      console.error(
+        "[offer-dispatch] cannot dispatch: missing offer_dispatch_state row id=1; run database migrations.",
+      );
+      throw new Error("offer_dispatch_state row missing; run migrations");
+    }
+
+    const lastSent = state.lastSentSequenceId;
+    const filtered = await mgr
+      .createQueryBuilder(OfferOrder, "o")
+      .where("o.sequenceId IS NOT NULL")
+      .andWhere("o.sequenceId > :last", { last: lastSent })
+      .orderBy("o.sequenceId", "ASC")
+      .take(BATCH_SIZE)
+      .getMany();
+
+    if (filtered.length === 0) return false;
+
+    const topic = `offer.${getAppConfig().marketName}`;
+
+    const kafkaMessages: { value: Buffer }[] = [];
+    for (const row of filtered) {
+      const seq = row.sequenceId!;
+      let base: Record<string, unknown>;
+      try {
+        base = JSON.parse(row.payloadJson) as Record<string, unknown>;
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e);
+        console.error(
+          `[offer-dispatch] cannot dispatch: invalid JSON in payload_json for order_id=${row.id} sequence_id=${seq}: ${detail}`,
+        );
+        return false;
+      }
+      const body = { ...base, input_sequence_id: seq };
+      kafkaMessages.push({ value: Buffer.from(encode(body)) });
+    }
+
+    try {
+      await this.producer.send({
+        topic,
+        messages: kafkaMessages,
+      });
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      console.error(
+        `[offer-dispatch] cannot write to Kafka: topic=${topic} batch_size=${filtered.length}: ${detail}`,
+      );
+      throw e;
+    }
+
+    const lastRow = filtered[filtered.length - 1]!;
+    const maxSentSeq = lastRow.sequenceId!;
+    const ids = filtered.map((r) => r.id);
+    const now = unixSecondsNow();
+
+    try {
+      await mgr.transaction(async (em) => {
+        await em.update(
+          OfferDispatchState,
+          { id: 1 },
+          {
+            lastSentSequenceId: maxSentSeq,
+            updatedAt: now,
+          },
+        );
+        await em.update(OfferOrder, { id: In(ids) }, { status: "sent" });
+      });
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      console.error(
+        `[offer-dispatch] Kafka send succeeded but DB update failed (possible inconsistency): topic=${topic} max_sequence=${maxSentSeq}: ${detail}`,
+      );
+      throw e;
+    }
+
+    return filtered.length === BATCH_SIZE;
   }
 }

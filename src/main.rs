@@ -3,7 +3,7 @@ use rdkafka::consumer::StreamConsumer;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::util::Timeout;
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
-use std::{env, net::SocketAddr, process, str, sync::mpsc, thread, time::Duration};
+use std::{env, net::SocketAddr, process, sync::mpsc, thread, time::Duration};
 use uuid::Uuid;
 
 use chrono::prelude::*;
@@ -36,7 +36,7 @@ mod config;
 // - Main thread: blocking loop on `main_routine_receiver`; owns `Market`, handles Kafka input, REST replies,
 //   snapshot dumps, and publish progress updates.
 // - HTTP (`http-driver` + nested Tokio `http-worker*`): Axum; forwards `HttpRequest` tasks to the main channel.
-// - Kafka consumer: Tokio `kafka-consumer*` (single worker) on `offer.<market>`; runs `json::parse` + RPC
+// - Kafka consumer: Tokio `kafka-consumer*` (single worker) on `offer.<market>`; unpacks MessagePack + RPC
 //   envelope checks via `parse_mq_payload`, then sends `MqTask` to the main channel (matcher + sequence checks stay main-thread).
 // - Timer `snap-timer`: periodic `DumpTask` to fork snapshot writers.
 // - Snapshot cleanup `snap-cleanup`: periodic `prune_snapshots` against MySQL.
@@ -273,21 +273,18 @@ fn main() {
         loop {
             match consumer.recv().await {
                 Ok(message) => {
+                    let data = message.payload();
                     debug!(
-                        "Received message at topic: {} partition: {} offset: {} payload: {:?}",
+                        "Received message at topic: {} partition: {} offset: {} payload_len: {:?}",
                         message.topic(),
                         message.partition(),
                         message.offset(),
-                        message
-                            .payload()
-                            .map(|p| String::from_utf8_lossy(p).into_owned())
+                        data.map(|p| p.len())
                     );
 
-                    let data = message
-                        .payload()
-                        .map(|p| String::from_utf8_lossy(p).to_string())
-                        .unwrap();
-                    let payload = mainprocess::parse_mq_payload(&data);
+                    let payload = data
+                        .map(mainprocess::parse_mq_payload)
+                        .unwrap_or_else(|| Err("empty mq payload".to_owned()));
                     let task = task::KafkaMqTask {
                         offset: message.offset(),
                         payload,

@@ -6,6 +6,10 @@ The client trade protocol covers `put_order` and `cancel_order`. There are two l
 
 The offer service handles the client’s `put_order` / `cancel_order` requests, creates a pre-order and writes it to the database, and sends order/cancel messages to Kafka (topic `offer.eth_btc`). The matching engine consumes `offer.eth_btc`, updates local state, emits orders, deals, or errors, and publishes to Kafka (topic `settle.$idx`). The settle service consumes `settle.*` and updates users and their orders.
 
+Internal Kafka messages are MessagePack in both directions: offer input is decoded from MessagePack, and quote / settle outputs are encoded as MessagePack.
+
+Protocol type fields are numeric. Offer input uses `method`: `1` limit order, `2` market order, `3` cancel. Quote output uses `type=1` for quote deal ticks. Settle output uses `type`: `1` put order, `2` cancel order, `3` error, `4` deals.
+
 # Matching Engine
 
 ![image-20210813104403474](https://github.com/rqzrqh/matchengine_rust/blob/master/image/match_process.png?raw=true)

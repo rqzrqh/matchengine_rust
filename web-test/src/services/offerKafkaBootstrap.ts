@@ -4,18 +4,14 @@ import { getAppConfig } from "../config.js";
 import { getDb } from "../db.js";
 import { OfferDispatchState, OfferOrder } from "../db/entities.js";
 import { unixSecondsNow } from "../time.js";
+import { decodeMsgpackObject } from "./kafkaWireCodec.js";
 
 const PARTITION = 0;
 const BOOTSTRAP_RUN_MS = 45_000;
 
-/** Kafka JSON may use `input_sequence_id` (engine wire format) or `sequence_id`. */
-function parseSequenceIdFromPayload(raw: string): number {
-  let body: Record<string, unknown>;
-  try {
-    body = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    throw new Error("invalid JSON");
-  }
+/** Kafka MessagePack may use `input_sequence_id` (engine wire format) or `sequence_id`. */
+function parseSequenceIdFromPayload(raw: Buffer): number {
+  const body = decodeMsgpackObject(raw, "[offer-bootstrap]");
   const rawSeq = body.sequence_id ?? body.input_sequence_id;
   let seq: number;
   if (typeof rawSeq === "number") seq = rawSeq;
@@ -23,7 +19,7 @@ function parseSequenceIdFromPayload(raw: string): number {
   else if (rawSeq != null) seq = Number(rawSeq);
   else seq = NaN;
   if (!Number.isFinite(seq) || seq < 1 || !Number.isInteger(seq)) {
-    const preview = raw.length > 240 ? `${raw.slice(0, 240)}…` : raw;
+    const preview = raw.toString("hex").slice(0, 240);
     throw new Error(`missing or invalid sequence_id / input_sequence_id (preview=${preview})`);
   }
   return seq;
@@ -180,7 +176,7 @@ export async function bootstrapOfferLastSequenceFromKafka(kafka: Kafka): Promise
         pause();
 
         const lastMsg = eligible[eligible.length - 1]!;
-        const raw = lastMsg.value?.toString() ?? "{}";
+        const raw = lastMsg.value ?? Buffer.alloc(0);
 
         try {
           const seq = parseSequenceIdFromPayload(raw);

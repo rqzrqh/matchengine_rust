@@ -5,11 +5,16 @@ import { getDb } from "../db.js";
 import { SettleConsumerState, SettleMessage } from "../db/entities.js";
 import { unixSecondsNow } from "../time.js";
 import type { FeedHub } from "./feedHub.js";
+import { decodeMsgpackObject, normalizeObjectForJson } from "./kafkaWireCodec.js";
 
 const SETTLE_TOPIC = "settle";
+const SETTLE_MSG_TYPE_PUT_ORDER = 1;
+const SETTLE_MSG_TYPE_CANCEL_ORDER = 2;
+const SETTLE_MSG_TYPE_ERROR = 3;
+const SETTLE_MSG_TYPE_DEALS = 4;
 
 /**
- * Consumes Kafka topic `settle` (N partitions, default 64); `settle_group_id` = message partition index.
+ * Consumes MessagePack Kafka topic `settle` (N partitions, default 64); `settle_group_id` = message partition index.
  * Seeks each partition on startup. For each partition, a message is accepted only
  * when `settle_message_id == db_last_settle_message_id + 1`; stale/duplicate ids
  * only advance the offset, and gaps raise an error.
@@ -76,12 +81,31 @@ export class SettleService {
         }
         const settleGroup = partition;
 
-        const raw = message.value?.toString() ?? "{}";
+        const raw = message.value ?? Buffer.alloc(0);
         let payload: Record<string, unknown>;
+        let jsonPayload: Record<string, unknown>;
         try {
-          payload = JSON.parse(raw) as Record<string, unknown>;
-        } catch {
-          await this.handleBadJson(getDb(), topic, settleGroup, marketName, offset);
+          payload = decodeMsgpackObject(raw, "[settle]");
+          jsonPayload = normalizeObjectForJson(payload);
+        } catch (e) {
+          console.warn(
+            `[settle] bad MessagePack payload topic=${topic} partition=${partition} offset=${offset}: ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          );
+          await this.handleBadMessage(getDb(), topic, settleGroup, marketName, offset);
+          await this.safeCommit(topic, partition, offset);
+          return;
+        }
+
+        const msgType = u32OrNull(payload.type);
+        if (!isSupportedSettleType(msgType)) {
+          console.warn(
+            `[settle] unsupported message type topic=${topic} partition=${partition} offset=${offset} type=${String(
+              payload.type,
+            )}`,
+          );
+          await this.handleBadMessage(getDb(), topic, settleGroup, marketName, offset);
           await this.safeCommit(topic, partition, offset);
           return;
         }
@@ -95,12 +119,12 @@ export class SettleService {
           settleGroup,
           market,
           offset,
-          raw,
+          JSON.stringify(jsonPayload),
           settleMessageId,
         );
 
         if (inserted) {
-          this.hub.broadcast("settle", { topic, ...payload });
+          this.hub.broadcast("settle", { topic, ...jsonPayload });
         }
 
         await this.safeCommit(topic, partition, offset);
@@ -114,7 +138,7 @@ export class SettleService {
     await this.consumer.commitOffsets([{ topic, partition, offset: next }]);
   }
 
-  private async handleBadJson(
+  private async handleBadMessage(
     ds: AppDb,
     topic: string,
     settleGroup: number,
@@ -271,6 +295,26 @@ function u64OrNull(v: unknown): bigint | null {
     return BigInt(v);
   }
   return null;
+}
+
+function u32OrNull(v: unknown): number | null {
+  if (v === undefined || v === null) return null;
+  if (typeof v === "bigint") {
+    if (v < 0n || v > 0xffffffffn) return null;
+    return Number(v);
+  }
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) return null;
+  return n;
+}
+
+function isSupportedSettleType(v: number | null): boolean {
+  return (
+    v === SETTLE_MSG_TYPE_PUT_ORDER ||
+    v === SETTLE_MSG_TYPE_CANCEL_ORDER ||
+    v === SETTLE_MSG_TYPE_ERROR ||
+    v === SETTLE_MSG_TYPE_DEALS
+  );
 }
 
 export function serializeSettleMessage(r: SettleMessage): Record<string, unknown> {

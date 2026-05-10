@@ -25,6 +25,7 @@ For OS threads and Tokio runtimes inside the engine binary, see **`doc/thread-mo
 Edit repo root **`config.yaml`** so that:
 
 - **`market.name`** is the MySQL database name and the Kafka topic suffix (e.g. `eth_btc` → DB `eth_btc`, topics `offer.eth_btc`, `quote_deals.eth_btc`).
+- Internal Kafka I/O uses MessagePack on both sides: input `offer.<market>` messages are unpacked as MessagePack, and output `quote_deals.<market>` / `settle` messages are published as MessagePack.
 - **`brokers`** matches your Kafka bootstrap servers.
 - **`db.addr` / `db.user` / `db.passwd`** match MySQL.
 - **`output_publish`** must define **`quote`** (`quote_deals.<market>`) and **`settle`** (`settle` topic) separately. Each has **`batch_size`**, **`linger_ms`**, **`max_in_flight_requests_per_connection`**. Settle publishing always uses Kafka idempotence with `acks=all`, so keep its `max_in_flight_requests_per_connection` ≤ 5. See root **`config.yaml`** for an example.
@@ -101,7 +102,7 @@ The crate may ship with **no** `#[test]` cases yet (`running 0 tests` is normal)
 
 #### Matching core benchmark
 
-The bundled Criterion benchmark measures only the in-memory matching core with a no-op publisher. It is useful for comparing code changes, but it is not the real engine TPS because it excludes Kafka consume/produce, JSON serialization, channel handoff, OS scheduling, and database snapshot work:
+The bundled Criterion benchmark measures only the in-memory matching core with a no-op publisher. It is useful for comparing code changes, but it is not the real engine TPS because it excludes Kafka consume/produce, wire encoding/decoding, channel handoff, OS scheduling, and database snapshot work:
 
 ```bash
 cargo bench --bench matching_engine
@@ -113,7 +114,7 @@ Read Criterion's `thrpt` / `elem/s` output as a core upper-bound metric:
 - `market_order_sweep_core_deal_throughput`: in-memory deal throughput when one market order sweeps many resting asks.
 - `resting_limit_order_core_throughput`: in-memory order-book insert throughput for non-crossing limit orders.
 
-To know deployable TPS, run the engine against Kafka/MySQL and drive `offer.<market>` with the same message shape as production, then measure accepted input rate together with `quote_deals.<market>`, `settle.*`, publish backlog, and engine latency.
+To know deployable TPS, run the engine against Kafka/MySQL and drive `offer.<market>` with the same MessagePack message shape as production, then measure accepted input rate together with `quote_deals.<market>`, `settle.*`, publish backlog, and engine latency.
 
 #### Matching engine HTTP
 
@@ -132,7 +133,7 @@ With **`npm run dev`** in **`web-test/`**, open the printed URL (typically **`ht
 
 #### Load / integration
 
-For end-to-end integration testing, run the engine against a dev Kafka/MySQL stack, publish orders to **`offer.<market>`** as your upstream does, and observe **`quote_deals.<market>`** / **`settle.*`** plus engine HTTP and DB state.
+For end-to-end integration testing, run the engine against a dev Kafka/MySQL stack, publish MessagePack orders to **`offer.<market>`** as your upstream does, and observe MessagePack outputs on **`quote_deals.<market>`** / **`settle.*`** plus engine HTTP and DB state.
 
 ### Profiling
 

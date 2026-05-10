@@ -73,7 +73,7 @@ async function runSession(): Promise<void> {
   const hub = new FeedHub();
   const offerDispatch = new OfferDispatchService(producer);
   const offerSequence = new OfferSequenceService();
-  const offerService = new OfferService(offerSequence);
+  const offerService = new OfferService();
   const offerTopicMonitor = new OfferTopicMonitor(kafka);
   const quoteService = new QuoteService(kafka, hub);
   const settleService = new SettleService(kafka, hub);

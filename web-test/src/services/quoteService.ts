@@ -5,11 +5,13 @@ import { getDb } from "../db.js";
 import { QuoteConsumerState, QuoteDealTick } from "../db/entities.js";
 import { unixSecondsNow } from "../time.js";
 import type { FeedHub } from "./feedHub.js";
+import { decodeMsgpackObject, normalizeObjectForJson } from "./kafkaWireCodec.js";
 
 const PARTITION = 0;
+const QUOTE_MSG_TYPE_DEAL = 1;
 
 /**
- * Consumes Kafka `quote_deals.<market>`, resumes from `quote_consumer_state`, and writes `quote_deal_ticks`.
+ * Consumes MessagePack Kafka `quote_deals.<market>`, resumes from `quote_consumer_state`, and writes `quote_deal_ticks`.
  * If `info.deal_id` lags `last_deal_id`, only the offset advances; otherwise a tick row is inserted and offset/deal_id update.
  */
 export class QuoteService {
@@ -61,14 +63,33 @@ export class QuoteService {
       autoCommit: false,
       eachMessage: async ({ topic, partition, message }) => {
         if (!this.consumer) return;
-        const raw = message.value?.toString() ?? "{}";
+        const raw = message.value ?? Buffer.alloc(0);
         const offset = BigInt(message.offset);
 
         let payload: Record<string, unknown>;
+        let jsonPayload: Record<string, unknown>;
         try {
-          payload = JSON.parse(raw) as Record<string, unknown>;
-        } catch {
-          await this.handleBadJson(getDb(), topic, partition, offset);
+          payload = decodeMsgpackObject(raw, "[quote]");
+          jsonPayload = normalizeObjectForJson(payload);
+        } catch (e) {
+          console.warn(
+            `[quote] bad MessagePack payload topic=${topic} partition=${partition} offset=${offset}: ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          );
+          await this.handleBadMessage(getDb(), topic, partition, offset);
+          await this.safeCommit(topic, partition, offset);
+          return;
+        }
+
+        const msgType = u32OrNull(payload.type);
+        if (msgType !== QUOTE_MSG_TYPE_DEAL) {
+          console.warn(
+            `[quote] unsupported message type topic=${topic} partition=${partition} offset=${offset} type=${String(
+              payload.type,
+            )}`,
+          );
+          await this.handleBadMessage(getDb(), topic, partition, offset);
           await this.safeCommit(topic, partition, offset);
           return;
         }
@@ -86,7 +107,7 @@ export class QuoteService {
           topic,
           partition,
           offset,
-          raw,
+          JSON.stringify(jsonPayload),
           market,
           dealId,
           time,
@@ -96,7 +117,7 @@ export class QuoteService {
         );
 
         if (inserted) {
-          this.hub.broadcast("quote", { topic, ...payload });
+          this.hub.broadcast("quote", { topic, ...jsonPayload });
         }
 
         await this.safeCommit(topic, partition, offset);
@@ -110,7 +131,7 @@ export class QuoteService {
     await this.consumer.commitOffsets([{ topic, partition, offset: next }]);
   }
 
-  private async handleBadJson(ds: AppDb, topic: string, partition: number, offset: bigint): Promise<void> {
+  private async handleBadMessage(ds: AppDb, topic: string, partition: number, offset: bigint): Promise<void> {
     const mgr = ds.manager;
     const row = await mgr.findOne(QuoteConsumerState, {
       where: { kafkaTopic: topic, partitionId: partition },
@@ -243,10 +264,25 @@ export class QuoteService {
 
 function parseDealId(v: unknown): number | null {
   if (v === undefined || v === null) return null;
+  if (typeof v === "bigint") {
+    if (v < 0n || v > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+    return Number(v);
+  }
   if (typeof v === "number" && Number.isFinite(v)) return Math.trunc(v);
   const n = Number(v);
   if (!Number.isFinite(n)) return null;
   return Math.trunc(n);
+}
+
+function u32OrNull(v: unknown): number | null {
+  if (v === undefined || v === null) return null;
+  if (typeof v === "bigint") {
+    if (v < 0n || v > 0xffffffffn) return null;
+    return Number(v);
+  }
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) return null;
+  return n;
 }
 
 export function serializeQuoteDealTick(r: QuoteDealTick): Record<string, unknown> {

@@ -13,23 +13,20 @@ const TICK_MS = Math.min(
 
 /**
  * Assigns monotonic `sequence_id` to rows where it is still null, ordered by `offer_orders.id`.
- * Advances `offer_dispatch_state.last_sequence_id` in the same transaction so concurrent/frequent
- * order inserts cannot reuse an already assigned sequence id.
+ * Advances `offer_dispatch_state.last_sequence_id` with a compare-and-set guard in the same
+ * transaction, so another sequencer cannot race and reuse an already assigned sequence id.
  */
 export class OfferSequenceService {
   private timer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
 
-  async assignPending(): Promise<void> {
+  async assignPending(): Promise<boolean> {
     const ds = getDb();
-    await ds.manager.transaction(async (em) => {
-      const st = await em
-        .createQueryBuilder(OfferDispatchState, "s")
-        .setLock("pessimistic_write")
-        .where("s.id = :id", { id: 1 })
-        .getOne();
-      const base = st?.lastSequenceId ?? 0;
-      let next = base + 1;
+    return ds.manager.transaction(async (em) => {
+      const st = await em.findOne(OfferDispatchState, { where: { id: 1 } });
+      if (!st) {
+        throw new Error("offer_dispatch_state row missing; run database migrations");
+      }
 
       const pending = await em
         .createQueryBuilder(OfferOrder, "o")
@@ -39,32 +36,51 @@ export class OfferSequenceService {
         .take(BATCH_SIZE)
         .getMany();
 
+      if (pending.length === 0) return false;
+
+      const base = st.lastSequenceId;
+      let next = base + 1;
       for (const row of pending) {
         await em.update(OfferOrder, { id: row.id }, { sequenceId: next });
         next += 1;
       }
 
-      if (next > base + 1) {
-        await em.update(
-          OfferDispatchState,
-          { id: 1 },
-          { lastSequenceId: next - 1, updatedAt: unixSecondsNow() },
+      const updateResult = await em
+        .createQueryBuilder()
+        .update(OfferDispatchState)
+        .set({ lastSequenceId: next - 1, updatedAt: unixSecondsNow() })
+        .where("id = :id", { id: 1 })
+        .andWhere("last_sequence_id = :base", { base })
+        .execute();
+
+      if ((updateResult.affected ?? 0) !== 1) {
+        throw new Error(
+          `offer sequence CAS failed: expected last_sequence_id=${base}, assigned=${pending.length}`,
         );
       }
+
+      return pending.length === BATCH_SIZE;
     });
   }
 
   start(): void {
     if (this.timer) return;
+    void this.tick().catch((e) => console.error("[offer-sequence]", e));
     this.timer = setInterval(() => {
-      if (this.inFlight) return;
-      this.inFlight = true;
-      void this.assignPending()
-        .catch((e) => console.error("[offer-sequence]", e))
-        .finally(() => {
-          this.inFlight = false;
-        });
+      void this.tick().catch((e) => console.error("[offer-sequence]", e));
     }, TICK_MS);
+  }
+
+  private async tick(): Promise<void> {
+    if (this.inFlight) return;
+    this.inFlight = true;
+    try {
+      while (await this.assignPending()) {
+        // Drain current pending backlog without waiting for the next timer tick.
+      }
+    } finally {
+      this.inFlight = false;
+    }
   }
 
   async stop(): Promise<void> {

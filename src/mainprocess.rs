@@ -2,34 +2,14 @@ use crate::decimal_util::parse_decimal_with_max_scale;
 use crate::engine::*;
 use crate::error::*;
 use crate::market::*;
+use crate::payload_encoding::decode_msgpack;
 use crate::publish::*;
-use crate::task::KafkaMqTask;
-use json::JsonValue;
+use crate::task::*;
 
-/// JSON-RPC–style envelope validation and `json::parse` — intended to run on the Kafka consumer thread.
-pub fn parse_mq_payload(data: &str) -> Result<JsonValue, String> {
-    let parsed = json::parse(data).map_err(|e| format!("json parse failed: {}", e))?;
-    debug!("{}", parsed);
-
-    if !parsed.is_object() {
-        return Err(format!("mq msg not object {}", parsed));
-    }
-
-    if !parsed.has_key("method") || !parsed["method"].is_string() {
-        return Err(format!("method parse failed {}", parsed));
-    }
-
-    if !parsed.has_key("id") || !parsed["id"].is_number() {
-        return Err(format!("id parse failed {}", parsed));
-    }
-
-    if !parsed.has_key("params") || !parsed["params"].is_object() {
-        return Err(format!("params parse failed {}", parsed));
-    }
-
-    if !parsed.has_key("input_sequence_id") || !parsed["input_sequence_id"].is_number() {
-        return Err(format!("input_sequence_id parse failed {}", parsed));
-    }
+/// RPC envelope validation after MessagePack unpacking on the Kafka consumer thread.
+pub fn parse_mq_payload(data: &[u8]) -> Result<MqPayload, String> {
+    let parsed: MqPayload = decode_msgpack(data)?;
+    debug!("{:?}", parsed);
 
     Ok(parsed)
 }
@@ -47,7 +27,7 @@ pub fn handle_mq_message(publisher: &Publish, m: &mut Market, mq: KafkaMqTask) {
         }
     };
 
-    let msg_seq = parsed["input_sequence_id"].as_u64().unwrap();
+    let msg_seq = parsed.input_sequence_id;
     let Some(expected_seq) = m.input_sequence_id.checked_add(1) else {
         error!("market input_sequence_id overflow {}", m.input_sequence_id);
         return;
@@ -68,61 +48,35 @@ pub fn handle_mq_message(publisher: &Publish, m: &mut Market, mq: KafkaMqTask) {
         return;
     }
 
-    let method = parsed["method"].as_str().unwrap();
-    let extern_id = parsed["id"].as_u64().unwrap();
-    let params = &parsed["params"];
+    let method = parsed.method;
+    let extern_id = parsed.id;
+    let params = parsed.params;
 
     m.input_sequence_id = msg_seq;
 
-    match method {
-        "order.put_limit" => on_order_put_limit(&publisher, m, extern_id, &params),
-        "order.put_market" => on_order_put_market(&publisher, m, extern_id, &params),
-        "order.cancel" => on_order_cancel(&publisher, m, extern_id, &params),
-        _ => {
-            error!("method error");
+    match (method, params) {
+        (MQ_METHOD_ORDER_PUT_LIMIT, MqParams::PutLimit(params)) => {
+            on_order_put_limit(&publisher, m, extern_id, params)
+        }
+        (MQ_METHOD_ORDER_PUT_MARKET, MqParams::PutMarket(params)) => {
+            on_order_put_market(&publisher, m, extern_id, params)
+        }
+        (MQ_METHOD_ORDER_CANCEL, MqParams::Cancel(params)) => {
+            on_order_cancel(&publisher, m, extern_id, params)
+        }
+        (method, params) => {
+            error!(
+                "method/params mismatch method={} params={:?}",
+                method, params
+            );
         }
     };
 }
 
-fn on_order_put_limit(publisher: &Publish, m: &mut Market, extern_id: u64, params: &JsonValue) {
-    if !params.has_key("user_id") || !params["user_id"].is_number() {
-        error!("user_id parse failed {}", params);
-        return;
-    }
+fn on_order_put_limit(publisher: &Publish, m: &mut Market, extern_id: u64, params: PutLimitParams) {
+    let error_params = MqParams::PutLimit(params.clone());
 
-    if !params.has_key("side") || !params["side"].is_number() {
-        error!("side parse failed {}", params);
-        return;
-    }
-
-    if !params.has_key("amount") || !params["amount"].is_string() {
-        error!("amount parse failed {}", params);
-        return;
-    }
-
-    if !params.has_key("price") || !params["price"].is_string() {
-        error!("price parse failed {}", params);
-        return;
-    }
-
-    if !params.has_key("taker_fee_rate") || !params["taker_fee_rate"].is_string() {
-        error!("taker_fee_rate parse failed {}", params);
-        return;
-    }
-
-    if !params.has_key("maker_fee_rate") || !params["maker_fee_rate"].is_string() {
-        error!("maker_fee_rate parse failed {}", params);
-        return;
-    }
-
-    let user_id = params["user_id"].as_u32().unwrap();
-    let side = params["side"].as_u32().unwrap();
-
-    let amount = match parse_decimal_with_max_scale(
-        params["amount"].as_str().unwrap(),
-        m.stock_prec,
-        "amount",
-    ) {
+    let amount = match parse_decimal_with_max_scale(&params.amount, m.stock_prec, "amount") {
         Ok(value) => value,
         Err(e) => {
             error!("{}", e);
@@ -130,11 +84,7 @@ fn on_order_put_limit(publisher: &Publish, m: &mut Market, extern_id: u64, param
         }
     };
 
-    let price = match parse_decimal_with_max_scale(
-        params["price"].as_str().unwrap(),
-        m.price_prec(),
-        "price",
-    ) {
+    let price = match parse_decimal_with_max_scale(&params.price, m.price_prec(), "price") {
         Ok(value) => value,
         Err(e) => {
             error!("{}", e);
@@ -143,7 +93,7 @@ fn on_order_put_limit(publisher: &Publish, m: &mut Market, extern_id: u64, param
     };
 
     let taker_fee_rate = match parse_decimal_with_max_scale(
-        params["taker_fee_rate"].as_str().unwrap(),
+        &params.taker_fee_rate,
         m.fee_rate_prec,
         "taker_fee_rate",
     ) {
@@ -155,7 +105,7 @@ fn on_order_put_limit(publisher: &Publish, m: &mut Market, extern_id: u64, param
     };
 
     let maker_fee_rate = match parse_decimal_with_max_scale(
-        params["maker_fee_rate"].as_str().unwrap(),
+        &params.maker_fee_rate,
         m.fee_rate_prec,
         "maker_fee_rate",
     ) {
@@ -170,51 +120,31 @@ fn on_order_put_limit(publisher: &Publish, m: &mut Market, extern_id: u64, param
         publisher,
         m,
         extern_id,
-        user_id,
-        side,
+        params.user_id,
+        params.side,
         amount,
         price,
         taker_fee_rate,
         maker_fee_rate,
     )
     .unwrap_or_else(|e| {
-        publisher.publish_error(m, extern_id, user_id, params, e);
+        publisher.publish_error(m, extern_id, params.user_id, &error_params, e);
     });
 }
 
-fn on_order_put_market(publisher: &Publish, m: &mut Market, extern_id: u64, params: &JsonValue) {
-    if !params.has_key("user_id") || !params["user_id"].is_number() {
-        error!("user_id parse failed {}", params);
-        return;
-    }
-
-    if !params.has_key("side") || !params["side"].is_number() {
-        error!("side parse failed {}", params);
-        return;
-    }
-
-    if !params.has_key("amount") || !params["amount"].is_string() {
-        error!("amount parse failed {}", params);
-        return;
-    }
-
-    if !params.has_key("taker_fee_rate") || !params["taker_fee_rate"].is_string() {
-        error!("taker_fee_rate parse failed {}", params);
-        return;
-    }
-
-    let user_id = params["user_id"].as_u32().unwrap();
-    let side = params["side"].as_u32().unwrap();
-    let amount_prec = if side == MARKET_ORDER_SIDE_ASK {
+fn on_order_put_market(
+    publisher: &Publish,
+    m: &mut Market,
+    extern_id: u64,
+    params: PutMarketParams,
+) {
+    let error_params = MqParams::PutMarket(params.clone());
+    let amount_prec = if params.side == MARKET_ORDER_SIDE_ASK {
         m.stock_prec
     } else {
         m.money_prec
     };
-    let amount = match parse_decimal_with_max_scale(
-        params["amount"].as_str().unwrap(),
-        amount_prec,
-        "amount",
-    ) {
+    let amount = match parse_decimal_with_max_scale(&params.amount, amount_prec, "amount") {
         Ok(value) => value,
         Err(e) => {
             error!("{}", e);
@@ -223,7 +153,7 @@ fn on_order_put_market(publisher: &Publish, m: &mut Market, extern_id: u64, para
     };
 
     let taker_fee_rate = match parse_decimal_with_max_scale(
-        params["taker_fee_rate"].as_str().unwrap(),
+        &params.taker_fee_rate,
         m.fee_rate_prec,
         "taker_fee_rate",
     ) {
@@ -238,30 +168,20 @@ fn on_order_put_market(publisher: &Publish, m: &mut Market, extern_id: u64, para
         publisher,
         m,
         extern_id,
-        user_id,
-        side,
+        params.user_id,
+        params.side,
         amount,
         taker_fee_rate,
     )
     .unwrap_or_else(|e| {
-        publisher.publish_error(m, extern_id, user_id, params, e);
+        publisher.publish_error(m, extern_id, params.user_id, &error_params, e);
     });
 }
-fn on_order_cancel(publisher: &Publish, m: &mut Market, extern_id: u64, params: &JsonValue) {
-    if !params.has_key("user_id") || !params["user_id"].is_number() {
-        error!("user_id parse failed {}", params);
-        return;
-    }
 
-    if !params.has_key("order_id") || !params["order_id"].is_number() {
-        error!("order_id parse failed {}", params);
-        return;
-    }
+fn on_order_cancel(publisher: &Publish, m: &mut Market, extern_id: u64, params: CancelParams) {
+    let error_params = MqParams::Cancel(params.clone());
 
-    let user_id = params["user_id"].as_u32().unwrap();
-    let order_id = params["order_id"].as_u64().unwrap();
-
-    match m.get_order(&order_id) {
+    match m.get_order(&params.order_id) {
         Some(order_ref) => {
             let order = order_ref.clone();
 
@@ -275,7 +195,13 @@ fn on_order_cancel(publisher: &Publish, m: &mut Market, extern_id: u64, params: 
             m.order_finish(&order.clone());
         }
         None => {
-            publisher.publish_error(m, extern_id, user_id, params, MATCH_ERROR_ORDER_NOT_FOUND);
+            publisher.publish_error(
+                m,
+                extern_id,
+                params.user_id,
+                &error_params,
+                MATCH_ERROR_ORDER_NOT_FOUND,
+            );
         }
     }
 }

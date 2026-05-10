@@ -197,10 +197,10 @@ The binary uses **one** [`StreamConsumer`](https://docs.rs/rdkafka/latest/rdkafk
 
 | Layer | Threads / code you own | What it does |
 | --- | --- | --- |
-| **Application** | Exactly **one** Tokio **worker** on a dedicated runtime: [`.worker_threads(1)` + `.thread_name("kafka-consumer")`](../src/main.rs). The spawned task loops, awaiting [`StreamConsumer::recv`](https://docs.rs/rdkafka/latest/rdkafka/consumer/stream_consumer/struct.StreamConsumer.html#method.recv) ([`.await`](https://doc.rust-lang.org/stable/std/keyword.await.html)) for each message. | Parks on the Tokio reactor / rdkafka futures until a record is ready, then forwards offset + payload as [`Task::MqTask`](../src/task.rs) on the main channel. Matcher logic stays off this thread. |
+| **Application** | Exactly **one** Tokio **worker** on a dedicated runtime: [`.worker_threads(1)` + `.thread_name("kafka-consumer")`](../src/main.rs). The spawned task loops, awaiting [`StreamConsumer::recv`](https://docs.rs/rdkafka/latest/rdkafka/consumer/stream_consumer/struct.StreamConsumer.html#method.recv) ([`.await`](https://doc.rust-lang.org/stable/std/keyword.await.html)) for each message. | Parks on the Tokio reactor / rdkafka futures until a record is ready, unpacks MessagePack and validates the RPC envelope, then forwards offset + parsed payload as [`Task::MqTask`](../src/task.rs) on the main channel. Matcher logic stays off this thread. |
 | **librdkafka** (this consumer handle only) | Native threads profiler users often label `rdk:main`, `rdk:broker-*`, … | Broker TCP, fetch/heartbeat work, buffering that ultimately feeds **`recv`**; not shared with HTTP, and **not** the same `rdk:*` threads as either producer. |
 
-**Send path (`quote_deals.<market>` and `settle`):**
+**Send path (`quote_deals.<market>` and `settle`, both MessagePack):**
 
 | Layer | Quote | Settle |
 | --- | --- | --- |
@@ -211,7 +211,7 @@ So: **“Receive”** in product terms is *broker → librdkafka fetch side → 
 
 ### Kafka consumer runtime
 
-`src/main.rs` builds the consumer runtime described in the **Receive path** row above. It assigns **partition 0** of `offer.<market>` at `Market.input_offset + 1` after restore and uses a fresh `group.id` per run. It does not run matching; it only wraps Kafka offset and payload in `Task::MqTask` and sends that to the main thread.
+`src/main.rs` builds the consumer runtime described in the **Receive path** row above. It assigns **partition 0** of `offer.<market>` at `Market.input_offset + 1` after restore and uses a fresh `group.id` per run. It does not run matching; it unpacks the Kafka MessagePack bytes, wraps Kafka offset and parsed payload in `Task::MqTask`, and sends that to the main thread.
 
 ### HTTP thread
 
@@ -251,8 +251,8 @@ At startup a thread named **`snap-cleanup`** runs periodically (`snap_cleanup.cl
 
 ### Input path
 
-1. Kafka consumer reads `offer.<market>` payload.
-2. It sends `Task::MqTask { offset, data }` to the main thread.
+1. Kafka consumer reads `offer.<market>` MessagePack payload.
+2. It unpacks and envelope-validates the payload, then sends `Task::MqTask { offset, payload }` to the main thread.
 3. Main thread bumps `oper_id` and `input_offset`; `input_sequence_id` must be strictly consecutive.
 4. Matcher logic updates books, indexes, deal ids, message ids, and per-group settle message ids.
 5. Quote / settle outputs are sent to the respective publish threads.
@@ -261,7 +261,7 @@ Input sequence checks are central: stale ids are skipped; gaps reject processing
 
 ### Output path
 
-The matcher thread does not block on Kafka. During matching it calls `Publish` and enqueues completed outputs on quote or settle channels. After Kafka delivery, publish threads send “how far we have published” back to the main thread.
+The matcher thread does not block on Kafka. During matching it calls `Publish` and enqueues completed outputs on quote or settle channels. Publish threads encode these outputs as MessagePack before writing to Kafka. After Kafka delivery, publish threads send “how far we have published” back to the main thread.
 
 So `Market` tracks two output notions:
 
@@ -309,8 +309,8 @@ The consumer assigns only partition 0 of `offer.<market>` and continues from the
 
 Quote and settle publish on separate threads:
 
-- One quote publisher to `quote_deals.<market>`.
-- One settle publisher writing partitions of `settle` by `user_id % 64`.
+- One quote publisher to `quote_deals.<market>` using MessagePack payloads.
+- One settle publisher writing MessagePack payloads to partitions of `settle` by `user_id % 64`.
 - Each producer uses `max.in.flight.requests.per.connection = 1` and reports progress only after delivery ack.
 
 There is no single global settle ordering; ordering is per group/partition, matching `settle_message_ids[group_id]`.

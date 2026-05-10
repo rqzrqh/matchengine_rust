@@ -1,7 +1,6 @@
 use crate::market::*;
 use crate::payload_encoding::encode_msgpack_named;
 use crate::task::*;
-use json::JsonValue;
 use rust_decimal::prelude::*;
 use serde::Serialize;
 use std::rc::Rc;
@@ -152,41 +151,57 @@ struct DealsNested {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(tag = "type")]
+#[serde(untagged)]
 enum SettlePublishBody {
-    #[serde(rename = "put_order")]
-    PutOrder {
-        market: String,
-        msgid: u64,
-        settle_message_id: u64,
-        txid: u64,
-        order: KafkaOrderPayload,
-    },
-    #[serde(rename = "cancel_order")]
-    CancelOrder {
-        market: String,
-        msgid: u64,
-        settle_message_id: u64,
-        txid: u64,
-        order: KafkaOrderPayload,
-    },
-    #[serde(rename = "error")]
-    Error {
-        market: String,
-        msgid: u64,
-        settle_message_id: u64,
-        txid: u64,
-        params: serde_json::Value,
-        code: u32,
-    },
-    #[serde(rename = "deals")]
-    Deals {
-        market: String,
-        msgid: u64,
-        settle_message_id: u64,
-        txid: u64,
-        deals: DealsNested,
-    },
+    PutOrder(SettlePutOrderMsg),
+    CancelOrder(SettleCancelOrderMsg),
+    Error(SettleErrorMsg),
+    Deals(SettleDealsMsg),
+}
+
+#[derive(Debug, Serialize)]
+struct SettlePutOrderMsg {
+    #[serde(rename = "type")]
+    message_type: u32,
+    market: String,
+    msgid: u64,
+    settle_message_id: u64,
+    txid: u64,
+    order: KafkaOrderPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct SettleCancelOrderMsg {
+    #[serde(rename = "type")]
+    message_type: u32,
+    market: String,
+    msgid: u64,
+    settle_message_id: u64,
+    txid: u64,
+    order: KafkaOrderPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct SettleErrorMsg {
+    #[serde(rename = "type")]
+    message_type: u32,
+    market: String,
+    msgid: u64,
+    settle_message_id: u64,
+    txid: u64,
+    params: MqParams,
+    code: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct SettleDealsMsg {
+    #[serde(rename = "type")]
+    message_type: u32,
+    market: String,
+    msgid: u64,
+    settle_message_id: u64,
+    txid: u64,
+    deals: DealsNested,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,7 +216,7 @@ struct QuoteDealInfoKafka {
 #[derive(Debug, Serialize)]
 struct QuoteDealsKafkaMsg {
     #[serde(rename = "type")]
-    message_type: &'static str,
+    message_type: u32,
     market: String,
     info: QuoteDealInfoKafka,
 }
@@ -216,10 +231,6 @@ struct SettlePublishTaskInfo {
     group_id: u32,
     settle_message_id: u64,
     body: SettlePublishBody,
-}
-
-fn json_params_to_serde(params: &JsonValue) -> serde_json::Value {
-    serde_json::from_str(&params.dump()).expect("rpc params must convert to serde_json::Value")
 }
 
 fn collect_publish_batch<T>(receiver: &mpsc::Receiver<T>, batch_size: usize) -> Vec<T> {
@@ -540,13 +551,14 @@ impl Publish {
 
     pub fn publish_cancel_order(&self, m: &mut Market, extern_id: u64, order: &Rc<Order>) {
         let settle_message_id = m.next_settle_message_id(order.user_id);
-        let body = SettlePublishBody::CancelOrder {
+        let body = SettlePublishBody::CancelOrder(SettleCancelOrderMsg {
+            message_type: SETTLE_MSG_TYPE_CANCEL_ORDER,
             market: m.name.clone(),
             msgid: m.message_id,
             settle_message_id,
             txid: extern_id,
             order: kafka_order_payload(order),
-        };
+        });
 
         let group_id = Market::settle_group_id(order.user_id) as u32;
 
@@ -574,20 +586,21 @@ impl Publish {
         m: &mut Market,
         extern_id: u64,
         user_id: u32,
-        params: &JsonValue,
+        params: &MqParams,
         code: u32,
     ) {
         m.message_id += 1;
 
         let settle_message_id = m.next_settle_message_id(user_id);
-        let body = SettlePublishBody::Error {
+        let body = SettlePublishBody::Error(SettleErrorMsg {
+            message_type: SETTLE_MSG_TYPE_ERROR,
             market: m.name.clone(),
             msgid: m.message_id,
             settle_message_id,
             txid: extern_id,
-            params: json_params_to_serde(params),
+            params: params.clone(),
             code,
-        };
+        });
 
         let group_id = Market::settle_group_id(user_id) as u32;
 
@@ -614,13 +627,14 @@ impl Publish {
 impl MatchPublisher for Publish {
     fn publish_put_order(&self, m: &mut Market, extern_id: u64, order: &Rc<Order>) {
         let settle_message_id = m.next_settle_message_id(order.user_id);
-        let body = SettlePublishBody::PutOrder {
+        let body = SettlePublishBody::PutOrder(SettlePutOrderMsg {
+            message_type: SETTLE_MSG_TYPE_PUT_ORDER,
             market: m.name.clone(),
             msgid: m.message_id,
             settle_message_id,
             txid: extern_id,
             order: kafka_order_payload(order),
-        };
+        });
 
         let group_id = Market::settle_group_id(order.user_id) as u32;
 
@@ -659,7 +673,8 @@ impl MatchPublisher for Publish {
         rival_fee: &Decimal,
     ) {
         let settle_message_id = m.next_settle_message_id(user_id);
-        let body = SettlePublishBody::Deals {
+        let body = SettlePublishBody::Deals(SettleDealsMsg {
+            message_type: SETTLE_MSG_TYPE_DEALS,
             market: m.name.clone(),
             msgid: m.message_id,
             settle_message_id,
@@ -677,7 +692,7 @@ impl MatchPublisher for Publish {
                 fee: fee.to_string(),
                 rival_fee: rival_fee.to_string(),
             },
-        };
+        });
 
         let group_id = Market::settle_group_id(user_id) as u32;
 
@@ -709,7 +724,7 @@ impl MatchPublisher for Publish {
         side: u32,
     ) {
         let body = QuoteDealsKafkaMsg {
-            message_type: "quote_deals",
+            message_type: QUOTE_MSG_TYPE_DEAL,
             market: m.name.clone(),
             info: QuoteDealInfoKafka {
                 time: tm,

@@ -1,6 +1,6 @@
 import { WebSocket } from "ws";
 
-/** Broadcast quote/settle writes to WebSocket clients */
+/** Broadcast decoded quote/settle JSON views to WebSocket clients. */
 export class FeedHub {
   private clients = new Set<WebSocket>();
 
