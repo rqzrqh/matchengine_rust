@@ -32,11 +32,15 @@ done
 
 CONFIG_PATH="${CONFIG_PATH:-$REPO_ROOT/config.yaml}"
 [[ -f "$CONFIG_PATH" ]] || { echo "config not found: $CONFIG_PATH" >&2; exit 1; }
+CONFIG_PATH="$(cd "$(dirname "$CONFIG_PATH")" && pwd)/$(basename "$CONFIG_PATH")"
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/profiling/xctrace-$RUN_ID}"
 mkdir -p "$OUT_DIR"
 OUT_DIR_ABS="$(cd "$OUT_DIR" && pwd)"
+CONFIG_SNAPSHOT_REL="matchengine-config.yaml"
+CONFIG_SNAPSHOT_PATH="$OUT_DIR_ABS/$CONFIG_SNAPSHOT_REL"
+cp "$CONFIG_PATH" "$CONFIG_SNAPSHOT_PATH"
 
 extract_market_name() {
   awk '
@@ -72,7 +76,7 @@ MARKET="$(extract_market_name)"
 
 BASE_URL="${ENGINE_HTTP:-http://127.0.0.1:8080}"
 ENGINE_BIN="$REPO_ROOT/target/release/matchengine_rust"
-POLL_IV="${POLL_INTERVAL_SECS:-1}"
+POLL_IV="${POLL_INTERVAL_SECS:-0.01}"
 LIM="$(duration_limit_secs "$TIME_LIMIT")"
 POLL_DURATION=$((LIM + 25))
 
@@ -98,7 +102,7 @@ xcrun xctrace record \\
   --env RUST_LOG=${RUST_LOG:-warn} \\
   --target-stdout - \\
   --output '$OUT_DIR_ABS/matchengine.trace' \\
-  --launch -- '$ENGINE_BIN' '$CONFIG_PATH'
+  --launch -- '$ENGINE_BIN' --wait-initial-status '$CONFIG_PATH'
 EOF
 )
 echo "$PROFILE_CMD" > "$OUT_DIR_ABS/profile-command.txt"
@@ -110,6 +114,10 @@ meta = {
   'market': '$MARKET',
   'engine_http': '$BASE_URL',
   'out_dir': '$OUT_DIR_ABS',
+  'config': {
+    'source_path': '$CONFIG_PATH',
+    'snapshot_path': '$CONFIG_SNAPSHOT_REL',
+  },
   'profile': {
     'tool': 'xctrace',
     'template': 'Time Profiler',
@@ -125,7 +133,10 @@ meta = {
     'ndjson_path': 'state-snapshots.ndjson',
     'human_log_path': 'http-state.log',
   },
-  'artifacts': {'console_log': 'xctrace-console.log'},
+  'artifacts': {
+    'console_log': 'xctrace-console.log',
+    'matchengine_config': '$CONFIG_SNAPSHOT_REL',
+  },
 }
 pathlib.Path('$OUT_DIR_ABS', 'metadata.json').write_text(json.dumps(meta, indent=2))
 "
@@ -150,7 +161,7 @@ xcrun xctrace record \
   --env RUST_LOG="${RUST_LOG:-warn}" \
   --target-stdout - \
   --output "$OUT_DIR_ABS/matchengine.trace" \
-  --launch -- "$ENGINE_BIN" "$CONFIG_PATH" \
+  --launch -- "$ENGINE_BIN" --wait-initial-status "$CONFIG_PATH" \
   2>&1 | tee "$OUT_DIR_ABS/xctrace-console.log"
 XCTRACE_EXIT=${PIPESTATUS[0]}
 set -e

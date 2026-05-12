@@ -4,7 +4,7 @@ market:
   name: eth_btc
   stock_prec: 1
   money_prec: 2
-  fee_prec: 1
+  fee_prec: 3
   min_amount: "0.1"
 
 brokers: "127.0.0.1:9092"
@@ -13,6 +13,10 @@ db:
   addr: "127.0.0.1:3306"
   user: root
   passwd: "123456"
+
+# Bounded queue for all tasks sent into the single matcher thread, including offer-consumer input.
+# When full, producers block and apply backpressure instead of growing memory unbounded.
+main_task_queue_capacity: 500000
 
 # --- Snapshot dump ---
 # Forks a child process on an interval; writes one row to `snap` and order rows to `snap_order_<timestamp>`.
@@ -34,17 +38,42 @@ snap_cleanup:
 
 # --- Downstream Kafka publish (quote vs settle producers are configured separately) ---
 output_publish:
+  # Max interval for coalesced quote/settle progress updates; idle workers flush immediately.
+  progress_flush_interval_ms: 1000
   quote:
     # `quote_deals.<market>`
-    batch_size: 1024
-    linger_ms: 10
-    max_in_flight_requests_per_connection: 1
+    kafka:
+      batch_num_messages: 1024
+      linger_ms: 10
+      max_in_flight_requests_per_connection: 1
+      queue_buffering_max_messages: 100000
+      queue_buffering_max_kbytes: 1048576
+      compression_type: none
+      delivery_timeout_ms: 5000
+      statistics_interval_ms: 0
+    # Bounded channel from matcher main thread to quote publish thread; full queue backpressures matching.
+    channel_capacity: 300000
+    drain_batch_size: 1024
+    max_outstanding: 65536
   settle:
-    batch_size: 4096
+    kafka:
+      batch_num_messages: 4096
+      linger_ms: 5
+      max_in_flight_requests_per_connection: 5
+      queue_buffering_max_messages: 100000
+      queue_buffering_max_kbytes: 1048576
+      compression_type: none
+      delivery_timeout_ms: 5000
+      statistics_interval_ms: 0
+    # Bounded channel per settle publish worker; full queue backpressures matching for groups mapped to that worker.
+    channel_capacity: 1000000
     drain_batch_size: 4096
+    # Per settle partition/group in-flight delivery window.
     max_outstanding: 16384
-    linger_ms: 5
-    max_in_flight_requests_per_connection: 5
+    # Per settle publish worker in-flight delivery window; caps aggregate group fan-out per worker.
+    worker_max_outstanding: 65536
+    # Max records one settle group may enqueue per scheduling turn before the worker tries other ready groups.
+    per_group_send_burst: 256
     # Number of application settle publish workers. The settle topic partition count
     # and USER_SETTLE_GROUP_SIZE must be integer multiples of this value.
-    thread_count: 1
+    thread_count: 8

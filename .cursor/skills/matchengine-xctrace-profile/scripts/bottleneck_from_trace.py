@@ -206,12 +206,12 @@ def _thread_bucket(tf: str) -> str:
     tl = tf.lower()
     if "main thread" in tl:
         return "Main thread (matcher loop)"
-    if "kafka-consumer" in tl:
-        return "kafka-consumer (ingress)"
-    if "quote-publish" in tl:
-        return "quote-publish (Kafka out)"
-    if "settle-publish" in tl:
-        return "settle-publish (Kafka out)"
+    if "kafka-consumer" in tl or "offer-consumer" in tl:
+        return "offer-consumer (Kafka in)"
+    if "quote-publish" in tl or "quote-pub" in tl:
+        return "quote-pub (Kafka out)"
+    if "settle-publish" in tl or "settle-pub" in tl:
+        return "settle-pub (Kafka out)"
     if "http-worker" in tl or "http-driver" in tl:
         return "HTTP (http-driver / http-worker)"
     if "producer polling" in tl:
@@ -285,6 +285,47 @@ def state_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         except (TypeError, ValueError):
             return None
 
+    def gp(d: dict[str, Any], *path: str) -> Any:
+        cur: Any = d
+        for key in path:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(key)
+        return cur
+
+    def gpv(d: dict[str, Any], *path: str) -> float | None:
+        v = gp(d, *path)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def list_sum(obj: Any) -> float | None:
+        if not isinstance(obj, list) or not obj:
+            return None
+        vals = []
+        for x in obj:
+            try:
+                vals.append(float(x))
+            except (TypeError, ValueError):
+                pass
+        return sum(vals) if vals else None
+
+    def list_max_with_index(obj: Any) -> tuple[float | None, int | None]:
+        if not isinstance(obj, list) or not obj:
+            return None, None
+        vals = []
+        for idx, x in enumerate(obj):
+            try:
+                vals.append((float(x), idx))
+            except (TypeError, ValueError):
+                pass
+        if not vals:
+            return None, None
+        return max(vals, key=lambda x: x[0])
+
     first, last = ok_status[0], ok_status[-1]
     dq = gv(last, "deals_id"), gv(first, "deals_id")
     pq = gv(last, "pushed_quote_deals_id"), gv(first, "pushed_quote_deals_id")
@@ -325,6 +366,53 @@ def state_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         out["signals"]["delta_pushed_settle_max"] = ps1 - ps0
     if sm1 is not None and ps1 is not None:
         out["signals"]["settle_publish_lag_end"] = sm1 - ps1
+
+    qp_vals = [gpv(st, "publish_backlog", "quote_pending") for st in ok_status]
+    qp_vals = [v for v in qp_vals if v is not None]
+    if qp_vals:
+        out["signals"]["publish_backlog_quote_pending_max"] = max(qp_vals)
+
+    sp_vals = [gpv(st, "publish_backlog", "settle_pending") for st in ok_status]
+    sp_vals = [v for v in sp_vals if v is not None]
+    if sp_vals:
+        out["signals"]["publish_backlog_settle_pending_max"] = max(sp_vals)
+
+    qfull0 = gpv(first, "publish_backlog", "quote_queue_full_count")
+    qfull1 = gpv(last, "publish_backlog", "quote_queue_full_count")
+    if qfull0 is not None and qfull1 is not None:
+        out["signals"]["publish_backlog_quote_queue_full_delta"] = qfull1 - qfull0
+
+    swq0 = list_sum(gp(first, "publish_backlog", "settle_worker_queue_full_counts"))
+    swq1 = list_sum(gp(last, "publish_backlog", "settle_worker_queue_full_counts"))
+    if swq0 is not None and swq1 is not None:
+        out["signals"]["publish_backlog_settle_worker_queue_full_total_delta"] = swq1 - swq0
+
+    max_group_pending_pairs = [
+        (
+            gpv(st, "publish_backlog", "max_settle_group_pending", "pending"),
+            gpv(st, "publish_backlog", "max_settle_group_pending", "group_id"),
+        )
+        for st in ok_status
+    ]
+    max_group_pending_pairs = [(v, group) for v, group in max_group_pending_pairs if v is not None]
+    if max_group_pending_pairs:
+        max_group_pending, max_group_pending_id = max(max_group_pending_pairs, key=lambda x: x[0])
+        out["signals"]["publish_backlog_max_settle_group_pending_peak"] = max_group_pending
+        if max_group_pending_id is not None:
+            out["signals"]["publish_backlog_max_settle_group_pending_group_peak"] = max_group_pending_id
+
+    quote_lag_vals = [gpv(st, "publish_lag", "quote_deals") for st in ok_status]
+    quote_lag_vals = [v for v in quote_lag_vals if v is not None]
+    if quote_lag_vals:
+        out["signals"]["publish_lag_quote_deals_max"] = max(quote_lag_vals)
+
+    settle_lag_vals = [list_max_with_index(gp(st, "publish_lag", "settle_group_lags")) for st in ok_status]
+    settle_lag_vals = [(v, idx) for v, idx in settle_lag_vals if v is not None]
+    if settle_lag_vals:
+        max_lag, max_lag_group = max(settle_lag_vals, key=lambda x: x[0])
+        out["signals"]["publish_lag_max_settle_group_lag_peak"] = max_lag
+        if max_lag_group is not None:
+            out["signals"]["publish_lag_max_settle_group_lag_group_peak"] = max_lag_group
 
     return out
 
@@ -486,6 +574,17 @@ def build_bottleneck_section(
 
     iso_lo = wall_win[0].strftime("%Y-%m-%dT%H:%M:%SZ") if wall_win else ""
     iso_hi = wall_win[1].strftime("%Y-%m-%dT%H:%M:%SZ") if wall_win else ""
+    top_thread = thr_rows[0] if thr_rows else ("—", 0)
+    top_work = bkt_rows[0] if bkt_rows else ("—", 0)
+    matcher_pct = pct_view(thr_weight.get("Main thread (matcher loop)", 0))
+    kafka_pct = pct_view(bucket_weight.get("Kafka producer / rdkafka", 0))
+    cpu_overview_rows = [
+        ["Scoped sample weight", f"{view_total / 1e9:.3f}s", "CPU weight used by the tables below"],
+        ["Largest thread bucket", top_thread[0], f"{pct_view(top_thread[1]):.1f}% of scoped CPU"],
+        ["Largest work area", top_work[0], f"{pct_view(top_work[1]):.1f}% of scoped CPU"],
+        ["Matcher loop share", f"{matcher_pct:.1f}%", "High values point at matching/order handling pressure"],
+        ["Kafka producer share", f"{kafka_pct:.1f}%", "High values point at publish/broker pressure"],
+    ]
 
     lines: list[str] = [
         "## Bottleneck synthesis (CPU + HTTP)",
@@ -496,6 +595,10 @@ def build_bottleneck_section(
         "",
         f"- **Trace file**: `{trace_path.name}`",
         f"- **All engine-related samples**: {total_eng / 1e9:.3f}s total weight ({len(eng)} samples)",
+        "",
+        "### CPU at a glance",
+        "",
+        md_table(["signal", "value", "meaning"], cpu_overview_rows),
         "",
         "### Profiler ↔ HTTP alignment",
         "",
@@ -631,6 +734,29 @@ def build_bottleneck_section(
         hints.append(
             f"**Settle backlog** (~{lag_s:.0f} on max message-id proxy) visible in `/status` — "
             "CPU may be waiting on broker/IO rather than serde; compare with kafka thread activity."
+        )
+
+    try:
+        qfull_delta = float(signals.get("publish_backlog_quote_queue_full_delta", 0) or 0)
+        swq_delta = float(signals.get("publish_backlog_settle_worker_queue_full_total_delta", 0) or 0)
+    except (TypeError, ValueError):
+        qfull_delta, swq_delta = 0.0, 0.0
+    if qfull_delta > 0 or swq_delta > 0:
+        hints.append(
+            f"**Kafka QueueFull** increased during the HTTP-ok window "
+            f"(quote Δ≈{qfull_delta:.0f}, settle workers total Δ≈{swq_delta:.0f}); "
+            "treat producer queue capacity / broker back-pressure as a first-class suspect."
+        )
+
+    try:
+        max_group_pending = float(signals.get("publish_backlog_max_settle_group_pending_peak", 0) or 0)
+        max_group_pending_id = signals.get("publish_backlog_max_settle_group_pending_group_peak")
+    except (TypeError, ValueError):
+        max_group_pending, max_group_pending_id = 0.0, None
+    if max_group_pending > 0:
+        hints.append(
+            f"**Settle group hotspot**: peak pending≈{max_group_pending:.0f}"
+            f" on group `{max_group_pending_id}`; compare that group with worker outstanding and queue-full counters."
         )
 
     try:

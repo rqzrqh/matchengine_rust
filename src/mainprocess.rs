@@ -212,8 +212,13 @@ pub fn update_quote_progress(m: &mut Market, pushed_quote_deals_id: u64) {
     debug!("pushed_quote_deals_id={}", pushed_quote_deals_id);
 }
 
-pub fn update_settle_progress(m: &mut Market, group_id: usize, pushed_settle_message_id: u64) {
-    m.pushed_settle_message_ids[group_id] = pushed_settle_message_id;
+pub fn update_settle_progress_batch(
+    m: &mut Market,
+    progresses: &[crate::task::SettlePublishProgressTask],
+) {
+    for progress in progresses {
+        m.pushed_settle_message_ids[progress.group_id] = progress.pushed_settle_message_id;
+    }
     debug!(
         "pushed_settle_message_ids={:?}",
         m.pushed_settle_message_ids

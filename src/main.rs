@@ -3,7 +3,7 @@ use rdkafka::consumer::StreamConsumer;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::util::Timeout;
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
-use std::{env, net::SocketAddr, process, sync::mpsc, thread, time::Duration};
+use std::{env, net::SocketAddr, process, thread, time::Duration};
 use uuid::Uuid;
 
 use chrono::prelude::*;
@@ -23,6 +23,7 @@ mod http;
 mod load;
 mod mainprocess;
 mod market;
+mod offer_metrics;
 mod payload_encoding;
 mod publish;
 mod snap_cleanup;
@@ -31,22 +32,27 @@ mod task;
 mod config;
 
 // Runtime layout (one OS process, one market). Profiler-visible thread prefixes: matcher main (unnamed OS main),
-// `snap-cleanup`, `snap-timer`, `http-driver` + `http-worker`, `kafka-consumer`, `quote-publish`,
-// configured `settle-publish-*` worker threads (Tokio appends `-N` suffixes to the HTTP/consumer runtime threads).
+// `snap-cleanup`, `snap-timer`, `http-driver` + `http-worker`, `offer-consumer`, `quote-pub-1of1`,
+// configured `settle-pub-<n>of<count>` worker threads (Tokio appends `-N` suffixes to the HTTP/consumer runtime threads).
 // - Main thread: blocking loop on `main_routine_receiver`; owns `Market`, handles Kafka input, REST replies,
 //   snapshot dumps, and publish progress updates.
-// - HTTP (`http-driver` + nested Tokio `http-worker*`): Axum; forwards `HttpRequest` tasks to the main channel.
-// - Kafka consumer: Tokio `kafka-consumer*` (single worker) on `offer.<market>`; unpacks MessagePack + RPC
-//   envelope checks via `parse_mq_payload`, then sends `MqTask` to the main channel (matcher + sequence checks stay main-thread).
+// - HTTP (`http-driver` + nested Tokio `http-worker*`): Axum; forwards `HttpRequest` tasks to the bounded main channel.
+// - Kafka consumer: Tokio `offer-consumer*` (single worker) on `offer.<market>`; unpacks MessagePack + RPC
+//   envelope checks via `parse_mq_payload`, then sends `MqTask` to the bounded main channel (matcher + sequence checks stay main-thread).
 // - Timer `snap-timer`: periodic `DumpTask` to fork snapshot writers.
 // - Snapshot cleanup `snap-cleanup`: periodic `prune_snapshots` against MySQL.
 
-async fn start_httpserver(main_routine_sender: mpsc::Sender<task::Task>, addr: SocketAddr) {
+async fn start_httpserver(
+    main_routine_sender: task::MainTaskSender,
+    addr: SocketAddr,
+    ready_tx: Option<std::sync::mpsc::Sender<()>>,
+) {
     http::serve_engine_http(
         addr,
         http::EngineHttpState {
             main_routine_sender,
         },
+        ready_tx,
     )
     .await;
 }
@@ -58,8 +64,10 @@ fn init_logging() {
 }
 
 fn kafka_partition_count(brokers: &str, topic: &str) -> Result<usize, String> {
+    let client_id = format!("matchengine.startup-check.{}", topic);
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
+        .set("client.id", client_id)
         .set(
             "group.id",
             format!("match-startup-check-{}", Uuid::new_v4()),
@@ -123,7 +131,22 @@ fn main() {
     init_logging();
 
     let args: Vec<String> = env::args().collect();
-    let cfg_path = args.get(1).map(|s| s.as_str()).unwrap_or("config.yaml");
+    let mut cfg_path = "config.yaml";
+    let mut wait_initial_status = false;
+    for arg in args.iter().skip(1) {
+        match arg.as_str() {
+            "--wait-initial-status" => wait_initial_status = true,
+            "-h" | "--help" => {
+                eprintln!("Usage: {} [--wait-initial-status] [CONFIG_PATH]", args[0]);
+                process::exit(0);
+            }
+            value if value.starts_with('-') => {
+                error!("unknown argument: {}", value);
+                process::exit(1);
+            }
+            value => cfg_path = value,
+        }
+    }
 
     let cfg = config::load_config(cfg_path).unwrap_or_else(|e| {
         error!("config load failed: {} {}", cfg_path, e);
@@ -145,6 +168,7 @@ fn main() {
     let db_addr = cfg.db.addr.clone();
     let db_user = cfg.db.user.clone();
     let db_passwd = cfg.db.passwd.clone();
+    let main_task_queue_capacity = cfg.main_task_queue_capacity;
     let output_publish_cfg = cfg.output_publish.clone();
 
     const ENGINE_HTTP_IP: &str = "127.0.0.1";
@@ -221,31 +245,77 @@ fn main() {
         })
         .expect("spawn snap-cleanup thread");
 
-    let (main_routine_sender, main_routine_receiver) = mpsc::channel();
+    let (main_routine_sender, main_routine_receiver) =
+        task::MainTaskSender::channel(main_task_queue_capacity);
 
     let publisher = publish::Publish::new(
         brokers.clone(),
+        market_name.clone(),
         main_routine_sender.clone(),
         mk.pushed_quote_deals_id,
         mk.pushed_settle_message_ids.to_vec(),
         publish::PublishDriverCfg {
             quote_topic: quote_topic.clone(),
-            quote_batch_size: output_publish_cfg.quote.batch_size,
-            quote_linger_ms: output_publish_cfg.quote.linger_ms,
-            quote_max_in_flight_requests_per_connection: output_publish_cfg
-                .quote
-                .max_in_flight_requests_per_connection,
-            settle_batch_size: output_publish_cfg.settle.batch_size,
+            quote: publish::KafkaProducerDriverCfg {
+                batch_num_messages: output_publish_cfg.quote.kafka.batch_num_messages,
+                linger_ms: output_publish_cfg.quote.kafka.linger_ms,
+                max_in_flight_requests_per_connection: output_publish_cfg
+                    .quote
+                    .kafka
+                    .max_in_flight_requests_per_connection,
+                queue_buffering_max_messages: output_publish_cfg
+                    .quote
+                    .kafka
+                    .queue_buffering_max_messages,
+                queue_buffering_max_kbytes: output_publish_cfg
+                    .quote
+                    .kafka
+                    .queue_buffering_max_kbytes,
+                compression_type: output_publish_cfg.quote.kafka.compression_type.clone(),
+                delivery_timeout_ms: output_publish_cfg.quote.kafka.delivery_timeout_ms,
+                statistics_interval_ms: output_publish_cfg.quote.kafka.statistics_interval_ms,
+            },
+            quote_channel_capacity: output_publish_cfg.quote.channel_capacity,
+            quote_drain_batch_size: output_publish_cfg.quote.drain_batch_size,
+            quote_max_outstanding: output_publish_cfg.quote.max_outstanding,
+            settle: publish::KafkaProducerDriverCfg {
+                batch_num_messages: output_publish_cfg.settle.kafka.batch_num_messages,
+                linger_ms: output_publish_cfg.settle.kafka.linger_ms,
+                max_in_flight_requests_per_connection: output_publish_cfg
+                    .settle
+                    .kafka
+                    .max_in_flight_requests_per_connection,
+                queue_buffering_max_messages: output_publish_cfg
+                    .settle
+                    .kafka
+                    .queue_buffering_max_messages,
+                queue_buffering_max_kbytes: output_publish_cfg
+                    .settle
+                    .kafka
+                    .queue_buffering_max_kbytes,
+                compression_type: output_publish_cfg.settle.kafka.compression_type.clone(),
+                delivery_timeout_ms: output_publish_cfg.settle.kafka.delivery_timeout_ms,
+                statistics_interval_ms: output_publish_cfg.settle.kafka.statistics_interval_ms,
+            },
+            settle_channel_capacity: output_publish_cfg.settle.channel_capacity,
             settle_drain_batch_size: output_publish_cfg.settle.drain_batch_size,
             settle_max_outstanding: output_publish_cfg.settle.max_outstanding,
-            settle_linger_ms: output_publish_cfg.settle.linger_ms,
-            settle_max_in_flight_requests_per_connection: output_publish_cfg
-                .settle
-                .max_in_flight_requests_per_connection,
+            settle_worker_max_outstanding: output_publish_cfg.settle.worker_max_outstanding,
+            settle_per_group_send_burst: output_publish_cfg.settle.per_group_send_burst,
             settle_thread_count: output_publish_cfg.settle.thread_count,
+            progress_flush_interval: Duration::from_millis(
+                output_publish_cfg.progress_flush_interval_ms,
+            ),
         },
     );
 
+    let offer_consumer_stats = offer_metrics::OfferConsumerStats::new();
+    let (http_ready_sender, http_ready_receiver) = if wait_initial_status {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
     let main_routine_sender_http_clone = main_routine_sender.clone();
     let http_thread = thread::Builder::new()
         .name("http-driver".to_owned())
@@ -255,25 +325,69 @@ fn main() {
                 .thread_name("http-worker")
                 .build()
                 .expect("http tokio runtime");
-            rt.block_on(start_httpserver(main_routine_sender_http_clone, http_addr));
+            rt.block_on(start_httpserver(
+                main_routine_sender_http_clone,
+                http_addr,
+                http_ready_sender,
+            ));
         })
         .expect("spawn http thread");
+
+    if wait_initial_status {
+        let http_ready_receiver = http_ready_receiver.expect("http ready receiver");
+        http_ready_receiver
+            .recv()
+            .expect("http server ready signal failed");
+        match main_routine_receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(task) => {
+                main_routine_sender.mark_dequeued(&task);
+                match task {
+                    task::Task::HttpRequest(a) => {
+                        let publish_snapshot = publisher.status_snapshot();
+                        let main_task_queue_snapshot = main_routine_sender.status_snapshot();
+                        let offer_consumer_snapshot = offer_consumer_stats.snapshot();
+                        let res = http::handle_http_request(
+                            &mk,
+                            &publish_snapshot,
+                            &main_task_queue_snapshot,
+                            &offer_consumer_snapshot,
+                            a.op,
+                        );
+                        let _ = a.rsp.send(res);
+                    }
+                    other => {
+                        warn!("unexpected task before profiling initial status");
+                        drop(other);
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                warn!("timed out waiting for profiling initial status request");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("main task channel disconnected before startup")
+            }
+        }
+    }
 
     let main_routine_sender_mq_clone = main_routine_sender.clone();
     let brokers_clone2 = brokers.clone();
     let input_offset = mk.input_offset;
+    let offer_consumer_stats_for_consumer = offer_consumer_stats.clone();
 
     let consumer_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1) // consumer loop only
         // Stable name for profilers (Instruments / sample): distinguishes this from HTTP `tokio-runtime-worker`.
-        .thread_name("kafka-consumer")
+        .thread_name("offer-consumer")
         .enable_all()
         .build()
         .unwrap();
 
     let consumer_handler = consumer_rt.spawn(async move {
+        let client_id = format!("matchengine.{}.offer-consumer", market_name);
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", brokers_clone2)
+            .set("client.id", client_id)
             .set("enable.partition.eof", "false")
             // Unique group id per run so this process reads the full topic from the assigned offset.
             .set("group.id", format!("match-{}", Uuid::new_v4()))
@@ -291,8 +405,10 @@ fn main() {
         consumer.assign(&tpl).expect("failed to assign");
 
         loop {
+            let recv_started = std::time::Instant::now();
             match consumer.recv().await {
                 Ok(message) => {
+                    let recv_wait = recv_started.elapsed();
                     let data = message.payload();
                     debug!(
                         "Received message at topic: {} partition: {} offset: {} payload_len: {:?}",
@@ -302,18 +418,29 @@ fn main() {
                         data.map(|p| p.len())
                     );
 
+                    let payload_bytes = data.map(|p| p.len()).unwrap_or(0);
+                    let parse_started = std::time::Instant::now();
                     let payload = data
                         .map(mainprocess::parse_mq_payload)
                         .unwrap_or_else(|| Err("empty mq payload".to_owned()));
+                    let parse_elapsed = parse_started.elapsed();
                     let task = task::KafkaMqTask {
                         offset: message.offset(),
                         payload,
                     };
+                    let send_started = std::time::Instant::now();
                     main_routine_sender_mq_clone
                         .send(task::Task::MqTask(task))
                         .expect("send mqtask failed");
+                    offer_consumer_stats_for_consumer.record_message(
+                        payload_bytes,
+                        recv_wait,
+                        parse_elapsed,
+                        send_started.elapsed(),
+                    );
                 }
                 Err(e) => {
+                    offer_consumer_stats_for_consumer.record_recv_error(recv_started.elapsed());
                     error!("consume failed {}", e);
                 }
             }
@@ -340,13 +467,25 @@ fn main() {
 
     loop {
         let task = main_routine_receiver.recv().unwrap();
+        main_routine_sender.mark_dequeued(&task);
 
         match task {
             task::Task::MqTask(t) => {
                 mainprocess::handle_mq_message(&publisher, &mut mk, t);
             }
             task::Task::HttpRequest(a) => {
-                let res = http::handle_http_request(&mk, a.op);
+                // HTTP never reads `Market` or publish-worker state directly. The
+                // main thread owns `Market`, and publish exposes only atomic snapshots.
+                let publish_snapshot = publisher.status_snapshot();
+                let main_task_queue_snapshot = main_routine_sender.status_snapshot();
+                let offer_consumer_snapshot = offer_consumer_stats.snapshot();
+                let res = http::handle_http_request(
+                    &mk,
+                    &publish_snapshot,
+                    &main_task_queue_snapshot,
+                    &offer_consumer_snapshot,
+                    a.op,
+                );
                 let _ = a.rsp.send(res);
             }
             task::Task::DumpTask(b) => {
@@ -355,12 +494,8 @@ fn main() {
             task::Task::QuoteProgressUpdateTask(t) => {
                 mainprocess::update_quote_progress(&mut mk, t.pushed_quote_deals_id);
             }
-            task::Task::SettleProgressUpdateTask(t) => {
-                mainprocess::update_settle_progress(
-                    &mut mk,
-                    t.group_id,
-                    t.pushed_settle_message_id,
-                );
+            task::Task::SettleProgressBatchUpdateTask(t) => {
+                mainprocess::update_settle_progress_batch(&mut mk, &t.progresses);
             }
             task::Task::Terminate => {
                 warn!("terminate and exit");

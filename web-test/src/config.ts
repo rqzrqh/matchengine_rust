@@ -18,6 +18,8 @@ export interface MatchengineYaml {
     passwd: string;
   };
   /** Engine-only; optional for web-test. */
+  main_task_queue_capacity?: number;
+  /** Engine-only; optional for web-test. */
   snap_cleanup?: {
     max_age_secs: number;
     max_snapshots: number;
@@ -28,17 +30,38 @@ export interface MatchengineYaml {
   };
   /** Required in engine `config.yaml`; mirrored here for typing. */
   output_publish: {
+    progress_flush_interval_ms?: number;
     quote: {
-      batch_size: number;
-      linger_ms: number;
-      max_in_flight_requests_per_connection: number;
-    };
-    settle: {
-      batch_size: number;
+      kafka: {
+        batch_num_messages: number;
+        linger_ms: number;
+        max_in_flight_requests_per_connection: number;
+        queue_buffering_max_messages?: number;
+        queue_buffering_max_kbytes?: number;
+        compression_type?: string;
+        delivery_timeout_ms?: number;
+        statistics_interval_ms?: number;
+      };
+      channel_capacity: number;
       drain_batch_size: number;
       max_outstanding: number;
-      linger_ms: number;
-      max_in_flight_requests_per_connection: number;
+    };
+    settle: {
+      kafka: {
+        batch_num_messages: number;
+        linger_ms: number;
+        max_in_flight_requests_per_connection: number;
+        queue_buffering_max_messages?: number;
+        queue_buffering_max_kbytes?: number;
+        compression_type?: string;
+        delivery_timeout_ms?: number;
+        statistics_interval_ms?: number;
+      };
+      channel_capacity: number;
+      drain_batch_size: number;
+      max_outstanding: number;
+      worker_max_outstanding?: number;
+      per_group_send_burst?: number;
       thread_count: number;
     };
   };

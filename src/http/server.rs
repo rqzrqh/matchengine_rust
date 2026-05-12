@@ -6,12 +6,11 @@ use axum::http::{Method, StatusCode, header};
 use axum::response::Response;
 use axum::routing::get;
 use serde::Deserialize;
-use std::sync::mpsc;
 use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 pub struct EngineHttpState {
-    pub main_routine_sender: mpsc::Sender<task::Task>,
+    pub main_routine_sender: task::MainTaskSender,
 }
 
 #[derive(Deserialize)]
@@ -56,7 +55,11 @@ fn default_uo_limit() -> u32 {
     50
 }
 
-pub async fn serve_engine_http(addr: std::net::SocketAddr, state: EngineHttpState) {
+pub async fn serve_engine_http(
+    addr: std::net::SocketAddr,
+    state: EngineHttpState,
+    ready_tx: Option<std::sync::mpsc::Sender<()>>,
+) {
     let app = Router::new()
         .route("/markets/:market/summary", get(get_market_summary))
         .route("/markets/:market/status", get(get_market_status))
@@ -76,6 +79,9 @@ pub async fn serve_engine_http(addr: std::net::SocketAddr, state: EngineHttpStat
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("engine http bind");
+    if let Some(ready_tx) = ready_tx {
+        let _ = ready_tx.send(());
+    }
     if let Err(e) = axum::serve(listener, app).await {
         error!("engine http server: {}", e);
     }

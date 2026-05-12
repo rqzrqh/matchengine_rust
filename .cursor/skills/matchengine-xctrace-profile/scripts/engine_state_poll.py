@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poll matcher HTTP summary + status; write NDJSON and optional human-readable log."""
+"""Poll matcher HTTP status; write NDJSON and optional human-readable log."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def fetch_json(url: str, timeout: float) -> dict:
@@ -22,22 +22,24 @@ def fetch_json(url: str, timeout: float) -> dict:
         return json.loads(resp.read().decode())
 
 
-def wait_for_ready(summary_url: str, timeout: float, poll: float, req_timeout: float) -> None:
+def wait_for_ready(status_url: str, timeout: float, poll: float, req_timeout: float) -> tuple[str, dict] | None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            fetch_json(summary_url, timeout=min(req_timeout, deadline - time.monotonic()))
-            return
+            ts = utc_now_iso()
+            status = fetch_json(status_url, timeout=min(req_timeout, deadline - time.monotonic()))
+            return ts, status
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, OSError):
             time.sleep(poll)
     print("engine_state_poll: HTTP not ready within wait timeout", file=sys.stderr)
+    return None
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Poll matcher /summary and /status endpoints.")
+    ap = argparse.ArgumentParser(description="Poll matcher /status endpoint.")
     ap.add_argument("--base-url", default="http://127.0.0.1:8080", help="Engine HTTP base URL")
     ap.add_argument("--market", required=True)
-    ap.add_argument("--interval", type=float, default=1.0, help="Seconds between snapshots")
+    ap.add_argument("--interval", type=float, default=0.01, help="Seconds between status snapshots")
     ap.add_argument("--duration-secs", type=float, required=True, help="Total poll window after HTTP is ready")
     ap.add_argument("--http-timeout", type=float, default=3.0)
     ap.add_argument("--wait-ready-secs", type=float, default=90.0)
@@ -46,10 +48,9 @@ def main() -> int:
     args = ap.parse_args()
 
     base = args.base_url.rstrip("/")
-    summary_url = f"{base}/markets/{args.market}/summary"
     status_url = f"{base}/markets/{args.market}/status"
 
-    wait_for_ready(summary_url, timeout=args.wait_ready_secs, poll=0.1, req_timeout=args.http_timeout)
+    first_ready = wait_for_ready(status_url, timeout=args.wait_ready_secs, poll=0.1, req_timeout=args.http_timeout)
 
     end = time.monotonic() + args.duration_secs
 
@@ -57,17 +58,22 @@ def main() -> int:
         hl_cm = None
         if args.out_human_log:
             hl_cm = open(args.out_human_log, "w", encoding="utf-8")
-            hl_cm.write(f"# polls -> {summary_url} | {status_url}\n")
+            hl_cm.write(f"# polls -> {status_url}\n")
             hl_cm.write(f"# interval={args.interval}s\n")
 
         try:
+            if first_ready is not None:
+                ts, status = first_ready
+                row: dict = {"ts": ts, "summary": {}, "status": status, "errors": []}
+                nd.write(json.dumps(row, separators=(",", ":")) + "\n")
+                nd.flush()
+                if hl_cm:
+                    hl_cm.write(f"\n===== {ts} =====\n-- status --\n")
+                    hl_cm.write(json.dumps(row["status"], indent=2) if row["status"] else "{}\n")
+
             while time.monotonic() < end:
                 ts = utc_now_iso()
                 row: dict = {"ts": ts, "summary": {}, "status": {}, "errors": []}
-                try:
-                    row["summary"] = fetch_json(summary_url, args.http_timeout)
-                except Exception as e:
-                    row["errors"].append(f"summary:{e}")
                 try:
                     row["status"] = fetch_json(status_url, args.http_timeout)
                 except Exception as e:
@@ -77,9 +83,7 @@ def main() -> int:
                 nd.flush()
 
                 if hl_cm:
-                    hl_cm.write(f"\n===== {ts} =====\n-- summary --\n")
-                    hl_cm.write(json.dumps(row["summary"], indent=2) if row["summary"] else "{}\n")
-                    hl_cm.write("\n-- status --\n")
+                    hl_cm.write(f"\n===== {ts} =====\n-- status --\n")
                     hl_cm.write(json.dumps(row["status"], indent=2) if row["status"] else "{}\n")
                     if row["errors"]:
                         hl_cm.write("\n-- errors --\n")
