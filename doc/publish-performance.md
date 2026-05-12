@@ -116,12 +116,39 @@ settle message up to that id for the same group has been delivered. A worker may
 temporarily hold acknowledged ids above the cursor until the missing lower id
 arrives.
 
+The allowed-duplicate boundary is application-side only: this code will not send
+the same `settle_message_id` to Kafka a second time, while Kafka producer
+idempotence only deduplicates retries within the same producer lifecycle and
+does not provide downstream exactly-once semantics.
+
+### Broker-side ordering with `max_in_flight_requests_per_connection = 5`
+
+The settle producer is created with `enable.idempotence = true`. In this mode
+every message carries a `(ProducerID, partition, sequence_number)` triple.
+The broker accepts and orders messages by that sequence number, and rejects
+any write that would create a gap or duplicate—even if several request batches
+are in flight at the same time.
+
+This means `max_in_flight_requests_per_connection = 5` does **not** cause
+consumer-visible reordering. Without idempotence, a retry after a transient
+failure can arrive after a newer batch has already committed, interleaving
+physical log order with send order. The idempotent producer eliminates that
+race: the broker's sequence-number enforcement keeps the physical log order
+consistent with the application send order regardless of how many batches are
+concurrently in flight. `max_in_flight ≤ 5` is the Kafka-protocol limit for the
+guarantee to hold; the configured value of 5 is the recommended ceiling.
+
+The combined effect of the application-layer FIFO queue (one queue per
+`group_id`) and the broker-side idempotent sequencing is that a consumer of any
+single settle partition always sees messages in `settle_message_id` order,
+even if a batch had to be retried.
+
 ## Kafka producer settings
 
 `output_publish` is now split by producer:
 
 ```yaml
-main_task_queue_capacity: 65536
+main_task_queue_capacity: 500000
 
 output_publish:
   progress_flush_interval_ms: 1000
@@ -135,9 +162,9 @@ output_publish:
       compression_type: none
       delivery_timeout_ms: 5000
       statistics_interval_ms: 0
-    channel_capacity: 65536
+    channel_capacity: 300000
     drain_batch_size: 1024
-    max_outstanding: 1024
+    max_outstanding: 65536
   settle:
     kafka:
       batch_num_messages: 4096
@@ -148,19 +175,21 @@ output_publish:
       compression_type: none
       delivery_timeout_ms: 5000
       statistics_interval_ms: 0
-    channel_capacity: 65536
+    channel_capacity: 1000000
     drain_batch_size: 4096
     max_outstanding: 16384
-    worker_max_outstanding: 32768
+    worker_max_outstanding: 65536
     per_group_send_burst: 256
-    thread_count: 1
+    thread_count: 8
 ```
 
 Settle publishing always enables Kafka idempotence and `acks=all` in code. There
 is no `settle.enable_idempotence` flag anymore.
 
-The Kafka `settle` topic partition count and `USER_SETTLE_GROUP_SIZE` must both
-be integer multiples of `output_publish.settle.thread_count`.
+The Kafka `settle` topic must have at least `USER_SETTLE_GROUP_SIZE` partitions.
+Both the topic partition count and `USER_SETTLE_GROUP_SIZE` must be integer
+multiples of `output_publish.settle.thread_count`, so each application worker
+owns an equal-sized group range.
 
 Configuration meanings:
 
@@ -228,12 +257,15 @@ Start with the current safe defaults:
 - `settle.kafka.linger_ms: 5`
 - `settle.kafka.batch_num_messages: 4096`
 - `output_publish.progress_flush_interval_ms: 1000`
-- `settle.channel_capacity: 65536`
+- `main_task_queue_capacity: 500000`
+- `quote.channel_capacity: 300000`
+- `quote.max_outstanding: 65536`
+- `settle.channel_capacity: 1000000`
 - `settle.drain_batch_size: 4096`
 - `settle.max_outstanding: 16384`
-- `settle.worker_max_outstanding: 32768`
+- `settle.worker_max_outstanding: 65536`
 - `settle.per_group_send_burst: 256`
-- `settle.thread_count: 1`
+- `settle.thread_count: 8`
 
 For lower latency, reduce `settle.kafka.linger_ms` first. If a hot settle partition
 falls behind, compare `publish_backlog.max_settle_group_pending`,
@@ -246,6 +278,59 @@ headroom for retry and batching behavior.
 For a conservative ordering experiment, set
 `settle.kafka.max_in_flight_requests_per_connection: 1`; this may reduce throughput
 but also reduces broker connection concurrency.
+
+## Delivery semantics and receiver contract
+
+### At-least-once delivery
+
+The matching engine provides **at-least-once** delivery for both settle and quote
+messages. Exactly-once is not guaranteed:
+
+- A crash after Kafka delivery but before the publish worker writes
+  `pushed_settle_message_ids` back to the main thread causes those messages to be
+  re-sent on restart from the last persisted snapshot.
+- Multiple matching processes started from the same snapshot and consuming the
+  same `offer.<market>` input produce identical message content for every
+  `settle_message_id` / `deals_id`. Because matching is deterministic, the same
+  input sequence always yields the same output sequence; a duplicate is content-
+  identical, not a conflicting version.
+
+### Receiver idempotence contract
+
+Receivers **must** treat `settle_message_id` (per group/partition) and
+`deals_id` (quote) as monotone deduplication cursors:
+
+- Maintain a per-partition cursor `last_applied_id`, initialised from durable
+  storage on startup.
+- For each incoming message, if `settle_message_id <= last_applied_id`, discard
+  it silently—it is a duplicate caused by a publish retry or a producer restart.
+- If `settle_message_id == last_applied_id + 1`, apply the message and advance
+  the cursor.
+- If `settle_message_id > last_applied_id + 1`, a gap has appeared. A gap means
+  messages were lost in transit or the receiver's cursor is stale. This should
+  not happen in normal operation: the publish side maintains strict per-partition
+  ordering and retries until `delivery_timeout_ms`. Treat a gap as an error
+  requiring manual investigation rather than silently skipping.
+
+The same rules apply to `deals_id` on the `quote_deals.<market>` topic (single
+partition, single cursor).
+
+### Multiple producer instances
+
+If two matching engine instances run concurrently from the same snapshot and
+input offset they write identical content to the same Kafka partitions under
+different `ProducerID`s. Kafka broker idempotence does **not** deduplicate across
+`ProducerID`s, so a consumer sees the same `settle_message_id` twice—once from
+each instance. The receiver's cursor-based deduplication above handles this
+correctly: the second copy is discarded as `settle_message_id <= last_applied_id`.
+
+For this to be safe, both instances must consume identical input (same
+`offer.<market>` partition, same starting offset). If instances diverge in input
+(different offsets, missed messages, or different partitions), the same
+`settle_message_id` may carry different content from the two instances, which
+the cursor model cannot resolve. Preventing input divergence is an operational
+requirement: run at most one instance, or coordinate startup via an external
+lock.
 
 Use profiling before and after each change. The useful HTTP signals are:
 

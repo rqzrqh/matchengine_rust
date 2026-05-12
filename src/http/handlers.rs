@@ -199,6 +199,8 @@ fn publish_backlog_json(snapshot: &PublishStatusSnapshot) -> JsonValue {
     object["settle_worker_channel_max_blocked_nanos"] =
         ids_to_json(&snapshot.settle_worker_channel_max_blocked_nanos);
     object["settle_group_pending"] = usize_ids_to_json(&snapshot.settle_group_pending);
+    object["settle_duplicate_dropped_count"] =
+        usize_ids_to_json(&snapshot.settle_duplicate_dropped_count);
     object["max_settle_group_pending"] =
         max_group_json(max_pending_group_id, max_pending, "pending");
     object["quote_in_flight"] = (snapshot.quote_in_flight as u64).into();

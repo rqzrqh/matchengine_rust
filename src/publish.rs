@@ -94,6 +94,7 @@ pub struct PublishBacklog {
     quote_pending: AtomicUsize,
     settle_pending: AtomicUsize,
     settle_group_pending: Vec<AtomicUsize>,
+    settle_duplicate_dropped_count: Vec<AtomicUsize>,
     quote_channel_full_count: AtomicUsize,
     quote_channel_blocked_nanos: AtomicU64,
     quote_channel_max_blocked_nanos: AtomicU64,
@@ -125,6 +126,9 @@ impl PublishBacklog {
             quote_pending: AtomicUsize::new(0),
             settle_pending: AtomicUsize::new(0),
             settle_group_pending: (0..settle_group_count)
+                .map(|_| AtomicUsize::new(0))
+                .collect(),
+            settle_duplicate_dropped_count: (0..settle_group_count)
                 .map(|_| AtomicUsize::new(0))
                 .collect(),
             quote_channel_full_count: AtomicUsize::new(0),
@@ -169,6 +173,10 @@ impl PublishBacklog {
         let group_prev = self.settle_group_pending[group_id].fetch_sub(1, Ordering::Relaxed);
         debug_assert!(total_prev > 0, "settle backlog underflow");
         debug_assert!(group_prev > 0, "settle group backlog underflow");
+    }
+
+    fn inc_settle_duplicate_dropped(&self, group_id: usize) {
+        self.settle_duplicate_dropped_count[group_id].fetch_add(1, Ordering::Relaxed);
     }
 
     fn inc_quote_in_flight(&self) {
@@ -230,6 +238,11 @@ impl PublishBacklog {
                 .iter()
                 .map(|pending| pending.load(Ordering::Relaxed))
                 .collect(),
+            settle_duplicate_dropped_count: self
+                .settle_duplicate_dropped_count
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .collect(),
             quote_channel_full_count: self.quote_channel_full_count.load(Ordering::Relaxed),
             quote_channel_blocked_nanos: self.quote_channel_blocked_nanos.load(Ordering::Relaxed),
             quote_channel_max_blocked_nanos: self
@@ -275,6 +288,7 @@ pub struct PublishStatusSnapshot {
     pub quote_pending: usize,
     pub settle_pending: usize,
     pub settle_group_pending: Vec<usize>,
+    pub settle_duplicate_dropped_count: Vec<usize>,
     pub quote_channel_full_count: usize,
     pub quote_channel_blocked_nanos: u64,
     pub quote_channel_max_blocked_nanos: u64,
@@ -600,10 +614,16 @@ impl SettleGroupState {
         self.in_flight -= 1;
 
         if settle_message_id <= self.pushed_settle_message_id {
-            panic!(
+            // Correct send paths pass through `queue_settle_task`, which drops
+            // duplicate ids before Kafka enqueue. Keep this as a development
+            // invariant in case a future path bypasses that scheduler.
+            debug_assert!(
+                settle_message_id > self.pushed_settle_message_id,
                 "settle delivery id must be above pushed cursor: delivery_id={} pushed_id={}",
-                settle_message_id, self.pushed_settle_message_id
+                settle_message_id,
+                self.pushed_settle_message_id
             );
+            return None;
         }
 
         if settle_message_id != self.pushed_settle_message_id + 1 {
@@ -798,17 +818,20 @@ fn queue_quote_task(quote: &mut QuoteState, backlog: &PublishBacklog, task: Quot
 fn queue_settle_task(
     groups: &mut [SettleGroupState],
     ready_groups: &mut VecDeque<usize>,
+    backlog: &PublishBacklog,
     task: SettlePublishTaskInfo,
 ) {
     let group_id = task.group_id;
     let group = &mut groups[group_id];
-    assert!(
-        task.settle_message_id > group.scheduled_settle_message_id,
-        "settle publish task must be strictly increasing: group={} task_id={} scheduled_id={}",
-        group_id,
-        task.settle_message_id,
-        group.scheduled_settle_message_id
-    );
+    // Mirror quote-side `queue_quote_task`: silently drop `<= scheduled` ids so that
+    // snapshot-restore replays (matcher regenerates ids already published) don't panic.
+    // `scheduled_settle_message_id` starts at `pushed_settle_message_id`, so this also
+    // covers anything the downstream has already acked.
+    if task.settle_message_id <= group.scheduled_settle_message_id {
+        backlog.inc_settle_duplicate_dropped(group_id);
+        backlog.dec_settle(group_id);
+        return;
+    }
 
     group.scheduled_settle_message_id = task.settle_message_id;
     if group.queued.is_empty() && !group.ready_queued {
@@ -1335,12 +1358,12 @@ fn spawn_settle_publish_thread(
                         progress.flush(&main_routine_sender);
                         let task =
                             recv_settle_task(&receiver, &mut progress, &main_routine_sender);
-                        queue_settle_task(&mut groups, &mut ready_groups, task);
+                        queue_settle_task(&mut groups, &mut ready_groups, backlog.as_ref(), task);
                     }
 
                     for _ in 0..drain_batch_size {
                         match receiver.try_recv() {
-                            Ok(task) => queue_settle_task(&mut groups, &mut ready_groups, task),
+                            Ok(task) => queue_settle_task(&mut groups, &mut ready_groups, backlog.as_ref(), task),
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => {
                                 panic!("publish task channel disconnected")
@@ -1536,6 +1559,20 @@ impl Publish {
         self.backlog.snapshot()
     }
 
+    fn skip_pushed_settle_publish(
+        &self,
+        m: &Market,
+        group_id: usize,
+        settle_message_id: u64,
+    ) -> bool {
+        if m.pushed_settle_message_ids[group_id] < settle_message_id {
+            return false;
+        }
+
+        self.backlog.inc_settle_duplicate_dropped(group_id);
+        true
+    }
+
     fn send_settle_publish_task(
         &self,
         group_id: usize,
@@ -1570,6 +1607,11 @@ impl Publish {
 
     pub fn publish_cancel_order(&self, m: &mut Market, extern_id: u64, order: &Rc<Order>) {
         let settle_message_id = m.next_settle_message_id(order.user_id);
+        let group_id = Market::settle_group_id(order.user_id) as usize;
+        if self.skip_pushed_settle_publish(m, group_id, settle_message_id) {
+            return;
+        }
+
         let body = SettlePublishBody::CancelOrder(SettleCancelOrderMsg {
             message_type: SETTLE_MSG_TYPE_CANCEL_ORDER,
             market: m.name.clone(),
@@ -1579,17 +1621,15 @@ impl Publish {
             order: kafka_order_payload(order),
         });
 
-        let group_id = Market::settle_group_id(order.user_id) as u32;
-
         debug!("settle partition={} {:?}", group_id, body);
 
         let message = SettlePublishTaskInfo {
-            group_id: group_id as usize,
+            group_id,
             settle_message_id,
             body,
         };
 
-        self.send_settle_publish_task(group_id as usize, message, "publish_cancel_order");
+        self.send_settle_publish_task(group_id, message, "publish_cancel_order");
     }
 
     pub fn publish_error(
@@ -1603,6 +1643,11 @@ impl Publish {
         m.message_id += 1;
 
         let settle_message_id = m.next_settle_message_id(user_id);
+        let group_id = Market::settle_group_id(user_id) as usize;
+        if self.skip_pushed_settle_publish(m, group_id, settle_message_id) {
+            return;
+        }
+
         let body = SettlePublishBody::Error(SettleErrorMsg {
             message_type: SETTLE_MSG_TYPE_ERROR,
             market: m.name.clone(),
@@ -1613,23 +1658,26 @@ impl Publish {
             code,
         });
 
-        let group_id = Market::settle_group_id(user_id) as u32;
-
         debug!("settle partition={} {:?}", group_id, body);
 
         let message = SettlePublishTaskInfo {
-            group_id: group_id as usize,
+            group_id,
             settle_message_id,
             body,
         };
 
-        self.send_settle_publish_task(group_id as usize, message, "publish_error");
+        self.send_settle_publish_task(group_id, message, "publish_error");
     }
 }
 
 impl MatchPublisher for Publish {
     fn publish_put_order(&self, m: &mut Market, extern_id: u64, order: &Rc<Order>) {
         let settle_message_id = m.next_settle_message_id(order.user_id);
+        let group_id = Market::settle_group_id(order.user_id) as usize;
+        if self.skip_pushed_settle_publish(m, group_id, settle_message_id) {
+            return;
+        }
+
         let body = SettlePublishBody::PutOrder(SettlePutOrderMsg {
             message_type: SETTLE_MSG_TYPE_PUT_ORDER,
             market: m.name.clone(),
@@ -1639,17 +1687,15 @@ impl MatchPublisher for Publish {
             order: kafka_order_payload(order),
         });
 
-        let group_id = Market::settle_group_id(order.user_id) as u32;
-
         debug!("settle partition={} {:?}", group_id, body);
 
         let message = SettlePublishTaskInfo {
-            group_id: group_id as usize,
+            group_id,
             settle_message_id,
             body,
         };
 
-        self.send_settle_publish_task(group_id as usize, message, "publish_put_order");
+        self.send_settle_publish_task(group_id, message, "publish_put_order");
     }
 
     fn publish_deal(
@@ -1668,6 +1714,11 @@ impl MatchPublisher for Publish {
         rival_fee: &Decimal,
     ) {
         let settle_message_id = m.next_settle_message_id(user_id);
+        let group_id = Market::settle_group_id(user_id) as usize;
+        if self.skip_pushed_settle_publish(m, group_id, settle_message_id) {
+            return;
+        }
+
         let body = SettlePublishBody::Deals(SettleDealsMsg {
             message_type: SETTLE_MSG_TYPE_DEALS,
             market: m.name.clone(),
@@ -1689,17 +1740,15 @@ impl MatchPublisher for Publish {
             },
         });
 
-        let group_id = Market::settle_group_id(user_id) as u32;
-
         debug!("settle partition={} {:?}", group_id, body);
 
         let message = SettlePublishTaskInfo {
-            group_id: group_id as usize,
+            group_id,
             settle_message_id,
             body,
         };
 
-        self.send_settle_publish_task(group_id as usize, message, "publish_deal");
+        self.send_settle_publish_task(group_id, message, "publish_deal");
     }
 
     fn publish_quote_deal(
@@ -1752,9 +1801,38 @@ impl MatchPublisher for Publish {
 
 #[cfg(test)]
 mod tests {
-    use super::{SettleGroupState, SettleProgressReporter};
-    use crate::task::{MainTaskSender, Task};
+    use super::{
+        PublishBacklog, SETTLE_MSG_TYPE_ERROR, SettleErrorMsg, SettleGroupState,
+        SettleProgressReporter, SettlePublishBody, SettlePublishTaskInfo, queue_settle_task,
+    };
+    use crate::task::{MainTaskSender, MqParams, PutLimitParams, Task};
+    use std::collections::VecDeque;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
+
+    fn make_settle_task(group_id: usize, settle_message_id: u64) -> SettlePublishTaskInfo {
+        let body = SettlePublishBody::Error(SettleErrorMsg {
+            message_type: SETTLE_MSG_TYPE_ERROR,
+            market: "eth_btc".to_owned(),
+            msgid: 0,
+            settle_message_id,
+            txid: 0,
+            params: MqParams::PutLimit(PutLimitParams {
+                user_id: 0,
+                side: 0,
+                amount: "0".to_owned(),
+                price: "0".to_owned(),
+                taker_fee_rate: "0".to_owned(),
+                maker_fee_rate: "0".to_owned(),
+            }),
+            code: 0,
+        });
+        SettlePublishTaskInfo {
+            group_id,
+            settle_message_id,
+            body,
+        }
+    }
 
     #[test]
     fn settle_group_progress_advances_contiguous_acks() {
@@ -1804,5 +1882,133 @@ mod tests {
 
         progress.flush(&sender);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn queue_settle_task_drops_duplicate_and_stale_ids_silently() {
+        // Simulates snapshot restore: scheduled/pushed start at 10 (pushed cursor),
+        // matcher replay generates id 5 and id 10 — both must be dropped without panic,
+        // and the group's queue must stay empty so no stale record reaches Kafka.
+        let backlog = PublishBacklog::new(
+            /* settle_group_count = */ 1, /* settle_worker_count = */ 1,
+            /* quote_channel_capacity = */ 1, /* quote_max_outstanding = */ 1,
+            /* settle_channel_capacity_per_worker = */ 1,
+            /* settle_max_outstanding_per_group = */ 16,
+            /* settle_worker_max_outstanding = */ 16,
+        );
+        let mut groups = vec![SettleGroupState::new(10, 16)];
+        let mut ready_groups: VecDeque<usize> = VecDeque::new();
+
+        // `send_settle_publish_task` would have called `inc_settle` before enqueue;
+        // emulate that here so we can confirm the drop path runs `dec_settle` to net zero.
+        backlog.inc_settle(0);
+        queue_settle_task(
+            &mut groups,
+            &mut ready_groups,
+            &backlog,
+            make_settle_task(0, 10),
+        );
+        backlog.inc_settle(0);
+        queue_settle_task(
+            &mut groups,
+            &mut ready_groups,
+            &backlog,
+            make_settle_task(0, 5),
+        );
+
+        assert_eq!(backlog.settle_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.settle_group_pending[0].load(Ordering::Relaxed), 0);
+        assert_eq!(
+            backlog.settle_duplicate_dropped_count[0].load(Ordering::Relaxed),
+            2
+        );
+        assert!(groups[0].queued.is_empty());
+        assert!(ready_groups.is_empty());
+        assert_eq!(groups[0].scheduled_settle_message_id, 10);
+    }
+
+    #[test]
+    fn queue_settle_task_accepts_strictly_increasing_ids_after_drop() {
+        // After a drop the group state is intact and a subsequent id > scheduled is still queued.
+        let backlog = PublishBacklog::new(1, 1, 1, 1, 1, 16, 16);
+        let mut groups = vec![SettleGroupState::new(10, 16)];
+        let mut ready_groups: VecDeque<usize> = VecDeque::new();
+
+        backlog.inc_settle(0);
+        queue_settle_task(
+            &mut groups,
+            &mut ready_groups,
+            &backlog,
+            make_settle_task(0, 10),
+        );
+
+        backlog.inc_settle(0);
+        queue_settle_task(
+            &mut groups,
+            &mut ready_groups,
+            &backlog,
+            make_settle_task(0, 11),
+        );
+
+        assert_eq!(backlog.settle_pending.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.settle_group_pending[0].load(Ordering::Relaxed), 1);
+        assert_eq!(
+            backlog.settle_duplicate_dropped_count[0].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(groups[0].queued.len(), 1);
+        assert_eq!(ready_groups.len(), 1);
+        assert_eq!(groups[0].scheduled_settle_message_id, 11);
+    }
+
+    #[test]
+    fn settle_group_progress_and_duplicate_queue_drop_share_group_state() {
+        let backlog = PublishBacklog::new(1, 1, 1, 1, 1, 16, 16);
+        let mut groups = vec![SettleGroupState::new(10, 16)];
+        let mut ready_groups: VecDeque<usize> = VecDeque::new();
+
+        for settle_message_id in 11..=13 {
+            backlog.inc_settle(0);
+            queue_settle_task(
+                &mut groups,
+                &mut ready_groups,
+                &backlog,
+                make_settle_task(0, settle_message_id),
+            );
+        }
+
+        assert_eq!(groups[0].scheduled_settle_message_id, 13);
+        groups[0].queued.clear();
+        ready_groups.clear();
+        groups[0].ready_queued = false;
+        groups[0].in_flight = 3;
+
+        for settle_message_id in 11..=13 {
+            backlog.dec_settle(0);
+            assert_eq!(
+                groups[0].advance_pushed_settle_message_id(settle_message_id),
+                Some(settle_message_id)
+            );
+        }
+        assert_eq!(groups[0].pushed_settle_message_id, 13);
+
+        backlog.inc_settle(0);
+        queue_settle_task(
+            &mut groups,
+            &mut ready_groups,
+            &backlog,
+            make_settle_task(0, 11),
+        );
+
+        assert_eq!(groups[0].pushed_settle_message_id, 13);
+        assert_eq!(groups[0].scheduled_settle_message_id, 13);
+        assert_eq!(backlog.settle_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.settle_group_pending[0].load(Ordering::Relaxed), 0);
+        assert_eq!(
+            backlog.settle_duplicate_dropped_count[0].load(Ordering::Relaxed),
+            1
+        );
+        assert!(groups[0].queued.is_empty());
+        assert!(ready_groups.is_empty());
     }
 }

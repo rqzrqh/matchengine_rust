@@ -266,6 +266,12 @@ settle ordering.
 
 Publish threads hold only data needed to send plus `Arc<PublishBacklog>`. Backlog uses atomic counters for quote/settle/per-group pending counts—mostly accounting and debug underflow checks; the main thread does not use backlog for flow control today.
 
+Settle queueing allows duplicate ids by invariant: enqueue drops tasks whose
+`settle_message_id` is `<= scheduled_settle_message_id`, and each group's
+scheduled cursor is initialized from the pushed cursor. That means restore replay
+can regenerate already-pushed settle ids without sending them to Kafka again.
+Duplicate delivery acknowledgements do not go through this queueing path.
+
 ### Snapshot cleanup thread
 
 At startup a thread named **`snap-cleanup`** runs periodically (`snap_cleanup.cleanup_interval_secs`) and calls `snap_cleanup::prune_snapshots` with a cloned pool ([`src/main.rs`](../src/main.rs)). It does not touch `Market`, only the database.
@@ -335,18 +341,32 @@ Quote and settle publish on separate threads:
 - One quote publisher to `quote_deals.<market>` using MessagePack payloads.
 - Configured settle publishers writing MessagePack payloads to partitions of `settle` by `user_id % 64`; each `group_id` is always routed to the same `settle-pub-<n>of<count>` worker, and each worker owns an independent producer.
 - Each producer reports progress only after delivery ack; settle uses independent per-group pending windows plus a per-worker outstanding cap, and reports only contiguous per-group cursors, even if individual acks complete out of order.
+- Settle per-partition ordering is still provided by per-group FIFO scheduling
+  plus Kafka's idempotent producer. Already-scheduled or already-pushed duplicate
+  ids are discarded before Kafka enqueue, not reordered.
+- The settle producer uses `enable.idempotence = true`. Each message carries a
+  broker-side `(ProducerID, partition, sequence_number)` triple. The broker
+  enforces ordering by that sequence number even when multiple batches are in
+  flight simultaneously. `max_in_flight_requests_per_connection = 5` therefore
+  does **not** cause consumer-visible reordering: the idempotent sequencing
+  eliminates the retry-interleaving hazard that would otherwise arise with
+  `max_in_flight > 1`. A consumer of any single settle partition always receives
+  messages in `settle_message_id` order. See
+  [`doc/publish-performance.md § Broker-side ordering`](publish-performance.md#broker-side-ordering-with-max_in_flight_requests_per_connection--5)
+  for the full explanation.
 
 There is no single global settle ordering; ordering is per group/partition, matching `settle_message_ids[group_id]`.
 
 ## Risks and caveats
 
 1. The main thread is the bottleneck for matching, HTTP reads, dump triggers, and progress updates—any long task stalls others.
-2. `std::sync::mpsc::channel` is unbounded; backlog from Kafka, HTTP, or publishing has no explicit backpressure and can grow memory.
-3. Publish threads `panic!` on failure; there is no unified supervisor or graceful shutdown.
-4. `Task::Terminate` only stops the main loop; timer, HTTP, consumer, and publish loops are long-running—exit is incomplete.
-5. `fork()` runs in a multi-threaded process. The child is kept minimal (new pool, quick exit); adding extra work in the child needs a fresh fork-safety review.
-6. HTTP shares the main queue with matching—consistent reads, but heavy querying adds matcher latency.
-7. Runtime profilers show **many** HTTP **`http-worker`** threads, publish threads, **`producer polling thread`**, and **`rdk:*`** labels across Kafka handles; that is **not** parallel order-book matching—[`Market`](../src/market.rs) ownership remains on **one** thread (see § *Live corroboration: Time Profiler (`profiling/xctrace-20260509-181829`)*).
+2. The main task queue and publish input channels are bounded, so overload turns into blocking backpressure. That keeps memory bounded at the application queues, but it can also stall Kafka consumption, HTTP replies, snapshot triggers, or matching when downstream work falls behind.
+3. Kafka producers still have their own librdkafka local queues; tune `queue_buffering_max_messages`, `queue_buffering_max_kbytes`, and application outstanding windows together.
+4. Publish threads `panic!` on failure; there is no unified supervisor or graceful shutdown.
+5. `Task::Terminate` only stops the main loop; timer, HTTP, consumer, and publish loops are long-running—exit is incomplete.
+6. `fork()` runs in a multi-threaded process. The child is kept minimal (new pool, quick exit); adding extra work in the child needs a fresh fork-safety review.
+7. HTTP shares the main queue with matching—consistent reads, but heavy querying adds matcher latency.
+8. Runtime profilers show **many** HTTP **`http-worker`** threads, publish threads, **`producer polling thread`**, and **`rdk:*`** labels across Kafka handles; that is **not** parallel order-book matching—[`Market`](../src/market.rs) ownership remains on **one** thread (see § *Live corroboration: Time Profiler (`profiling/xctrace-20260509-181829`)*).
 
 ## Maintenance notes
 

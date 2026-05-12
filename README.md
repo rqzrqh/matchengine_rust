@@ -9,7 +9,7 @@ More detail: [design.md](https://github.com/rqzrqh/matchengine_rust/blob/master/
 
 ![Test architecture diagram](https://raw.githubusercontent.com/rqzrqh/matchengine_rust/refs/heads/master/image/test_architecture.png)
 
-For OS threads and Tokio runtimes inside the engine binary, see **`doc/thread-model.md`**; for messaging protocol notes see **`doc/design.md`**.
+For OS threads and Tokio runtimes inside the engine binary, see **`doc/thread-model.md`**; for messaging protocol notes see **`doc/design.md`**; for HTTP query endpoints see **`doc/http-api.md`**; for downstream publish tuning see **`doc/publish-performance.md`**.
 
 ### Deployment
 
@@ -29,9 +29,10 @@ Edit repo root **`config.yaml`** so that:
 - **`brokers`** matches your Kafka bootstrap servers.
 - **`db.addr` / `db.user` / `db.passwd`** match MySQL.
 - **`main_task_queue_capacity`** bounds the queue into the single matcher thread. When Kafka input, HTTP requests, snapshot timers, or publish progress outpace the matcher, senders block instead of growing an unbounded queue.
-- **`output_publish`** must define **`quote`** (`quote_deals.<market>`) and **`settle`** (`settle` topic) separately. Each has a **`kafka`** child for producer settings such as **`batch_num_messages`**, **`linger_ms`**, **`max_in_flight_requests_per_connection`**, local queue limits, compression, delivery timeout, and statistics interval; application pipeline settings such as bounded **`channel_capacity`**, **`drain_batch_size`**, **`max_outstanding`**, and settle **`per_group_send_burst`** stay outside **`kafka`**. Settle publishing always uses Kafka idempotence with `acks=all`, so keep its `kafka.max_in_flight_requests_per_connection` ≤ 5. See root **`config.yaml`** for an example.
+- **`output_publish`** must define **`quote`** (`quote_deals.<market>`) and **`settle`** (single `settle` topic, partitioned by settle group) separately. Each has a **`kafka`** child for producer settings such as **`batch_num_messages`**, **`linger_ms`**, **`max_in_flight_requests_per_connection`**, local queue limits, compression, delivery timeout, and statistics interval; application pipeline settings such as bounded **`channel_capacity`**, **`drain_batch_size`**, **`max_outstanding`**, settle **`worker_max_outstanding`**, **`per_group_send_burst`**, and **`thread_count`** stay outside **`kafka`**. Settle publishing always uses Kafka idempotence with `acks=all`, so keep its `kafka.max_in_flight_requests_per_connection` ≤ 5. See root **`config.yaml`** for an example.
+- **`snap_dump`** controls the forked snapshot interval; **`snap_cleanup`** controls periodic snapshot retention by max age and/or max count while protecting the snapshot that recovery would choose.
 
-The engine reads this file (default path `./config.yaml` relative to the process working directory, or pass another path as the first CLI argument). **web-test** also resolves `config.yaml` from the repo root or from `web-test/../`.
+The engine reads this file (default path `./config.yaml` relative to the process working directory, or pass another path as the first CLI argument). It also accepts **`--wait-initial-status`**, used by profiling helpers to let one HTTP status request run before Kafka consumption starts. **web-test** resolves `config.yaml` from the repo root or from `web-test/../`.
 
 #### 2. Database
 
@@ -52,10 +53,10 @@ Still under **`deploy/`**:
 
 ```bash
 ./kafka_market.sh <MARKET_NAME>    # offer.<market>, quote_deals.<market>
-./kafka_settle.sh                # settle.0 .. settle.63
+./kafka_settle.sh                  # settle topic with 64 partitions
 ```
 
-Adjust bootstrap server inside the scripts if Kafka is not on `localhost:9092`.
+Adjust bootstrap server inside the scripts if Kafka is not on `localhost:9092`. Startup validates that `offer.<market>` and `quote_deals.<market>` exist, that `settle` has at least 64 partitions, and that both the settle partition count and the engine's 64 settle groups divide cleanly across `output_publish.settle.thread_count`.
 
 #### 4. Build and run the matching engine
 
@@ -65,6 +66,7 @@ From the **repository root**:
 cargo build --release
 RUST_LOG=info cargo run --release
 # or: RUST_LOG=info cargo run --release /path/to/config.yaml
+# profiling helpers may use: RUST_LOG=info cargo run --release -- --wait-initial-status /path/to/config.yaml
 ```
 
 By default the engine exposes HTTP on **`http://127.0.0.1:8080`**.
@@ -99,7 +101,7 @@ REST surface on the engine (the UI calls these from the browser; web-test also i
 cargo test
 ```
 
-The crate may ship with **no** `#[test]` cases yet (`running 0 tests` is normal); the command still verifies that the project **builds** under the test profile.
+The command runs the crate's unit tests and also verifies that the project builds under the test profile.
 
 #### Matching core benchmark
 
@@ -115,7 +117,7 @@ Read Criterion's `thrpt` / `elem/s` output as a core upper-bound metric:
 - `market_order_sweep_core_deal_throughput`: in-memory deal throughput when one market order sweeps many resting asks.
 - `resting_limit_order_core_throughput`: in-memory order-book insert throughput for non-crossing limit orders.
 
-To know deployable TPS, run the engine against Kafka/MySQL and drive `offer.<market>` with the same MessagePack message shape as production, then measure accepted input rate together with `quote_deals.<market>`, `settle.*`, publish backlog, and engine latency.
+To know deployable TPS, run the engine against Kafka/MySQL and drive `offer.<market>` with the same MessagePack message shape as production, then measure accepted input rate together with `quote_deals.<market>`, the partitioned `settle` topic, publish backlog, and engine latency.
 
 #### Matching engine HTTP
 
@@ -134,7 +136,7 @@ With **`npm run dev`** in **`web-test/`**, open the printed URL (typically **`ht
 
 #### Load / integration
 
-For end-to-end integration testing, run the engine against a dev Kafka/MySQL stack, publish MessagePack orders to **`offer.<market>`** as your upstream does, and observe MessagePack outputs on **`quote_deals.<market>`** / **`settle.*`** plus engine HTTP and DB state.
+For end-to-end integration testing, run the engine against a dev Kafka/MySQL stack, publish MessagePack orders to **`offer.<market>`** as your upstream does, and observe MessagePack outputs on **`quote_deals.<market>`** / the partitioned **`settle`** topic plus engine HTTP and DB state.
 
 ### Profiling
 
@@ -162,9 +164,5 @@ Open **`matchengine.trace`** in **Instruments** for interactive timeline and cal
 | **`src/`** | Matching engine (Rust) |
 | **`deploy/`** | MySQL + Kafka bootstrap scripts |
 | **`config.yaml`** | Shared YAML for engine and web-test |
-| **`doc/`** | Design notes (`design.md`) |
+| **`doc/`** | Design, HTTP API, thread model, and publish-performance notes |
 | **`web-test/`** | Optional Node console (UI + APIs + Kafka helpers) |
-
-### TODO
-
-1. Use ordered batch sends for higher data-push throughput.

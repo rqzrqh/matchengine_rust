@@ -66,6 +66,7 @@ Axum forwards each request to the main matcher thread; execution is a synchronou
 | `pushed_settle_message_ids` | array | Per-group ids confirmed published to settle |
 | `runtime_status` | object | Categorized runtime queues and Kafka publish state |
 | `main_task_queue` | object | Bounded main matcher task queue backlog and capacity |
+| `offer_consumer` | object | Offer Kafka consumer receive / parse / enqueue timing counters |
 | `publish_backlog` | object | Publish-side pending / in-flight counters |
 | `publish_lag` | object | Cursor lag between generated matcher output and confirmed Kafka publish |
 
@@ -74,12 +75,34 @@ Axum forwards each request to the main matcher thread; execution is a synchronou
 | Field | Type | Description |
 |-------|------|-------------|
 | `offer_queue` | object | Offer-consumer → main matcher queue state |
+| `offer_consumer` | object | Rolling receive / parse / main-queue send metrics from the offer consumer |
 | `quote_message_queue` | object | Main matcher → quote publish thread queue state |
 | `settle_message_queue` | object | Main matcher → settle publish worker queue state |
 | `quote_kafka` | object | Quote Kafka producer in-flight / capacity / lag state |
 | `settle_kafka` | object | Settle Kafka producer in-flight / capacity / lag state |
 
 `runtime_status.offer_queue` uses the shared main queue capacity because HTTP, timers, and publish progress also enter the same bounded main matcher queue. `pending_or_blocked` is the current offer-task share; `total_main_queue_pending_or_blocked` shows the whole shared queue.
+
+**`offer_consumer` fields**
+
+The same object appears as top-level `offer_consumer` and as `runtime_status.offer_consumer`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `bucket_width_ms` | number | Width of one rolling metrics bucket; currently 10 ms |
+| `window_buckets` | number | Number of rolling buckets retained; currently 200 |
+| `current_generation` | number | Current bucket generation since process start |
+| `start_unix_ms` | number | Process metrics start timestamp in Unix milliseconds |
+| `current_elapsed_ms` | number | Milliseconds elapsed since metrics start |
+| `total_messages` | number | Total successfully received Kafka messages recorded by the consumer loop |
+| `total_payload_bytes` | number | Total Kafka payload bytes observed |
+| `total_recv_wait_nanos` | number | Total time spent waiting for `StreamConsumer::recv` results |
+| `total_parse_nanos` | number | Total MessagePack decode / envelope parse time |
+| `total_send_nanos` | number | Total time spent sending offer tasks into the bounded main queue |
+| `total_recv_errors` | number | Total Kafka receive errors |
+| `buckets` | array | Non-empty rolling bucket objects in chronological order |
+
+Each item in `buckets` contains `generation`, `start_ms`, `start_unix_ms`, `messages`, `payload_bytes`, `recv_wait_nanos`, `recv_wait_max_nanos`, `parse_nanos`, `parse_max_nanos`, `send_nanos`, `send_max_nanos`, and `recv_errors`.
 
 **`main_task_queue` fields**
 
